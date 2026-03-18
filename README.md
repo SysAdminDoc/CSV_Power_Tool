@@ -16,6 +16,9 @@
 
 ---
 
+
+![Screenshot](screenshot.png)
+
 ## ✨ Features
 
 ### 📁 File Management
