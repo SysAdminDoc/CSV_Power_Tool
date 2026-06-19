@@ -94,27 +94,39 @@ class ProcessingConfig:
     selected_columns: list = field(default_factory=list)
     column_mapping: dict = field(default_factory=dict)  # {original: renamed}
     column_order: list = field(default_factory=list)
-    
+
     # Sorting
     sort_enabled: bool = False
     sort_columns: list = field(default_factory=list)  # [(column, ascending), ...]
     sort_case_sensitive: bool = False
     sort_numeric_aware: bool = True
-    
+
     # Deduplication
     dedupe_enabled: bool = True
     dedupe_columns: list = field(default_factory=list)  # Empty = all columns
     dedupe_keep: str = "first"  # "first", "last", "none"
-    
+
     # Filtering
     filters: list = field(default_factory=list)  # [(column, operator, value), ...]
     filter_logic: str = "and"  # "and", "or"
-    
+
     # Transformations
     trim_whitespace: bool = True
     case_transform: str = "none"  # "none", "upper", "lower", "title"
     empty_value: str = ""  # Replace empty cells with this
-    
+
+    # Header normalization
+    header_normalize: str = "none"  # "none", "trim", "lowercase", "snake_case"
+    strip_bom: bool = True
+
+    # Advanced transforms (per-column)
+    column_transforms: list = field(default_factory=list)  # [(column, transform_type, *args)]
+    # transform_type: "trim", "upper", "lower", "title", "replace", "regex_replace",
+    #                  "split", "merge", "compute"
+
+    # Schema unification
+    schema_mode: str = "union"  # "union", "intersection", "first_file"
+
     # Output
     output_delimiter: str = ","
     output_encoding: str = "utf-8"
@@ -142,7 +154,7 @@ class ProcessingStats:
 
 class CSVEngine:
     """Core CSV processing engine."""
-    
+
     FILTER_OPERATORS = {
         "equals": lambda v, t: str(v).lower() == str(t).lower(),
         "not_equals": lambda v, t: str(v).lower() != str(t).lower(),
@@ -154,9 +166,14 @@ class CSVEngine:
         "is_not_empty": lambda v, t: bool(str(v).strip()),
         "greater_than": lambda v, t: CSVEngine._numeric_compare(v, t, ">"),
         "less_than": lambda v, t: CSVEngine._numeric_compare(v, t, "<"),
+        "greater_than_or_equal": lambda v, t: CSVEngine._numeric_compare(v, t, ">="),
+        "less_than_or_equal": lambda v, t: CSVEngine._numeric_compare(v, t, "<="),
+        "between": lambda v, t: CSVEngine._between(v, t),
+        "in_list": lambda v, t: str(v).strip().lower() in [x.strip().lower() for x in str(t).split(",")],
+        "not_in_list": lambda v, t: str(v).strip().lower() not in [x.strip().lower() for x in str(t).split(",")],
         "regex": lambda v, t: bool(re.search(t, str(v), re.IGNORECASE)),
     }
-    
+
     @staticmethod
     def _numeric_compare(v, t, op):
         try:
@@ -164,9 +181,101 @@ class CSVEngine:
             t_num = float(str(t).replace(",", ""))
             if op == ">":
                 return v_num > t_num
-            return v_num < t_num
+            elif op == "<":
+                return v_num < t_num
+            elif op == ">=":
+                return v_num >= t_num
+            elif op == "<=":
+                return v_num <= t_num
+            return False
         except ValueError:
             return False
+
+    @staticmethod
+    def _between(v, t):
+        """Check if value is between two numbers separated by comma. E.g. '10,20'."""
+        try:
+            parts = str(t).split(",")
+            if len(parts) != 2:
+                return False
+            lo = float(parts[0].strip())
+            hi = float(parts[1].strip())
+            val = float(str(v).replace(",", ""))
+            return lo <= val <= hi
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _normalize_header(name: str, mode: str) -> str:
+        """Normalize a header name according to the mode."""
+        if mode == "none":
+            return name.strip()
+        name = name.strip()
+        # Strip BOM if present
+        if name.startswith("﻿"):
+            name = name[1:]
+        if mode == "trim":
+            return name
+        if mode == "lowercase":
+            return name.lower()
+        if mode == "snake_case":
+            # Convert to snake_case: "First Name" -> "first_name", "firstName" -> "first_name"
+            import re as _re
+            s = _re.sub(r'[\s\-\.]+', '_', name)  # spaces/hyphens/dots to underscore
+            s = _re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', s)
+            s = _re.sub(r'([a-z\d])([A-Z])', r'\1_\2', s)
+            s = _re.sub(r'_+', '_', s)
+            return s.lower().strip('_')
+        return name
+
+    @staticmethod
+    def _detect_file_params(file_path: Path) -> tuple:
+        """Auto-detect encoding, delimiter, and quotechar for a file.
+        Returns (encoding, delimiter, quotechar)."""
+        # Try to detect encoding
+        encoding = 'utf-8'
+        try:
+            import chardet
+            with open(file_path, 'rb') as f:
+                raw = f.read(min(32768, file_path.stat().st_size))
+            detection = chardet.detect(raw)
+            if detection and detection.get('encoding') and detection.get('confidence', 0) > 0.5:
+                encoding = detection['encoding']
+                # Normalize common encoding names
+                enc_lower = encoding.lower().replace('-', '').replace('_', '')
+                if enc_lower in ('ascii', 'utf8'):
+                    encoding = 'utf-8'
+                elif enc_lower in ('iso88591', 'latin1'):
+                    encoding = 'latin-1'
+                elif enc_lower in ('cp1252', 'windows1252'):
+                    encoding = 'cp1252'
+                elif enc_lower.startswith('utf16'):
+                    encoding = 'utf-16'
+        except ImportError:
+            pass  # chardet not available, fall back to trial-and-error
+
+        # Detect delimiter and quotechar using csv.Sniffer
+        delimiter = ','
+        quotechar = '"'
+        for enc in [encoding, 'utf-8', 'latin-1', 'cp1252']:
+            try:
+                with open(file_path, 'r', encoding=enc, newline='') as f:
+                    sample = f.read(8192)
+                try:
+                    dialect = csv.Sniffer().sniff(sample, delimiters=',\t;|')
+                    delimiter = dialect.delimiter
+                    quotechar = dialect.quotechar or '"'
+                except csv.Error:
+                    # Sniffer failed, fall back to frequency counting
+                    for delim in [',', '\t', ';', '|']:
+                        if sample.count(delim) > sample.count(delimiter):
+                            delimiter = delim
+                encoding = enc
+                break
+            except UnicodeDecodeError:
+                continue
+
+        return encoding, delimiter, quotechar
     
     def __init__(self, config: ProcessingConfig, 
                  progress_callback: Callable = None,
@@ -192,63 +301,105 @@ class CSVEngine:
         """Discover all unique columns across files."""
         all_columns = []
         seen = set()
-        
+        per_file_columns = []  # Track columns per file for schema modes
+
+        norm_mode = getattr(self.config, 'header_normalize', 'none')
+
         for file_path in files:
             try:
-                with open(file_path, 'r', encoding='utf-8', newline='') as f:
-                    reader = csv.reader(f)
+                encoding, delimiter, quotechar = self._detect_file_params(file_path)
+                with open(file_path, 'r', encoding=encoding, newline='') as f:
+                    reader = csv.reader(f, delimiter=delimiter, quotechar=quotechar)
                     headers = next(reader, [])
+                    file_cols = []
                     for col in headers:
-                        col = col.strip()
-                        if col and col not in seen:
-                            all_columns.append(col)
-                            seen.add(col)
-            except:
+                        col = self._normalize_header(col, norm_mode)
+                        if col:
+                            file_cols.append(col)
+                            if col not in seen:
+                                all_columns.append(col)
+                                seen.add(col)
+                    per_file_columns.append(set(file_cols))
+            except Exception:
                 try:
                     with open(file_path, 'r', encoding='latin-1', newline='') as f:
                         reader = csv.reader(f)
                         headers = next(reader, [])
+                        file_cols = []
                         for col in headers:
-                            col = col.strip()
+                            col = self._normalize_header(col, norm_mode)
                             if col and col not in seen:
                                 all_columns.append(col)
                                 seen.add(col)
-                except:
+                                file_cols.append(col)
+                        per_file_columns.append(set(file_cols))
+                except Exception:
                     pass
-        
+
+        # Apply schema unification mode
+        schema_mode = getattr(self.config, 'schema_mode', 'union')
+        if schema_mode == "intersection" and per_file_columns:
+            common = per_file_columns[0]
+            for s in per_file_columns[1:]:
+                common = common & s
+            all_columns = [c for c in all_columns if c in common]
+        elif schema_mode == "first_file" and per_file_columns:
+            first_set = per_file_columns[0]
+            all_columns = [c for c in all_columns if c in first_set]
+
         return all_columns
     
     def process(self, input_files: list[Path], output_file: Path) -> ProcessingStats:
         """Process CSV files according to configuration."""
         self.cancelled = False
         self.stats = ProcessingStats()
-        
+
         all_rows = []
         all_columns = set()
         column_order = []
-        
+        per_file_columns = []  # Track columns per file for schema modes
+
         total_files = len(input_files)
-        
+
         # Phase 1: Read all files
         self.log("Phase 1: Reading files...", "info")
-        
+
         for idx, csv_path in enumerate(input_files):
             if self.cancelled:
                 self.log("Processing cancelled", "warning")
                 return self.stats
-            
+
             progress = (idx / total_files) * 40
             self.update_progress(progress, f"Reading {csv_path.name}...")
-            
+
+            pre_cols = set(all_columns)
             rows_from_file = self._read_file(csv_path, all_columns, column_order)
+            new_cols = all_columns - pre_cols
+            # Track which columns this file contributed
+            # We need all columns that appeared in this file's headers
+            file_cols = set()
+            if rows_from_file:
+                file_cols = set(rows_from_file[0].keys())
+            per_file_columns.append(file_cols)
             all_rows.extend(rows_from_file)
-        
+
         if not all_rows:
             self.log("No data to process", "warning")
             return self.stats
-        
+
         self.stats.unique_columns = len(all_columns)
-        
+
+        # Apply schema unification before determining final columns
+        schema_mode = getattr(self.config, 'schema_mode', 'union')
+        if schema_mode == "intersection" and per_file_columns:
+            common = per_file_columns[0]
+            for s in per_file_columns[1:]:
+                common = common & s
+            column_order = [c for c in column_order if c in common]
+        elif schema_mode == "first_file" and per_file_columns:
+            first_set = per_file_columns[0]
+            column_order = [c for c in column_order if c in first_set]
+
         # Determine final columns
         final_columns = self._get_final_columns(column_order)
         
@@ -290,60 +441,59 @@ class CSVEngine:
     def _read_file(self, file_path: Path, all_columns: set, column_order: list) -> list[dict]:
         """Read a single CSV file."""
         rows = []
-        
+
         if not file_path.exists():
             self.log(f"✗ File not found: {file_path.name}", "error")
             self.stats.files_skipped += 1
             self.stats.errors.append(f"Not found: {file_path.name}")
             return rows
-        
-        encodings = ['utf-8', 'latin-1', 'cp1252', 'utf-16']
-        
-        for encoding in encodings:
+
+        norm_mode = getattr(self.config, 'header_normalize', 'none')
+
+        # Auto-detect encoding, delimiter, quotechar
+        detected_enc, detected_delim, detected_quote = self._detect_file_params(file_path)
+        encodings_to_try = [detected_enc]
+        for fallback in ['utf-8', 'latin-1', 'cp1252', 'utf-16']:
+            if fallback not in encodings_to_try:
+                encodings_to_try.append(fallback)
+
+        for encoding in encodings_to_try:
             try:
                 with open(file_path, 'r', encoding=encoding, newline='') as f:
-                    # Detect delimiter
-                    sample = f.read(4096)
-                    f.seek(0)
-                    
-                    delimiter = ','
-                    for delim in [',', '\t', ';', '|']:
-                        if sample.count(delim) > sample.count(delimiter):
-                            delimiter = delim
-                    
-                    reader = csv.DictReader(f, delimiter=delimiter)
-                    
+                    reader = csv.DictReader(f, delimiter=detected_delim,
+                                            quotechar=detected_quote)
+
                     if reader.fieldnames:
                         for col in reader.fieldnames:
-                            col = col.strip() if col else ""
+                            col = self._normalize_header(col, norm_mode)
                             if col and col not in all_columns:
                                 all_columns.add(col)
                                 column_order.append(col)
-                    
+
                     row_count = 0
                     for row in reader:
                         cleaned_row = {}
                         for k, v in row.items():
-                            key = k.strip() if k else ""
+                            key = self._normalize_header(k, norm_mode) if k else ""
                             if key:
                                 cleaned_row[key] = v.strip() if v and self.config.trim_whitespace else (v or "")
                         rows.append(cleaned_row)
                         row_count += 1
-                    
+
                     self.stats.files_processed += 1
                     self.stats.total_rows_read += row_count
-                    self.log(f"✓ {file_path.name} ({row_count:,} rows)", "success")
+                    self.log(f"✓ {file_path.name} ({row_count:,} rows, {encoding}, delim={repr(detected_delim)})", "success")
                     return rows
-                    
+
             except UnicodeDecodeError:
                 continue
             except Exception as e:
-                if encoding == encodings[-1]:
+                if encoding == encodings_to_try[-1]:
                     self.log(f"✗ Error reading {file_path.name}: {e}", "error")
                     self.stats.files_skipped += 1
                     self.stats.errors.append(f"{file_path.name}: {e}")
                 continue
-        
+
         return rows
     
     def _get_final_columns(self, discovered_order: list) -> list[str]:
@@ -396,31 +546,150 @@ class CSVEngine:
     
     def _apply_transformations(self, rows: list[dict], columns: list[str]) -> list[dict]:
         """Apply configured transformations to data."""
+        # Pre-index per-column transforms for fast lookup
+        col_transforms = {}  # {column: [(transform_type, *args), ...]}
+        for ct in getattr(self.config, 'column_transforms', []):
+            col_name = ct[0]
+            transform = ct[1:]
+            col_transforms.setdefault(col_name, []).append(transform)
+
+        # Collect split/merge/compute transforms that alter the column set
+        extra_columns = []
+        for ct in getattr(self.config, 'column_transforms', []):
+            if len(ct) >= 3 and ct[1] == "split":
+                # split: (column, "split", delimiter, num_parts)
+                num_parts = int(ct[3]) if len(ct) > 3 else 2
+                for i in range(1, num_parts + 1):
+                    new_col = f"{ct[0]}_{i}"
+                    if new_col not in columns and new_col not in extra_columns:
+                        extra_columns.append(new_col)
+            elif len(ct) >= 4 and ct[1] == "merge":
+                # merge: (target_col, "merge", separator, col1, col2, ...)
+                new_col = ct[0]
+                if new_col not in columns and new_col not in extra_columns:
+                    extra_columns.append(new_col)
+            elif len(ct) >= 3 and ct[1] == "compute":
+                # compute: (new_column, "compute", expression)
+                new_col = ct[0]
+                if new_col not in columns and new_col not in extra_columns:
+                    extra_columns.append(new_col)
+
+        all_columns = columns + extra_columns
+
         transformed = []
-        
+
         for row in rows:
             new_row = {}
             for col in columns:
                 value = row.get(col, self.config.empty_value)
-                
+
                 if value is None:
                     value = self.config.empty_value
-                
-                # Case transformation
+
+                # Global case transformation
                 if self.config.case_transform == "upper":
                     value = str(value).upper()
                 elif self.config.case_transform == "lower":
                     value = str(value).lower()
                 elif self.config.case_transform == "title":
                     value = str(value).title()
-                
+
+                # Per-column transforms
+                if col in col_transforms:
+                    for transform in col_transforms[col]:
+                        value = self._apply_column_transform(value, transform, row)
+
                 # Apply column mapping
                 output_col = self.config.column_mapping.get(col, col)
                 new_row[output_col] = value
-            
+
+            # Handle split column transforms
+            for ct in getattr(self.config, 'column_transforms', []):
+                if len(ct) >= 3 and ct[1] == "split":
+                    src_col = ct[0]
+                    delimiter = ct[2]
+                    num_parts = int(ct[3]) if len(ct) > 3 else 2
+                    src_value = str(row.get(src_col, ""))
+                    parts = src_value.split(delimiter, num_parts - 1)
+                    for i in range(num_parts):
+                        new_col = f"{src_col}_{i+1}"
+                        new_row[new_col] = parts[i].strip() if i < len(parts) else ""
+
+            # Handle merge column transforms
+            for ct in getattr(self.config, 'column_transforms', []):
+                if len(ct) >= 4 and ct[1] == "merge":
+                    target_col = ct[0]
+                    separator = ct[2]
+                    merge_cols = ct[3:]
+                    merged_parts = [str(row.get(c, new_row.get(c, ""))) for c in merge_cols]
+                    new_row[target_col] = separator.join(merged_parts)
+
+            # Handle compute column transforms
+            for ct in getattr(self.config, 'column_transforms', []):
+                if len(ct) >= 3 and ct[1] == "compute":
+                    target_col = ct[0]
+                    expression = ct[2]
+                    new_row[target_col] = self._evaluate_expression(expression, row, new_row)
+
             transformed.append(new_row)
-        
+
         return transformed
+
+    @staticmethod
+    def _apply_column_transform(value: str, transform: tuple, row: dict) -> str:
+        """Apply a single per-column transform."""
+        transform_type = transform[0]
+        value = str(value)
+
+        if transform_type == "trim":
+            return value.strip()
+        elif transform_type == "upper":
+            return value.upper()
+        elif transform_type == "lower":
+            return value.lower()
+        elif transform_type == "title":
+            return value.title()
+        elif transform_type == "replace" and len(transform) >= 3:
+            # (replace, search, replacement)
+            return value.replace(transform[1], transform[2])
+        elif transform_type == "regex_replace" and len(transform) >= 3:
+            # (regex_replace, pattern, replacement)
+            try:
+                return re.sub(transform[1], transform[2], value)
+            except re.error:
+                return value
+        return value
+
+    @staticmethod
+    def _evaluate_expression(expression: str, row: dict, new_row: dict) -> str:
+        """Evaluate a simple compute expression using row values.
+        Supports: column references in curly braces, basic arithmetic.
+        E.g. '{qty} * {price}' or '{first_name} + " " + {last_name}'
+        """
+        try:
+            # Replace {column_name} with values
+            resolved = expression
+            # Find all column references
+            col_refs = re.findall(r'\{([^}]+)\}', expression)
+            for ref in col_refs:
+                val = row.get(ref, new_row.get(ref, ""))
+                # Try to use numeric value if possible
+                try:
+                    numeric_val = float(str(val).replace(",", ""))
+                    resolved = resolved.replace(f'{{{ref}}}', str(numeric_val))
+                except ValueError:
+                    resolved = resolved.replace(f'{{{ref}}}', repr(str(val)))
+
+            # Only allow safe operations
+            allowed_chars = set('0123456789.+-*/() "\'_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ,')
+            if all(c in allowed_chars for c in resolved):
+                result = eval(resolved)  # nosec - input is sanitized
+                if isinstance(result, float) and result == int(result):
+                    return str(int(result))
+                return str(result)
+            return ""
+        except Exception:
+            return ""
     
     def _deduplicate(self, rows: list[dict], columns: list[str]) -> list[dict]:
         """Remove duplicate rows."""
@@ -1146,7 +1415,7 @@ class DedupePanel(ctk.CTkFrame):
 
 class FilterPanel(ctk.CTkFrame):
     """Filter configuration."""
-    
+
     OPERATORS = [
         ("equals", "Equals"),
         ("not_equals", "Not Equals"),
@@ -1158,6 +1427,11 @@ class FilterPanel(ctk.CTkFrame):
         ("is_not_empty", "Is Not Empty"),
         ("greater_than", "Greater Than"),
         ("less_than", "Less Than"),
+        ("greater_than_or_equal", "Greater/Equal"),
+        ("less_than_or_equal", "Less/Equal"),
+        ("between", "Between"),
+        ("in_list", "In List"),
+        ("not_in_list", "Not In List"),
         ("regex", "Regex Match"),
     ]
     
@@ -1338,32 +1612,45 @@ class FilterPanel(ctk.CTkFrame):
 
 class TransformPanel(ctk.CTkFrame):
     """Data transformation configuration."""
-    
+
+    COLUMN_TRANSFORM_TYPES = [
+        ("trim", "Trim"),
+        ("upper", "UPPER"),
+        ("lower", "lower"),
+        ("title", "Title"),
+        ("replace", "Replace"),
+        ("regex_replace", "Regex Replace"),
+    ]
+
     def __init__(self, master, **kwargs):
         if "fg_color" not in kwargs:
             kwargs["fg_color"] = COLORS["bg_secondary"]
         if "corner_radius" not in kwargs:
             kwargs["corner_radius"] = 8
         super().__init__(master, **kwargs)
-        
+
+        self.columns: list[str] = []
+        self.column_transforms: list = []  # [(column, type, *args)]
+
         self.trim_whitespace = BooleanVar(value=True)
         self.case_transform = StringVar(value="none")
         self.empty_value = StringVar(value="")
-        
+        self.header_normalize = StringVar(value="none")
+
         # Header
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.pack(fill="x", padx=12, pady=(12, 8))
-        
+
         ctk.CTkLabel(
             header, text="⚙️ Transformations",
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color=COLORS["text_primary"]
         ).pack(side="left")
-        
+
         # Options
         opts_frame = ctk.CTkFrame(self, fg_color="transparent")
-        opts_frame.pack(fill="x", padx=12, pady=(0, 12))
-        
+        opts_frame.pack(fill="x", padx=12, pady=(0, 4))
+
         # Trim whitespace
         ctk.CTkCheckBox(
             opts_frame, text="Trim whitespace",
@@ -1372,17 +1659,17 @@ class TransformPanel(ctk.CTkFrame):
             fg_color=COLORS["accent_blue"],
             text_color=COLORS["text_secondary"]
         ).pack(anchor="w", pady=4)
-        
+
         # Case transformation
         case_frame = ctk.CTkFrame(opts_frame, fg_color="transparent")
-        case_frame.pack(fill="x", pady=8)
-        
+        case_frame.pack(fill="x", pady=4)
+
         ctk.CTkLabel(
             case_frame, text="Case:",
             font=ctk.CTkFont(size=11),
             text_color=COLORS["text_secondary"]
         ).pack(side="left", padx=(0, 8))
-        
+
         for val, text in [("none", "None"), ("upper", "UPPER"), ("lower", "lower"), ("title", "Title")]:
             ctk.CTkRadioButton(
                 case_frame, text=text, variable=self.case_transform, value=val,
@@ -1390,17 +1677,36 @@ class TransformPanel(ctk.CTkFrame):
                 fg_color=COLORS["accent_blue"],
                 text_color=COLORS["text_secondary"]
             ).pack(side="left", padx=(0, 8))
-        
+
+        # Header normalization
+        header_frame = ctk.CTkFrame(opts_frame, fg_color="transparent")
+        header_frame.pack(fill="x", pady=4)
+
+        ctk.CTkLabel(
+            header_frame, text="Headers:",
+            font=ctk.CTkFont(size=11),
+            text_color=COLORS["text_secondary"]
+        ).pack(side="left", padx=(0, 8))
+
+        ctk.CTkOptionMenu(
+            header_frame, variable=self.header_normalize,
+            values=["none", "trim", "lowercase", "snake_case"],
+            font=ctk.CTkFont(size=11), height=28, width=120,
+            fg_color=COLORS["bg_dark"],
+            button_color=COLORS["bg_tertiary"],
+            dropdown_fg_color=COLORS["bg_secondary"]
+        ).pack(side="left")
+
         # Empty value replacement
         empty_frame = ctk.CTkFrame(opts_frame, fg_color="transparent")
         empty_frame.pack(fill="x", pady=4)
-        
+
         ctk.CTkLabel(
             empty_frame, text="Replace empty cells with:",
             font=ctk.CTkFont(size=11),
             text_color=COLORS["text_secondary"]
         ).pack(side="left", padx=(0, 8))
-        
+
         ctk.CTkEntry(
             empty_frame, textvariable=self.empty_value,
             placeholder_text="(leave blank)",
@@ -1409,9 +1715,184 @@ class TransformPanel(ctk.CTkFrame):
             border_color=COLORS["border"],
             text_color=COLORS["text_primary"]
         ).pack(side="left")
-    
+
+        # Per-column transforms section
+        sep = ctk.CTkFrame(self, fg_color=COLORS["border"], height=1)
+        sep.pack(fill="x", padx=12, pady=(8, 4))
+
+        col_header = ctk.CTkFrame(self, fg_color="transparent")
+        col_header.pack(fill="x", padx=12, pady=(4, 4))
+
+        ctk.CTkLabel(
+            col_header, text="Per-Column Transforms",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=COLORS["text_primary"]
+        ).pack(side="left")
+
+        # Per-column transform list
+        list_frame = ctk.CTkFrame(self, fg_color=COLORS["bg_dark"], corner_radius=6)
+        list_frame.pack(fill="both", expand=True, padx=12, pady=(0, 4))
+
+        self.transforms_frame = ctk.CTkScrollableFrame(
+            list_frame, fg_color="transparent",
+            scrollbar_button_color=COLORS["bg_tertiary"]
+        )
+        self.transforms_frame.pack(fill="both", expand=True, padx=4, pady=4)
+
+        self._refresh_transforms()
+
+        # Buttons
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=12, pady=(0, 12))
+
+        ctk.CTkButton(
+            btn_frame, text="+ Add Transform", font=ctk.CTkFont(size=11),
+            height=28, fg_color=COLORS["accent_purple"],
+            hover_color=COLORS["accent_purple_hover"],
+            corner_radius=4, command=self._add_transform
+        ).pack(side="left")
+
+        ctk.CTkButton(
+            btn_frame, text="Clear All", font=ctk.CTkFont(size=11),
+            height=28, fg_color=COLORS["bg_tertiary"],
+            hover_color=COLORS["accent_red"],
+            text_color=COLORS["text_secondary"],
+            corner_radius=4, command=self._clear_transforms
+        ).pack(side="right")
+
+    def set_columns(self, columns: list[str]):
+        self.columns = columns
+
+    def _add_transform(self):
+        if not self.columns:
+            return
+        self.column_transforms.append((self.columns[0], "trim", "", ""))
+        self._refresh_transforms()
+
+    def _remove_transform(self, idx: int):
+        if 0 <= idx < len(self.column_transforms):
+            self.column_transforms.pop(idx)
+            self._refresh_transforms()
+
+    def _clear_transforms(self):
+        self.column_transforms.clear()
+        self._refresh_transforms()
+
+    def _update_transform(self, idx: int, **kwargs):
+        if 0 <= idx < len(self.column_transforms):
+            current = list(self.column_transforms[idx])
+            if "column" in kwargs:
+                current[0] = kwargs["column"]
+            if "transform_type" in kwargs:
+                current[1] = kwargs["transform_type"]
+            if "arg1" in kwargs:
+                if len(current) > 2:
+                    current[2] = kwargs["arg1"]
+                else:
+                    current.append(kwargs["arg1"])
+            if "arg2" in kwargs:
+                if len(current) > 3:
+                    current[3] = kwargs["arg2"]
+                else:
+                    current.append(kwargs["arg2"])
+            self.column_transforms[idx] = tuple(current)
+
+    def _refresh_transforms(self):
+        for w in self.transforms_frame.winfo_children():
+            w.destroy()
+
+        if not self.column_transforms:
+            ctk.CTkLabel(
+                self.transforms_frame,
+                text="No per-column transforms defined",
+                font=ctk.CTkFont(size=11),
+                text_color=COLORS["text_muted"]
+            ).pack(pady=10)
+        else:
+            for idx, ct in enumerate(self.column_transforms):
+                self._create_transform_row(idx, ct)
+
+    def _create_transform_row(self, idx: int, ct: tuple):
+        frame = ctk.CTkFrame(self.transforms_frame, fg_color=COLORS["bg_secondary"],
+                             corner_radius=4)
+        frame.pack(fill="x", pady=2)
+
+        row1 = ctk.CTkFrame(frame, fg_color="transparent")
+        row1.pack(fill="x", padx=8, pady=(6, 2))
+
+        col_var = StringVar(value=ct[0])
+        ctk.CTkOptionMenu(
+            row1, variable=col_var,
+            values=self.columns if self.columns else ["(no columns)"],
+            font=ctk.CTkFont(size=10), height=26, width=120,
+            fg_color=COLORS["bg_dark"],
+            button_color=COLORS["bg_tertiary"],
+            dropdown_fg_color=COLORS["bg_secondary"],
+            command=lambda v, i=idx: self._update_transform(i, column=v)
+        ).pack(side="left", padx=(0, 4))
+
+        type_display = {t: n for t, n in self.COLUMN_TRANSFORM_TYPES}
+        type_var = StringVar(value=type_display.get(ct[1], ct[1]))
+        ctk.CTkOptionMenu(
+            row1, variable=type_var,
+            values=[n for _, n in self.COLUMN_TRANSFORM_TYPES],
+            font=ctk.CTkFont(size=10), height=26, width=100,
+            fg_color=COLORS["bg_dark"],
+            button_color=COLORS["bg_tertiary"],
+            dropdown_fg_color=COLORS["bg_secondary"],
+            command=lambda v, i=idx: self._update_transform(
+                i, transform_type=next(
+                    (t for t, n in self.COLUMN_TRANSFORM_TYPES if n == v), v
+                ))
+        ).pack(side="left", padx=(0, 4))
+
+        ctk.CTkButton(
+            row1, text="✕", font=ctk.CTkFont(size=10),
+            width=24, height=24, fg_color="transparent",
+            hover_color=COLORS["accent_red"],
+            text_color=COLORS["text_muted"], corner_radius=4,
+            command=lambda i=idx: self._remove_transform(i)
+        ).pack(side="right")
+
+        # Show arg fields for replace/regex_replace
+        if ct[1] in ("replace", "regex_replace"):
+            row2 = ctk.CTkFrame(frame, fg_color="transparent")
+            row2.pack(fill="x", padx=8, pady=(2, 6))
+
+            search_entry = ctk.CTkEntry(
+                row2, placeholder_text="Search...",
+                font=ctk.CTkFont(size=10), height=26, width=120,
+                fg_color=COLORS["bg_dark"],
+                border_color=COLORS["border"],
+                text_color=COLORS["text_primary"]
+            )
+            search_entry.pack(side="left", padx=(0, 4))
+            if len(ct) > 2:
+                search_entry.insert(0, ct[2])
+            search_entry.bind("<KeyRelease>",
+                              lambda e, i=idx: self._update_transform(i, arg1=e.widget.get()))
+
+            replace_entry = ctk.CTkEntry(
+                row2, placeholder_text="Replace with...",
+                font=ctk.CTkFont(size=10), height=26, width=120,
+                fg_color=COLORS["bg_dark"],
+                border_color=COLORS["border"],
+                text_color=COLORS["text_primary"]
+            )
+            replace_entry.pack(side="left")
+            if len(ct) > 3:
+                replace_entry.insert(0, ct[3])
+            replace_entry.bind("<KeyRelease>",
+                               lambda e, i=idx: self._update_transform(i, arg2=e.widget.get()))
+
     def get_config(self) -> tuple[bool, str, str]:
         return self.trim_whitespace.get(), self.case_transform.get(), self.empty_value.get()
+
+    def get_header_normalize(self) -> str:
+        return self.header_normalize.get()
+
+    def get_column_transforms(self) -> list:
+        return [ct for ct in self.column_transforms]
 
 
 class OutputPanel(ctk.CTkFrame):
@@ -1722,7 +2203,7 @@ class CSVPowerToolApp:
         # Version
         ver_badge = ctk.CTkFrame(header, fg_color=COLORS["bg_tertiary"], corner_radius=12)
         ver_badge.pack(side="right")
-        ctk.CTkLabel(ver_badge, text="v2.0", font=ctk.CTkFont(size=11),
+        ctk.CTkLabel(ver_badge, text="v3.0", font=ctk.CTkFont(size=11),
                      text_color=COLORS["text_muted"]).pack(padx=12, pady=4)
         
         # Content: 3 columns
@@ -1880,6 +2361,7 @@ class CSVPowerToolApp:
             self.sort_panel.set_columns(columns)
             self.dedupe_panel.set_columns(columns)
             self.filter_panel.set_columns(columns)
+            self.transform_panel.set_columns(columns)
     
     def _update_progress(self, value: float, status: str):
         self.progress_bar.set(value / 100)
@@ -1917,7 +2399,9 @@ class CSVPowerToolApp:
         config.trim_whitespace = trim
         config.case_transform = case
         config.empty_value = empty
-        
+        config.header_normalize = self.transform_panel.get_header_normalize()
+        config.column_transforms = self.transform_panel.get_column_transforms()
+
         # Output
         output_config = self.output_panel.get_config()
         config.output_delimiter = output_config["delimiter"]
@@ -1925,7 +2409,7 @@ class CSVPowerToolApp:
         config.output_quoting = output_config["quoting"]
         config.include_header = output_config["include_header"]
         config.line_ending = output_config["line_ending"]
-        
+
         return config
     
     def _process(self):
@@ -2004,6 +2488,9 @@ class CSVPowerToolApp:
                 "trim_whitespace": config.trim_whitespace,
                 "case_transform": config.case_transform,
                 "empty_value": config.empty_value,
+                "header_normalize": config.header_normalize,
+                "column_transforms": config.column_transforms,
+                "schema_mode": config.schema_mode,
                 "output_delimiter": config.output_delimiter,
                 "output_encoding": config.output_encoding,
                 "output_quoting": config.output_quoting,
@@ -2045,7 +2532,10 @@ class CSVPowerToolApp:
                 self.transform_panel.trim_whitespace.set(data.get("trim_whitespace", True))
                 self.transform_panel.case_transform.set(data.get("case_transform", "none"))
                 self.transform_panel.empty_value.set(data.get("empty_value", ""))
-                
+                self.transform_panel.header_normalize.set(data.get("header_normalize", "none"))
+                self.transform_panel.column_transforms = data.get("column_transforms", [])
+                self.transform_panel._refresh_transforms()
+
                 delim = data.get("output_delimiter", ",")
                 if delim == "\t":
                     delim = "\\t (Tab)"
@@ -2064,9 +2554,157 @@ class CSVPowerToolApp:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# CLI MODE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def cli_main():
+    """Headless CLI mode: csv_power_tool --config preset.json --inputs *.csv --output combined.csv"""
+    import argparse
+    import glob as globmod
+
+    parser = argparse.ArgumentParser(
+        prog="csv_power_tool",
+        description="CSV Power Tool - Professional-grade CSV combiner and processor (CLI mode)",
+    )
+    parser.add_argument("--config", "-c", help="JSON preset configuration file")
+    parser.add_argument("--inputs", "-i", nargs="+", required=True,
+                        help="Input CSV files or glob patterns (e.g. *.csv)")
+    parser.add_argument("--output", "-o", required=True, help="Output file path")
+    parser.add_argument("--delimiter", "-d", default=None, help="Output delimiter")
+    parser.add_argument("--encoding", "-e", default=None, help="Output encoding")
+    parser.add_argument("--no-header", action="store_true", help="Exclude header row")
+    parser.add_argument("--no-dedupe", action="store_true", help="Disable deduplication")
+    parser.add_argument("--sort", nargs="+", metavar="COL[:asc|desc]",
+                        help="Sort by columns, e.g. name:asc age:desc")
+    parser.add_argument("--columns", nargs="+", help="Include only these columns")
+    parser.add_argument("--exclude-columns", nargs="+", help="Exclude these columns")
+    parser.add_argument("--header-normalize", choices=["none", "trim", "lowercase", "snake_case"],
+                        default="none", help="Header normalization mode")
+    parser.add_argument("--schema-mode", choices=["union", "intersection", "first_file"],
+                        default="union", help="Schema unification mode")
+    parser.add_argument("--quiet", "-q", action="store_true", help="Suppress log output")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+
+    args = parser.parse_args()
+
+    # Expand glob patterns in inputs
+    input_files = []
+    for pattern in args.inputs:
+        expanded = globmod.glob(pattern)
+        if expanded:
+            input_files.extend([Path(f) for f in expanded])
+        else:
+            p = Path(pattern)
+            if p.exists():
+                input_files.append(p)
+            else:
+                print(f"Warning: No files matched: {pattern}", file=sys.stderr)
+
+    if not input_files:
+        print("Error: No input files found", file=sys.stderr)
+        sys.exit(1)
+
+    # Build config
+    config = ProcessingConfig()
+
+    # Load preset if provided
+    if args.config:
+        try:
+            with open(args.config, 'r') as f:
+                data = json.load(f)
+            for key, value in data.items():
+                if hasattr(config, key):
+                    setattr(config, key, value)
+        except Exception as e:
+            print(f"Error loading config: {e}", file=sys.stderr)
+            sys.exit(3)
+
+    # Apply CLI overrides
+    if args.delimiter:
+        delim = args.delimiter
+        if delim.lower() == "tab" or delim == "\\t":
+            delim = "\t"
+        config.output_delimiter = delim
+
+    if args.encoding:
+        config.output_encoding = args.encoding
+
+    if args.no_header:
+        config.include_header = False
+
+    if args.no_dedupe:
+        config.dedupe_enabled = False
+
+    if args.columns:
+        config.columns_mode = "select"
+        config.selected_columns = args.columns
+
+    if args.exclude_columns:
+        config.columns_mode = "exclude"
+        config.selected_columns = args.exclude_columns
+
+    config.header_normalize = args.header_normalize
+    config.schema_mode = args.schema_mode
+
+    if args.sort:
+        config.sort_enabled = True
+        config.sort_columns = []
+        for s in args.sort:
+            if ":" in s:
+                col, direction = s.rsplit(":", 1)
+                ascending = direction.lower() != "desc"
+            else:
+                col = s
+                ascending = True
+            config.sort_columns.append((col, ascending))
+
+    # Log callback
+    def log_msg(message, level="info"):
+        if args.quiet:
+            return
+        prefix = {"info": "  ", "success": "OK", "warning": "!!", "error": "XX"}.get(level, "  ")
+        print(f"[{prefix}] {message}", file=sys.stderr)
+
+    def progress_msg(value, status):
+        if args.verbose and not args.quiet:
+            print(f"  ... {status} ({value:.0f}%)", file=sys.stderr)
+
+    # Run engine
+    engine = CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg)
+    output_path = Path(args.output)
+
+    if not args.quiet:
+        print(f"CSV Power Tool - Processing {len(input_files)} file(s)...", file=sys.stderr)
+
+    stats = engine.process(input_files, output_path)
+
+    # Print summary
+    if not args.quiet:
+        print(f"\nResults:", file=sys.stderr)
+        print(f"  Files processed:    {stats.files_processed}", file=sys.stderr)
+        print(f"  Files skipped:      {stats.files_skipped}", file=sys.stderr)
+        print(f"  Total rows read:    {stats.total_rows_read:,}", file=sys.stderr)
+        print(f"  Rows filtered:      {stats.rows_filtered:,}", file=sys.stderr)
+        print(f"  Duplicates removed: {stats.duplicates_removed:,}", file=sys.stderr)
+        print(f"  Final row count:    {stats.final_row_count:,}", file=sys.stderr)
+        print(f"  Output: {output_path}", file=sys.stderr)
+
+    # Exit codes: 0 OK, 1 no input matched, 2 schema mismatch, 3 filter/transform error
+    if stats.files_processed == 0:
+        sys.exit(1)
+    if stats.errors:
+        sys.exit(3)
+    sys.exit(0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    app = CSVPowerToolApp()
-    app.run()
+    # If CLI arguments are present, run headless; otherwise launch GUI
+    if len(sys.argv) > 1 and any(a in sys.argv for a in ['--inputs', '-i', '--help', '-h']):
+        cli_main()
+    else:
+        app = CSVPowerToolApp()
+        app.run()
