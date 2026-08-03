@@ -25,7 +25,9 @@
 - **Drag & drop** support for adding files
 - Add individual files or entire folders
 - Support for CSV, TSV, TXT, Excel `.xlsx`, and Parquet files
+- Support for JSON Lines / NDJSON input and output
 - Auto-detection of file delimiters and encodings
+- Schema-drift reports with samples, inferred types, and detection confidence
 - Recursive folder import
 - Process unlimited files at once
 
@@ -57,6 +59,11 @@
   - Regex Match
 - Date-aware `Between` filtering with timezone normalization
 - Fuzzy match filtering
+- Fuzzy duplicate matching with aggregate modes
+- Optional source-file provenance column and canonical column template ordering
+- SQL-style inner, left, right, and outer joins from the CLI
+- Keyed three-way CSV merge with configurable conflict resolution
+- Optional sensitive-value redaction
 
 ### ⚙️ Data Transformations
 - Trim whitespace from all cells
@@ -74,6 +81,7 @@
 ### 🎯 Additional Features
 - Save and load configuration presets (JSON)
 - CLI mode with recursive inputs, filters, fuzzy dedupe, and watch mode
+- CLI pivot/unpivot reshaping and machine-readable schema reports
 - Bounded-memory streaming for text inputs when sort and dedupe are disabled
 - Real-time processing log with color-coded messages
 - Live statistics panel
@@ -107,6 +115,9 @@ python CSV_Consolidator.py --inputs data/*.csv --output combined.csv
 python CSV_Consolidator.py --inputs exports --filter "date:between:2024-01-01..2024-12-31" --output filtered.xlsx
 python CSV_Consolidator.py --inputs exports --fuzzy-dedupe-threshold 88 --output deduped.parquet
 python CSV_Consolidator.py --watch --inputs exports --output combined.csv
+python CSV_Consolidator.py --inputs exports --source-column "(Source)" --schema-report schema.json --output combined.csv
+python CSV_Consolidator.py --inputs left.csv right.csv --join-on id --join-type outer --output joined.csv
+python CSV_Consolidator.py --three-way-base base.csv --three-way-ours ours.csv --three-way-theirs theirs.csv --key-columns id --output merged.csv
 ```
 
 ---

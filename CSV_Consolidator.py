@@ -9,9 +9,11 @@ import sys
 import csv
 import re
 import json
+import copy
 import threading
 import time
 import locale
+from collections import Counter, defaultdict
 from pathlib import Path
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -20,9 +22,11 @@ from tkinter import filedialog, StringVar, BooleanVar, IntVar, END
 
 APP_NAME = "CSV Power Tool"
 APP_VERSION = "3.1.0"
-SUPPORTED_INPUT_SUFFIXES = {".csv", ".tsv", ".txt", ".xlsx", ".parquet"}
+SUPPORTED_INPUT_SUFFIXES = {".csv", ".tsv", ".txt", ".xlsx", ".parquet", ".jsonl", ".ndjson"}
 SUPPORTED_TEXT_SUFFIXES = {".csv", ".tsv", ".txt"}
-SUPPORTED_OUTPUT_SUFFIXES = {".csv", ".tsv", ".txt", ".xlsx", ".parquet"}
+SUPPORTED_JSONL_SUFFIXES = {".jsonl", ".ndjson"}
+SUPPORTED_STREAM_SUFFIXES = SUPPORTED_TEXT_SUFFIXES | SUPPORTED_JSONL_SUFFIXES
+SUPPORTED_OUTPUT_SUFFIXES = {".csv", ".tsv", ".txt", ".xlsx", ".parquet", ".jsonl", ".ndjson"}
 
 try:
     locale.setlocale(locale.LC_COLLATE, "")
@@ -142,6 +146,23 @@ class ProcessingConfig:
 
     # Schema unification
     schema_mode: str = "union"  # "union", "intersection", "first_file"
+    column_template: str = ""  # Optional input file whose header defines output order
+    source_column: str = ""  # Optional provenance column, e.g. "(Source)"
+    source_value: str = "name"  # "name" or "path"
+
+    # Reshaping
+    unpivot_columns: list = field(default_factory=list)
+    unpivot_name_column: str = "variable"
+    unpivot_value_column: str = "value"
+    pivot_index_columns: list = field(default_factory=list)
+    pivot_column: str = ""
+    pivot_value_column: str = ""
+    pivot_aggregate: str = "first"  # "first", "sum", "min", "max", "concat"
+    pivot_separator: str = "; "
+
+    # Data-quality and privacy helpers
+    redact_sensitive: bool = False
+    redaction_token: str = "[REDACTED]"
 
     # Output
     output_delimiter: str = ","
@@ -163,6 +184,8 @@ class ProcessingStats:
     final_row_count: int = 0
     unique_columns: int = 0
     errors: list = field(default_factory=list)
+    column_summary: dict = field(default_factory=dict)
+    input_diagnostics: dict = field(default_factory=dict)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -191,6 +214,72 @@ class CSVEngine:
         "not_in_list": lambda v, t: str(v).strip().lower() not in [x.strip().lower() for x in str(t).split(",")],
         "regex": lambda v, t: bool(re.search(t, str(v), re.IGNORECASE)),
     }
+
+    SENSITIVE_COLUMN_HINTS = {
+        "ssn", "social_security", "socialsecurity", "credit_card", "creditcard",
+        "card_number", "cardnumber", "cvv", "email", "e_mail", "phone",
+        "password", "secret", "token", "api_key", "apikey",
+    }
+    SENSITIVE_PATTERNS = (
+        re.compile(r"^\d{3}-\d{2}-\d{4}$"),
+        re.compile(r"^\d{13,19}$"),
+        re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$"),
+    )
+
+    @staticmethod
+    def _infer_value_type(value: str) -> str:
+        text = "" if value is None else str(value).strip()
+        if not text:
+            return "empty"
+        if text.lower() in {"true", "false", "yes", "no"}:
+            return "boolean"
+        if CSVEngine._parse_number(text) is not None:
+            return "number"
+        if CSVEngine._parse_datetime(text) is not None:
+            return "datetime"
+        return "text"
+
+    @classmethod
+    def infer_column_types(cls, rows: list[dict], columns: list[str] | None = None) -> dict:
+        """Return deterministic type counts and a best-effort type per column."""
+        columns = list(columns or [])
+        if not columns and rows:
+            columns = list(rows[0].keys())
+        result = {}
+        precedence = {"empty": 0, "boolean": 1, "number": 2, "datetime": 3, "text": 4}
+        for column in columns:
+            counts = Counter(cls._infer_value_type(row.get(column, "")) for row in rows)
+            non_empty = [kind for kind in counts if kind != "empty"]
+            if not non_empty:
+                inferred = "empty"
+            elif len(non_empty) == 1:
+                inferred = non_empty[0]
+            elif all(kind in {"number", "boolean"} for kind in non_empty):
+                inferred = "number"
+            else:
+                inferred = max(non_empty, key=lambda kind: precedence[kind])
+            result[column] = {
+                "type": inferred,
+                "counts": dict(sorted(counts.items())),
+            }
+        return result
+
+    @classmethod
+    def _looks_sensitive(cls, column: str, value: str) -> bool:
+        normalized = re.sub(r"[^a-z0-9]+", "_", str(column).lower()).strip("_")
+        if normalized in cls.SENSITIVE_COLUMN_HINTS:
+            return True
+        text = "" if value is None else str(value).strip()
+        return bool(text and any(pattern.fullmatch(text) for pattern in cls.SENSITIVE_PATTERNS))
+
+    def _redact_row(self, row: dict) -> dict:
+        if not getattr(self.config, "redact_sensitive", False):
+            return row
+        token = getattr(self.config, "redaction_token", "[REDACTED]")
+        return {
+            column: token if self._looks_sensitive(column, value) else value
+            for column, value in row.items()
+        }
 
     @staticmethod
     def _parse_number(value):
@@ -332,53 +421,71 @@ class CSVEngine:
         return name
 
     @staticmethod
-    def _detect_file_params(file_path: Path) -> tuple:
-        """Auto-detect encoding, delimiter, and quotechar for a file.
-        Returns (encoding, delimiter, quotechar)."""
-        # Try to detect encoding
-        encoding = 'utf-8'
+    def _detect_file_details(file_path: Path) -> dict:
+        """Detect text-file parameters and expose confidence for diagnostics."""
+        encoding = "utf-8"
+        encoding_confidence = 0.25
         try:
             import chardet
-            with open(file_path, 'rb') as f:
-                raw = f.read(min(32768, file_path.stat().st_size))
+            with open(file_path, "rb") as handle:
+                raw = handle.read(min(32768, file_path.stat().st_size))
             detection = chardet.detect(raw)
-            if detection and detection.get('encoding') and detection.get('confidence', 0) > 0.5:
-                encoding = detection['encoding']
-                # Normalize common encoding names
-                enc_lower = encoding.lower().replace('-', '').replace('_', '')
-                if enc_lower in ('ascii', 'utf8'):
-                    encoding = 'utf-8'
-                elif enc_lower in ('iso88591', 'latin1'):
-                    encoding = 'latin-1'
-                elif enc_lower in ('cp1252', 'windows1252'):
-                    encoding = 'cp1252'
-                elif enc_lower.startswith('utf16'):
-                    encoding = 'utf-16'
-        except ImportError:
-            pass  # chardet not available, fall back to trial-and-error
+            detected_encoding = detection.get("encoding") if detection else None
+            if detected_encoding:
+                enc_lower = detected_encoding.lower().replace("-", "").replace("_", "")
+                if enc_lower in ("ascii", "utf8"):
+                    encoding = "utf-8"
+                elif enc_lower in ("iso88591", "latin1"):
+                    encoding = "latin-1"
+                elif enc_lower in ("cp1252", "windows1252"):
+                    encoding = "cp1252"
+                elif enc_lower.startswith("utf16"):
+                    encoding = "utf-16"
+                else:
+                    encoding = detected_encoding
+                encoding_confidence = float(detection.get("confidence") or 0.0)
+        except (ImportError, OSError, ValueError):
+            pass
 
-        # Detect delimiter and quotechar using csv.Sniffer
-        delimiter = ','
+        delimiter = ","
         quotechar = '"'
-        for enc in [encoding, 'utf-8', 'latin-1', 'cp1252']:
+        delimiter_confidence = 0.2
+        sample = ""
+        for candidate_encoding in [encoding, "utf-8", "latin-1", "cp1252"]:
             try:
-                with open(file_path, 'r', encoding=enc, newline='') as f:
-                    sample = f.read(8192)
-                try:
-                    dialect = csv.Sniffer().sniff(sample, delimiters=',\t;|')
-                    delimiter = dialect.delimiter
-                    quotechar = dialect.quotechar or '"'
-                except csv.Error:
-                    # Sniffer failed, fall back to frequency counting
-                    for delim in [',', '\t', ';', '|']:
-                        if sample.count(delim) > sample.count(delimiter):
-                            delimiter = delim
-                encoding = enc
+                with open(file_path, "r", encoding=candidate_encoding, newline="") as handle:
+                    sample = handle.read(8192)
+                encoding = candidate_encoding
                 break
-            except UnicodeDecodeError:
+            except (UnicodeDecodeError, OSError):
                 continue
 
-        return encoding, delimiter, quotechar
+        if sample:
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
+                delimiter = dialect.delimiter
+                quotechar = dialect.quotechar or '"'
+                delimiter_confidence = 0.95
+            except csv.Error:
+                counts = {delim: sample.count(delim) for delim in [",", "\t", ";", "|"]}
+                delimiter = max(counts, key=counts.get)
+                if counts[delimiter] == 0:
+                    delimiter = ","
+                delimiter_confidence = 0.45 if counts[delimiter] else 0.2
+
+        return {
+            "encoding": encoding,
+            "delimiter": delimiter,
+            "quotechar": quotechar,
+            "encoding_confidence": round(max(0.0, min(1.0, encoding_confidence)), 3),
+            "delimiter_confidence": round(max(0.0, min(1.0, delimiter_confidence)), 3),
+        }
+
+    @staticmethod
+    def _detect_file_params(file_path: Path) -> tuple:
+        """Return the backwards-compatible (encoding, delimiter, quotechar) tuple."""
+        details = CSVEngine._detect_file_details(file_path)
+        return details["encoding"], details["delimiter"], details["quotechar"]
 
     @staticmethod
     def _cell_to_text(value) -> str:
@@ -433,6 +540,67 @@ class CSVEngine:
                     raise RuntimeError("pyarrow or polars is required for .parquet input") from exc
 
         return []
+
+    def _discover_jsonl_columns(self, file_path: Path) -> list[str]:
+        """Discover the union of object keys in a JSON Lines input."""
+        norm_mode = getattr(self.config, "header_normalize", "none")
+        columns = []
+        seen = set()
+        try:
+            with open(file_path, "r", encoding="utf-8-sig") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    value = json.loads(line)
+                    if not isinstance(value, dict):
+                        continue
+                    for key in value:
+                        normalized = self._normalize_header(str(key), norm_mode)
+                        if normalized and normalized not in seen:
+                            seen.add(normalized)
+                            columns.append(normalized)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return []
+        return columns
+
+    def _read_jsonl_file(self, file_path: Path, all_columns: set, column_order: list) -> list[dict]:
+        rows = []
+        norm_mode = getattr(self.config, "header_normalize", "none")
+        try:
+            with open(file_path, "r", encoding="utf-8-sig") as handle:
+                for line_number, line in enumerate(handle, 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        value = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        self.stats.errors.append(f"{file_path.name}:{line_number}: {exc}")
+                        continue
+                    if not isinstance(value, dict):
+                        self.stats.errors.append(f"{file_path.name}:{line_number}: expected a JSON object")
+                        continue
+                    cleaned = {}
+                    for key, raw_value in value.items():
+                        normalized = self._normalize_header(str(key), norm_mode)
+                        if not normalized:
+                            continue
+                        if normalized not in all_columns:
+                            all_columns.add(normalized)
+                            column_order.append(normalized)
+                        cleaned[normalized] = self._cell_to_text(raw_value)
+                        if self.config.trim_whitespace:
+                            cleaned[normalized] = cleaned[normalized].strip()
+                    rows.append(cleaned)
+        except (OSError, UnicodeDecodeError) as exc:
+            self.stats.files_skipped += 1
+            self.stats.errors.append(f"{file_path.name}: {exc}")
+            self.log(f"XX Error reading {file_path.name}: {exc}", "error")
+            return []
+
+        self.stats.files_processed += 1
+        self.stats.total_rows_read += len(rows)
+        self.log(f"OK {file_path.name} ({len(rows):,} JSON rows)", "success")
+        return rows
 
     def _read_structured_file(self, file_path: Path, all_columns: set, column_order: list) -> list[dict]:
         suffix = file_path.suffix.lower()
@@ -514,6 +682,16 @@ class CSVEngine:
         self.log_callback = log_callback
         self.cancelled = False
         self.stats = ProcessingStats()
+        self._input_diagnostics = {}
+        self._summary_distinct = defaultdict(set)
+        self._summary_non_empty = Counter()
+        self._summary_rows = Counter()
+        self._summary_types = defaultdict(Counter)
+        self._input_diagnostics = {}
+        self._summary_distinct = defaultdict(set)
+        self._summary_non_empty = Counter()
+        self._summary_rows = Counter()
+        self._summary_types = defaultdict(Counter)
     
     def log(self, message: str, level: str = "info"):
         if self.log_callback:
@@ -525,6 +703,85 @@ class CSVEngine:
     
     def cancel(self):
         self.cancelled = True
+
+    def _source_for_file(self, file_path: Path) -> str:
+        if getattr(self.config, "source_value", "name") == "path":
+            return str(file_path)
+        return file_path.name
+
+    def _add_source_column(self, rows: list[dict], file_path: Path, all_columns=None, column_order=None):
+        source_column = getattr(self.config, "source_column", "").strip()
+        if not source_column:
+            return rows
+        if all_columns is not None:
+            all_columns.add(source_column)
+        if column_order is not None and source_column not in column_order:
+            column_order.append(source_column)
+        source_value = self._source_for_file(file_path)
+        for row in rows:
+            row[source_column] = source_value
+        return rows
+
+    def _record_input_diagnostic(self, file_path: Path):
+        if file_path.suffix.lower() in SUPPORTED_TEXT_SUFFIXES:
+            details = self._detect_file_details(file_path)
+        else:
+            details = {
+                "encoding": None,
+                "delimiter": None,
+                "quotechar": None,
+                "encoding_confidence": 1.0,
+                "delimiter_confidence": 1.0,
+            }
+        self._input_diagnostics[str(file_path)] = details
+        self.stats.input_diagnostics = self._input_diagnostics
+
+    def _record_summary(self, row: dict, columns: list[str]):
+        for column in columns:
+            value = row.get(column, "")
+            text = "" if value is None else str(value)
+            self._summary_rows[column] += 1
+            if text.strip():
+                self._summary_non_empty[column] += 1
+                self._summary_distinct[column].add(text)
+            self._summary_types[column][self._infer_value_type(text)] += 1
+
+    def _finalize_summary(self, columns: list[str]):
+        self.stats.column_summary = {}
+        for column in columns:
+            values = self._summary_distinct.get(column, set())
+            type_counts = self._summary_types.get(column, {})
+            non_empty = [kind for kind in type_counts if kind != "empty"]
+            inferred = "empty" if not non_empty else (
+                non_empty[0] if len(non_empty) == 1 else (
+                    "number" if all(kind in {"number", "boolean"} for kind in non_empty)
+                    else "text"
+                )
+            )
+            self.stats.column_summary[column] = {
+                "row_count": self._summary_rows.get(column, 0),
+                "non_empty_count": self._summary_non_empty.get(column, 0),
+                "distinct_count": len(values),
+                "inferred_type": inferred,
+            }
+
+    def _compute_column_summary(self, rows: list[dict], columns: list[str]):
+        self._summary_distinct = defaultdict(set)
+        self._summary_non_empty = Counter()
+        self._summary_rows = Counter()
+        self._summary_types = defaultdict(Counter)
+        for row in rows:
+            self._record_summary(row, columns)
+        type_info = self.infer_column_types(rows, columns)
+        self.stats.column_summary = {}
+        for column in columns:
+            summary = type_info.get(column, {})
+            self.stats.column_summary[column] = {
+                "row_count": self._summary_rows.get(column, 0),
+                "non_empty_count": self._summary_non_empty.get(column, 0),
+                "distinct_count": len(self._summary_distinct.get(column, set())),
+                "inferred_type": summary.get("type", "empty"),
+            }
     
     def discover_columns(self, files: list[Path]) -> list[str]:
         """Discover all unique columns across files."""
@@ -536,6 +793,7 @@ class CSVEngine:
 
         for file_path in files:
             try:
+                self._record_input_diagnostic(file_path)
                 if file_path.suffix.lower() in SUPPORTED_TEXT_SUFFIXES:
                     encoding, delimiter, quotechar = self._detect_file_params(file_path)
                     with open(file_path, 'r', encoding=encoding, newline='') as f:
@@ -550,6 +808,13 @@ class CSVEngine:
                                     all_columns.append(col)
                                     seen.add(col)
                         per_file_columns.append(set(file_cols))
+                elif file_path.suffix.lower() in SUPPORTED_JSONL_SUFFIXES:
+                    file_cols = self._discover_jsonl_columns(file_path)
+                    for col in file_cols:
+                        if col not in seen:
+                            all_columns.append(col)
+                            seen.add(col)
+                    per_file_columns.append(set(file_cols))
                 else:
                     file_cols = self._discover_structured_columns(file_path)
                     for col in file_cols:
@@ -584,7 +849,218 @@ class CSVEngine:
             first_set = per_file_columns[0]
             all_columns = [c for c in all_columns if c in first_set]
 
+        source_column = getattr(self.config, "source_column", "").strip()
+        if source_column and source_column not in all_columns:
+            all_columns.append(source_column)
+
+        template = getattr(self.config, "column_template", "").strip()
+        if template:
+            template_path = Path(template)
+            if template_path.exists():
+                template_columns = CSVEngine(self.config)._discover_columns_without_source(template_path)
+                all_columns = [
+                    *[column for column in template_columns if column in all_columns],
+                    *[column for column in all_columns if column not in template_columns],
+                ]
+
         return all_columns
+
+    def _discover_columns_without_source(self, file_path: Path) -> list[str]:
+        """Discover one file's columns without applying provenance ordering."""
+        source_column = self.config.source_column
+        column_template = self.config.column_template
+        self.config.source_column = ""
+        self.config.column_template = ""
+        try:
+            return self.discover_columns([file_path])
+        finally:
+            self.config.source_column = source_column
+            self.config.column_template = column_template
+
+    def build_schema_report(self, files: list[Path], sample_limit: int = 3) -> dict:
+        """Build a machine-readable schema-drift and type-inference report."""
+        file_reports = []
+        union = []
+        union_seen = set()
+        for file_path in files:
+            probe = CSVEngine(copy.deepcopy(self.config))
+            all_columns = set()
+            column_order = []
+            rows = probe._read_file(file_path, all_columns, column_order)
+            columns = list(column_order)
+            for column in columns:
+                if column not in union_seen:
+                    union_seen.add(column)
+                    union.append(column)
+            file_reports.append({
+                "file": str(file_path),
+                "columns": columns,
+                "row_count": len(rows),
+                "samples": rows[:sample_limit],
+                "types": self.infer_column_types(rows, columns),
+                "diagnostics": probe._input_diagnostics.get(str(file_path), {}),
+            })
+
+        for report in file_reports:
+            present = set(report["columns"])
+            report["missing_columns"] = [column for column in union if column not in present]
+            report["extra_columns"] = [
+                column for column in report["columns"] if column not in union
+            ]
+
+        return {
+            "version": 1,
+            "files": file_reports,
+            "union_columns": union,
+            "common_columns": [
+                column for column in union
+                if all(column in set(report["columns"]) for report in file_reports)
+            ] if file_reports else [],
+        }
+
+    def write_schema_report(self, files: list[Path], report_path: Path) -> dict:
+        report = self.build_schema_report(files)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(report_path, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2, ensure_ascii=False)
+        return report
+
+    @staticmethod
+    def join_rows(
+        left_rows: list[dict],
+        right_rows: list[dict],
+        key_columns: list[str],
+        join_type: str = "inner",
+        right_suffix: str = "_right",
+    ) -> tuple[list[dict], list[str]]:
+        """Join two row collections while preserving left/right input order."""
+        join_type = "outer" if join_type == "full" else join_type
+        if join_type not in {"inner", "left", "right", "outer"}:
+            raise ValueError(f"Unsupported join type: {join_type}")
+        key_columns = list(key_columns)
+
+        def key_for(row):
+            return tuple(str(row.get(column, "")).casefold() for column in key_columns)
+
+        left_columns = list(dict.fromkeys(column for row in left_rows for column in row))
+        right_columns = list(dict.fromkeys(column for row in right_rows for column in row))
+        right_output_names = {}
+        output_columns = list(left_columns)
+        for column in right_columns:
+            if column in key_columns:
+                continue
+            candidate = column
+            if candidate in output_columns:
+                candidate = f"{column}{right_suffix}"
+                counter = 2
+                while candidate in output_columns:
+                    candidate = f"{column}{right_suffix}{counter}"
+                    counter += 1
+            right_output_names[column] = candidate
+            output_columns.append(candidate)
+
+        right_index = defaultdict(list)
+        for row in right_rows:
+            right_index[key_for(row)].append(row)
+
+        result = []
+        matched_right = set()
+
+        def merge(left, right):
+            merged = {column: left.get(column, "") for column in left_columns}
+            if right:
+                for column in right_columns:
+                    target = column if column in key_columns else right_output_names[column]
+                    if column in key_columns and not merged.get(column):
+                        merged[target] = right.get(column, "")
+                    elif column not in key_columns:
+                        merged[target] = right.get(column, "")
+            return merged
+
+        for left in left_rows:
+            matches = right_index.get(key_for(left), [])
+            if matches:
+                for right in matches:
+                    matched_right.add(id(right))
+                    result.append(merge(left, right))
+            elif join_type in {"left", "outer"}:
+                result.append(merge(left, None))
+
+        if join_type in {"right", "outer"}:
+            for right in right_rows:
+                if id(right) in matched_right:
+                    continue
+                result.append(merge({}, right))
+
+        return result, output_columns
+
+    @staticmethod
+    def three_way_merge_rows(
+        base_rows: list[dict],
+        ours_rows: list[dict],
+        theirs_rows: list[dict],
+        key_columns: list[str],
+        conflict_resolution: str = "ours",
+    ) -> tuple[list[dict], list[dict], list[str]]:
+        """Merge three keyed row sets and return rows, conflict details, and columns."""
+        if not key_columns:
+            sample = next(iter(ours_rows or theirs_rows or base_rows), None)
+            if not sample:
+                return [], [], []
+            key_columns = [next(iter(sample))]
+        if conflict_resolution not in {"ours", "theirs", "base", "mark"}:
+            raise ValueError(f"Unsupported conflict resolution: {conflict_resolution}")
+
+        def key_for(row):
+            return tuple(str(row.get(column, "")).casefold() for column in key_columns)
+
+        def index(rows):
+            return {key_for(row): row for row in rows}
+
+        base = index(base_rows)
+        ours = index(ours_rows)
+        theirs = index(theirs_rows)
+        order = list(dict.fromkeys([*base, *ours, *theirs]))
+        columns = list(dict.fromkeys(
+            column for row in [*base_rows, *ours_rows, *theirs_rows] for column in row
+        ))
+        merged_rows = []
+        conflicts = []
+
+        for key in order:
+            base_row = base.get(key)
+            ours_row = ours.get(key)
+            theirs_row = theirs.get(key)
+            if ours_row == theirs_row:
+                selected = ours_row or theirs_row
+            elif ours_row == base_row:
+                selected = theirs_row
+            elif theirs_row == base_row:
+                selected = ours_row
+            else:
+                selected = copy.deepcopy(ours_row or theirs_row or base_row or {})
+                changed_columns = []
+                for column in columns:
+                    base_value = (base_row or {}).get(column, "")
+                    ours_value = (ours_row or {}).get(column, "")
+                    theirs_value = (theirs_row or {}).get(column, "")
+                    if ours_value != theirs_value and ours_value != base_value and theirs_value != base_value:
+                        changed_columns.append(column)
+                        if conflict_resolution == "theirs":
+                            selected[column] = theirs_value
+                        elif conflict_resolution == "base":
+                            selected[column] = base_value
+                        elif conflict_resolution == "mark":
+                            selected[column] = f"<<<<<<< ours\n{ours_value}\n=======\n{theirs_value}\n>>>>>>> theirs"
+                        else:
+                            selected[column] = ours_value
+                if changed_columns:
+                    conflicts.append({"key": list(key), "columns": changed_columns})
+
+            if selected is not None:
+                merged_rows.append({column: selected.get(column, "") for column in columns})
+
+        return merged_rows, conflicts, columns
     
     def process(self, input_files: list[Path], output_file: Path) -> ProcessingStats:
         """Process CSV files according to configuration."""
@@ -612,9 +1088,7 @@ class CSVEngine:
             progress = (idx / total_files) * 40
             self.update_progress(progress, f"Reading {csv_path.name}...")
 
-            pre_cols = set(all_columns)
             rows_from_file = self._read_file(csv_path, all_columns, column_order)
-            new_cols = all_columns - pre_cols
             # Track which columns this file contributed
             # We need all columns that appeared in this file's headers
             file_cols = set()
@@ -655,6 +1129,16 @@ class CSVEngine:
             self.update_progress(55, "Applying transformations...")
             self.log("Phase 3: Applying transformations...", "info")
             all_rows = self._apply_transformations(all_rows, final_columns)
+
+        # Phase 3b: Optional pivot/unpivot reshaping
+        if not self.cancelled and (
+            getattr(self.config, "unpivot_columns", None)
+            or getattr(self.config, "pivot_column", "")
+        ):
+            self.update_progress(60, "Reshaping data...")
+            self.log("Phase 3b: Reshaping data...", "info")
+            all_rows, final_columns = self._apply_reshape(all_rows, final_columns)
+            self.stats.unique_columns = len(final_columns)
         
         # Phase 4: Deduplicate
         if self.config.dedupe_enabled and not self.cancelled:
@@ -667,6 +1151,10 @@ class CSVEngine:
             self.update_progress(80, "Sorting data...")
             self.log("Phase 5: Sorting data...", "info")
             all_rows = self._sort_rows(all_rows, final_columns)
+
+        all_rows = [self._redact_row(row) for row in all_rows]
+        output_columns = [self.config.column_mapping.get(c, c) for c in final_columns]
+        self._compute_column_summary(all_rows, output_columns)
         
         # Phase 6: Write output
         if not self.cancelled:
@@ -684,9 +1172,53 @@ class CSVEngine:
             return False
         if self.config.dedupe_enabled or self.config.sort_enabled:
             return False
-        if output_file.suffix.lower() not in SUPPORTED_TEXT_SUFFIXES:
+        if getattr(self.config, "unpivot_columns", None) or getattr(self.config, "pivot_column", ""):
             return False
-        return all(path.suffix.lower() in SUPPORTED_TEXT_SUFFIXES for path in input_files)
+        if output_file.suffix.lower() not in SUPPORTED_STREAM_SUFFIXES:
+            return False
+        return all(path.suffix.lower() in SUPPORTED_STREAM_SUFFIXES for path in input_files)
+
+    def _iter_jsonl_rows(self, file_path: Path):
+        if not file_path.exists():
+            self.log(f"XX File not found: {file_path.name}", "error")
+            self.stats.files_skipped += 1
+            self.stats.errors.append(f"Not found: {file_path.name}")
+            return
+
+        norm_mode = getattr(self.config, "header_normalize", "none")
+        row_count = 0
+        try:
+            with open(file_path, "r", encoding="utf-8-sig") as handle:
+                for line_number, line in enumerate(handle, 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        value = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        self.stats.errors.append(f"{file_path.name}:{line_number}: {exc}")
+                        continue
+                    if not isinstance(value, dict):
+                        self.stats.errors.append(f"{file_path.name}:{line_number}: expected a JSON object")
+                        continue
+                    row = {}
+                    for key, raw_value in value.items():
+                        normalized_key = self._normalize_header(str(key), norm_mode)
+                        if normalized_key:
+                            text_value = self._cell_to_text(raw_value)
+                            row[normalized_key] = text_value.strip() if self.config.trim_whitespace else text_value
+                    if self.config.source_column:
+                        row[self.config.source_column] = self._source_for_file(file_path)
+                    row_count += 1
+                    yield row
+        except (OSError, UnicodeDecodeError) as exc:
+            self.stats.files_skipped += 1
+            self.stats.errors.append(f"{file_path.name}: {exc}")
+            self.log(f"XX Error reading {file_path.name}: {exc}", "error")
+            return
+
+        self.stats.files_processed += 1
+        self.stats.total_rows_read += row_count
+        self.log(f"OK {file_path.name} ({row_count:,} JSON rows)", "success")
 
     def _iter_text_rows(self, file_path: Path):
         if not file_path.exists():
@@ -714,6 +1246,8 @@ class CSVEngine:
                             if normalized_key:
                                 text_value = value or ""
                                 cleaned_row[normalized_key] = text_value.strip() if self.config.trim_whitespace else text_value
+                        if self.config.source_column:
+                            cleaned_row[self.config.source_column] = self._source_for_file(file_path)
                         row_count += 1
                         yield cleaned_row
                     self.stats.files_processed += 1
@@ -736,6 +1270,7 @@ class CSVEngine:
         output_columns = [self.config.column_mapping.get(c, c) for c in final_columns]
         self.stats.unique_columns = len(discovered_order)
 
+        is_jsonl = output_file.suffix.lower() in SUPPORTED_JSONL_SUFFIXES
         quoting_map = {
             "minimal": csv.QUOTE_MINIMAL,
             "all": csv.QUOTE_ALL,
@@ -747,15 +1282,17 @@ class CSVEngine:
 
         output_file.parent.mkdir(parents=True, exist_ok=True)
         with open(output_file, 'w', encoding=self.config.output_encoding, newline=newline if newline else '') as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=output_columns,
-                delimiter=self.config.output_delimiter,
-                quoting=quoting,
-                extrasaction='ignore'
-            )
-            if self.config.include_header:
-                writer.writeheader()
+            writer = None
+            if not is_jsonl:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=output_columns,
+                    delimiter=self.config.output_delimiter,
+                    quoting=quoting,
+                    extrasaction='ignore'
+                )
+                if self.config.include_header:
+                    writer.writeheader()
 
             total_files = len(input_files)
             for idx, csv_path in enumerate(input_files):
@@ -766,15 +1303,31 @@ class CSVEngine:
                 progress = (idx / total_files) * 90
                 self.update_progress(progress, f"Streaming {csv_path.name}...")
 
-                for row in self._iter_text_rows(csv_path):
+                iterator = (
+                    self._iter_jsonl_rows(csv_path)
+                    if csv_path.suffix.lower() in SUPPORTED_JSONL_SUFFIXES
+                    else self._iter_text_rows(csv_path)
+                )
+                for row in iterator:
                     if self.config.filters and not self._row_matches_filters(row):
                         self.stats.rows_filtered += 1
                         continue
 
                     transformed = self._apply_transformations([row], final_columns)[0]
-                    writer.writerow(transformed)
+                    transformed = self._redact_row(transformed)
+                    if is_jsonl:
+                        json.dump(
+                            {column: transformed.get(column, "") for column in output_columns},
+                            f,
+                            ensure_ascii=False,
+                        )
+                        f.write("\n")
+                    else:
+                        writer.writerow(transformed)
+                    self._record_summary(transformed, output_columns)
                     self.stats.final_row_count += 1
 
+        self._finalize_summary(output_columns)
         self.update_progress(100, "Complete!")
         self.log(f"OK Saved: {output_file.name} ({self.stats.final_row_count:,} rows)", "success")
         return self.stats
@@ -789,8 +1342,15 @@ class CSVEngine:
             self.stats.errors.append(f"Not found: {file_path.name}")
             return rows
 
+        self._record_input_diagnostic(file_path)
+
+        if file_path.suffix.lower() in SUPPORTED_JSONL_SUFFIXES:
+            rows = self._read_jsonl_file(file_path, all_columns, column_order)
+            return self._add_source_column(rows, file_path, all_columns, column_order)
+
         if file_path.suffix.lower() not in SUPPORTED_TEXT_SUFFIXES:
-            return self._read_structured_file(file_path, all_columns, column_order)
+            rows = self._read_structured_file(file_path, all_columns, column_order)
+            return self._add_source_column(rows, file_path, all_columns, column_order)
 
         norm_mode = getattr(self.config, 'header_normalize', 'none')
 
@@ -827,7 +1387,7 @@ class CSVEngine:
                     self.stats.files_processed += 1
                     self.stats.total_rows_read += row_count
                     self.log(f"✓ {file_path.name} ({row_count:,} rows, {encoding}, delim={repr(detected_delim)})", "success")
-                    return rows
+                    return self._add_source_column(rows, file_path, all_columns, column_order)
 
             except UnicodeDecodeError:
                 continue
@@ -876,7 +1436,90 @@ class CSVEngine:
                 if new_col not in result:
                     result.append(new_col)
         return result
-    
+
+    def _mapped_value(self, row: dict, column: str):
+        mapped = self.config.column_mapping.get(column, column)
+        return row.get(mapped, row.get(column, ""))
+
+    def _apply_reshape(self, rows: list[dict], columns: list[str]) -> tuple[list[dict], list[str]]:
+        """Apply optional long-form unpivoting and wide-form pivoting."""
+        current_rows = rows
+        current_columns = list(columns)
+
+        unpivot_columns = [
+            column for column in getattr(self.config, "unpivot_columns", [])
+            if column in current_columns
+        ]
+        if unpivot_columns:
+            index_columns = [column for column in current_columns if column not in unpivot_columns]
+            name_column = getattr(self.config, "unpivot_name_column", "variable") or "variable"
+            value_column = getattr(self.config, "unpivot_value_column", "value") or "value"
+            reshaped = []
+            for row in current_rows:
+                for source_column in unpivot_columns:
+                    new_row = {
+                        self.config.column_mapping.get(column, column): self._mapped_value(row, column)
+                        for column in index_columns
+                    }
+                    new_row[name_column] = source_column
+                    new_row[value_column] = self._mapped_value(row, source_column)
+                    reshaped.append(new_row)
+            current_rows = reshaped
+            current_columns = index_columns + [name_column, value_column]
+
+        pivot_column = getattr(self.config, "pivot_column", "")
+        pivot_value_column = getattr(self.config, "pivot_value_column", "")
+        if pivot_column and pivot_value_column and pivot_column in current_columns and pivot_value_column in current_columns:
+            index_columns = [
+                column for column in getattr(self.config, "pivot_index_columns", [])
+                if column in current_columns and column not in {pivot_column, pivot_value_column}
+            ]
+            if not index_columns:
+                index_columns = [
+                    column for column in current_columns
+                    if column not in {pivot_column, pivot_value_column}
+                ]
+
+            groups = {}
+            pivot_values = []
+            for row in current_rows:
+                key = tuple(self._mapped_value(row, column) for column in index_columns)
+                if key not in groups:
+                    groups[key] = {
+                        self.config.column_mapping.get(column, column): value
+                        for column, value in zip(index_columns, key)
+                    }
+                pivot_value = str(self._mapped_value(row, pivot_column))
+                if pivot_value not in pivot_values:
+                    pivot_values.append(pivot_value)
+                target_column = pivot_value
+                incoming = self._mapped_value(row, pivot_value_column)
+                target_row = groups[key]
+                if target_column not in target_row:
+                    target_row[target_column] = incoming
+                else:
+                    mode = getattr(self.config, "pivot_aggregate", "first")
+                    if mode != "first":
+                        target_row[target_column] = self._aggregate_value(
+                            target_row[target_column],
+                            incoming,
+                            mode,
+                            getattr(self.config, "pivot_separator", "; "),
+                        )
+
+            current_rows = []
+            output_columns = [*index_columns, *pivot_values]
+            for group in groups.values():
+                current_rows.append({
+                    self.config.column_mapping.get(column, column): group.get(
+                        self.config.column_mapping.get(column, column), ""
+                    )
+                    for column in output_columns
+                })
+            current_columns = output_columns
+
+        return current_rows, current_columns
+
     def _apply_filters(self, rows: list[dict]) -> list[dict]:
         """Apply configured filters to rows."""
         if not self.config.filters:
@@ -937,8 +1580,6 @@ class CSVEngine:
                 new_col = ct[0]
                 if new_col not in columns and new_col not in extra_columns:
                     extra_columns.append(new_col)
-
-        all_columns = columns + extra_columns
 
         transformed = []
 
@@ -1205,9 +1846,6 @@ class CSVEngine:
                 keys.append(val)
             return keys
         
-        # Determine sort direction for each column
-        reverse_flags = [not asc for _, asc in self.config.sort_columns]
-        
         # Multi-column sort requires custom approach
         # Sort by last column first, then work backwards
         sorted_rows = rows.copy()
@@ -1243,6 +1881,9 @@ class CSVEngine:
         output_columns = [self.config.column_mapping.get(c, c) for c in columns]
 
         suffix = output_file.suffix.lower()
+        if suffix in SUPPORTED_JSONL_SUFFIXES:
+            self._write_jsonl_output(rows, output_columns, output_file)
+            return
         if suffix == ".xlsx":
             self._write_xlsx_output(rows, output_columns, output_file)
             return
@@ -1308,6 +1949,22 @@ class CSVEngine:
             for row in rows:
                 sheet.append([row.get(column, "") for column in output_columns])
             workbook.save(output_file)
+            self.log(f"OK Saved: {output_file.name} ({len(rows):,} rows)", "success")
+        except Exception as exc:
+            self.log(f"XX Error writing file: {exc}", "error")
+            self.stats.errors.append(f"Write error: {exc}")
+
+    def _write_jsonl_output(self, rows: list[dict], output_columns: list[str], output_file: Path):
+        try:
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_file, "w", encoding=self.config.output_encoding, newline="") as handle:
+                for row in rows:
+                    json.dump(
+                        {column: row.get(column, "") for column in output_columns},
+                        handle,
+                        ensure_ascii=False,
+                    )
+                    handle.write("\n")
             self.log(f"OK Saved: {output_file.name} ({len(rows):,} rows)", "success")
         except Exception as exc:
             self.log(f"XX Error writing file: {exc}", "error")
@@ -1508,7 +2165,7 @@ class FileListPanel(ctk.CTkFrame):
         try:
             size = path.stat().st_size
             size_text = f"{size/1024:.1f}KB" if size >= 1024 else f"{size}B"
-        except:
+        except OSError:
             size_text = ""
         
         ctk.CTkLabel(
@@ -3045,7 +3702,7 @@ class CSVPowerToolApp:
             self.engine = CSVEngine(
                 config,
                 progress_callback=lambda v, s: self.root.after(0, lambda: self._update_progress(v, s)),
-                log_callback=lambda m, l: self.root.after(0, lambda: self.log_panel.log(m, l))
+                log_callback=lambda m, level: self.root.after(0, lambda: self.log_panel.log(m, level))
             )
             
             stats = self.engine.process(self.file_panel.files, Path(output_path))
@@ -3173,6 +3830,25 @@ class CSVPowerToolApp:
 # CLI MODE
 # ══════════════════════════════════════════════════════════════════════════════
 
+def register_git_driver() -> None:
+    """Register a local, unsigned three-way CSV merge driver in Git."""
+    import subprocess
+
+    script = Path(__file__).resolve()
+    driver = (
+        f'"{sys.executable}" "{script}" '
+        "--three-way-base %O --three-way-ours %A --three-way-theirs %B --output %A"
+    )
+    commands = [
+        ["git", "config", "--local", "merge.csvpower.name", "CSV Power Tool three-way merge"],
+        ["git", "config", "--local", "merge.csvpower.driver", driver],
+        ["git", "config", "--local", "merge.csvpower.recursive", "binary"],
+    ]
+    for command in commands:
+        subprocess.run(command, check=True)
+    print("Registered the local csvpower merge driver. Add '*.csv merge=csvpower' to .gitattributes.")
+
+
 def cli_main():
     """Headless CLI mode: csv_power_tool --config preset.json --inputs *.csv --output combined.csv"""
     import argparse
@@ -3183,9 +3859,9 @@ def cli_main():
         description="CSV Power Tool - Professional-grade CSV combiner and processor (CLI mode)",
     )
     parser.add_argument("--config", "-c", help="JSON preset configuration file")
-    parser.add_argument("--inputs", "-i", nargs="+", required=True,
+    parser.add_argument("--inputs", "-i", nargs="+",
                         help="Input files, folders, or glob patterns (e.g. *.csv)")
-    parser.add_argument("--output", "-o", required=True, help="Output file path")
+    parser.add_argument("--output", "-o", help="Output file path")
     parser.add_argument("--delimiter", "-d", default=None, help="Output delimiter")
     parser.add_argument("--encoding", "-e", default=None, help="Output encoding")
     parser.add_argument("--no-header", action="store_true", help="Exclude header row")
@@ -3206,6 +3882,28 @@ def cli_main():
                         default="none", help="Header normalization mode")
     parser.add_argument("--schema-mode", choices=["union", "intersection", "first_file"],
                         default="union", help="Schema unification mode")
+    parser.add_argument("--column-template", help="Use this input's column order as the output template")
+    parser.add_argument("--source-column", help="Add a provenance column containing each source file")
+    parser.add_argument("--source-path", action="store_true", help="Store the full source path instead of the file name")
+    parser.add_argument("--schema-report", help="Write a JSON schema-drift, sample, and type report")
+    parser.add_argument("--redact-sensitive", action="store_true", help="Redact likely email, phone, SSN, card, and secret fields")
+    parser.add_argument("--redaction-token", default="[REDACTED]", help="Replacement text used by --redact-sensitive")
+    parser.add_argument("--unpivot", nargs="+", metavar="COLUMN", help="Unpivot these columns into name/value rows")
+    parser.add_argument("--unpivot-name", default="variable", help="Unpivoted column containing source column names")
+    parser.add_argument("--unpivot-value", default="value", help="Unpivoted column containing source values")
+    parser.add_argument("--pivot-index", nargs="+", metavar="COLUMN", help="Index columns for a pivot")
+    parser.add_argument("--pivot-column", help="Column whose values become pivoted columns")
+    parser.add_argument("--pivot-value", help="Column whose values populate pivoted columns")
+    parser.add_argument("--pivot-aggregate", choices=["first", "sum", "min", "max", "concat"], default="first")
+    parser.add_argument("--pivot-separator", default="; ", help="Separator for pivot concat aggregation")
+    parser.add_argument("--join-on", nargs="+", metavar="COLUMN", help="Join two or more inputs on these columns")
+    parser.add_argument("--join-type", choices=["inner", "left", "right", "outer"], default="inner")
+    parser.add_argument("--three-way-base", help="Base input for a three-way keyed merge")
+    parser.add_argument("--three-way-ours", help="Ours input for a three-way keyed merge")
+    parser.add_argument("--three-way-theirs", help="Theirs input for a three-way keyed merge")
+    parser.add_argument("--key-columns", nargs="+", metavar="COLUMN", help="Key columns for a three-way merge")
+    parser.add_argument("--conflict-resolution", choices=["ours", "theirs", "base", "mark"], default="ours")
+    parser.add_argument("--register-git-driver", action="store_true", help="Register the local csvpower merge driver")
     parser.add_argument("--no-stream", action="store_true", help="Disable bounded-memory streaming path")
     parser.add_argument("--watch", action="store_true",
                         help="Watch inputs and re-run whenever matching files change")
@@ -3216,6 +3914,17 @@ def cli_main():
     parser.add_argument("--version", action="version", version=f"{APP_NAME} v{APP_VERSION}")
 
     args = parser.parse_args()
+
+    if args.register_git_driver:
+        try:
+            register_git_driver()
+        except Exception as exc:
+            print(f"Error registering git driver: {exc}", file=sys.stderr)
+            sys.exit(3)
+        return
+
+    if not args.inputs or not args.output:
+        parser.error("--inputs and --output are required unless --register-git-driver is used")
 
     def expand_inputs(patterns):
         input_files = []
@@ -3298,6 +4007,26 @@ def cli_main():
     config.header_normalize = args.header_normalize
     config.schema_mode = args.schema_mode
     config.streaming_enabled = not args.no_stream
+    if args.column_template:
+        config.column_template = args.column_template
+    if args.source_column:
+        config.source_column = args.source_column
+        config.source_value = "path" if args.source_path else "name"
+    config.redact_sensitive = args.redact_sensitive
+    config.redaction_token = args.redaction_token
+    if args.unpivot:
+        config.unpivot_columns = args.unpivot
+        config.unpivot_name_column = args.unpivot_name
+        config.unpivot_value_column = args.unpivot_value
+    if args.pivot_column or args.pivot_value:
+        if not args.pivot_column or not args.pivot_value:
+            print("Error: --pivot-column and --pivot-value must be supplied together", file=sys.stderr)
+            sys.exit(3)
+        config.pivot_index_columns = args.pivot_index or []
+        config.pivot_column = args.pivot_column
+        config.pivot_value_column = args.pivot_value
+        config.pivot_aggregate = args.pivot_aggregate
+        config.pivot_separator = args.pivot_separator
 
     if args.filter:
         for spec in args.filter:
@@ -3336,6 +4065,57 @@ def cli_main():
 
     output_path = Path(args.output)
 
+    def read_operation_file(engine, path):
+        all_columns = set()
+        column_order = []
+        rows = engine._read_file(Path(path), all_columns, column_order)
+        return rows, column_order
+
+    def run_join(input_files):
+        if len(input_files) < 2:
+            print("Error: --join-on requires at least two input files", file=sys.stderr)
+            return 3
+        engine = CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg)
+        left_rows, left_columns = read_operation_file(engine, input_files[0])
+        for path in input_files[1:]:
+            right_rows, right_columns = read_operation_file(engine, path)
+            left_rows, joined_columns = CSVEngine.join_rows(
+                left_rows,
+                right_rows,
+                args.join_on,
+                args.join_type,
+            )
+            left_columns = joined_columns
+        if config.filters:
+            left_rows = engine._apply_filters(left_rows)
+        left_rows = engine._apply_transformations(left_rows, left_columns)
+        left_rows = [engine._redact_row(row) for row in left_rows]
+        engine.stats.unique_columns = len(left_columns)
+        engine.stats.final_row_count = len(left_rows)
+        engine._compute_column_summary(left_rows, [config.column_mapping.get(c, c) for c in left_columns])
+        engine._write_output(left_rows, left_columns, output_path)
+        if not args.quiet:
+            print(f"  Joined rows: {engine.stats.final_row_count:,}", file=sys.stderr)
+        return 3 if engine.stats.errors else 0
+
+    def run_three_way_merge():
+        paths = [args.three_way_base, args.three_way_ours, args.three_way_theirs]
+        if not all(paths):
+            print("Error: --three-way-base, --three-way-ours, and --three-way-theirs are required together", file=sys.stderr)
+            return 3
+        engine = CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg)
+        loaded = [read_operation_file(engine, path)[0] for path in paths]
+        rows, conflicts, columns = CSVEngine.three_way_merge_rows(
+            loaded[0], loaded[1], loaded[2], args.key_columns or [], args.conflict_resolution
+        )
+        engine.stats.unique_columns = len(columns)
+        engine.stats.final_row_count = len(rows)
+        engine._compute_column_summary(rows, columns)
+        engine._write_output(rows, columns, output_path)
+        if conflicts and not args.quiet:
+            print(f"!! Three-way merge produced {len(conflicts)} conflict(s) using {args.conflict_resolution}", file=sys.stderr)
+        return 3 if engine.stats.errors else 0
+
     def run_once(input_files):
         if not input_files:
             print("Error: No input files found", file=sys.stderr)
@@ -3343,13 +4123,21 @@ def cli_main():
 
         engine = CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg)
 
+        if args.schema_report:
+            engine.write_schema_report(input_files, Path(args.schema_report))
+            if not args.quiet:
+                print(f"  Schema report: {args.schema_report}", file=sys.stderr)
+
+        if args.join_on:
+            return run_join(input_files)
+
         if not args.quiet:
             print(f"CSV Power Tool - Processing {len(input_files)} file(s)...", file=sys.stderr)
 
         stats = engine.process(input_files, output_path)
 
         if not args.quiet:
-            print(f"\nResults:", file=sys.stderr)
+            print("\nResults:", file=sys.stderr)
             print(f"  Files processed:    {stats.files_processed}", file=sys.stderr)
             print(f"  Files skipped:      {stats.files_skipped}", file=sys.stderr)
             print(f"  Total rows read:    {stats.total_rows_read:,}", file=sys.stderr)
@@ -3363,6 +4151,9 @@ def cli_main():
         if stats.errors:
             return 3
         return 0
+
+    if args.three_way_base or args.three_way_ours or args.three_way_theirs:
+        sys.exit(run_three_way_merge())
 
     def input_signature(input_files):
         signature = []
