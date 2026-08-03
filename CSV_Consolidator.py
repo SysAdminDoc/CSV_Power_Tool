@@ -5,40 +5,52 @@ Professional-grade CSV file combiner and processor.
 Merge, filter, transform, deduplicate, and export CSV data with full control.
 """
 
-import subprocess
 import sys
-
-def install_dependencies():
-    """Install required packages if not present."""
-    required = ["customtkinter", "tkinterdnd2"]
-    for package in required:
-        try:
-            __import__(package)
-        except ImportError:
-            print(f"Installing {package}...")
-            subprocess.check_call([
-                sys.executable, "-m", "pip", "install", package,
-                "--quiet", "--break-system-packages"
-            ])
-
-install_dependencies()
-
 import csv
 import re
 import json
 import threading
+import time
+import locale
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Callable
 from tkinter import filedialog, StringVar, BooleanVar, IntVar, END
-import customtkinter as ctk
+
+APP_NAME = "CSV Power Tool"
+APP_VERSION = "3.1.0"
+SUPPORTED_INPUT_SUFFIXES = {".csv", ".tsv", ".txt", ".xlsx", ".parquet"}
+SUPPORTED_TEXT_SUFFIXES = {".csv", ".tsv", ".txt"}
+SUPPORTED_OUTPUT_SUFFIXES = {".csv", ".tsv", ".txt", ".xlsx", ".parquet"}
+
+try:
+    locale.setlocale(locale.LC_COLLATE, "")
+except locale.Error:
+    pass
+
+
+GUI_IMPORT_ERROR = None
+try:
+    import customtkinter as ctk
+except ImportError as exc:
+    GUI_IMPORT_ERROR = exc
+
+    class _MissingCTkFrame:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("customtkinter is required for GUI mode")
+
+    class _MissingCTk:
+        CTkFrame = _MissingCTkFrame
+
+    ctk = _MissingCTk()
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
-    DND_AVAILABLE = True
 except ImportError:
     DND_AVAILABLE = False
+else:
+    DND_AVAILABLE = GUI_IMPORT_ERROR is None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -105,6 +117,10 @@ class ProcessingConfig:
     dedupe_enabled: bool = True
     dedupe_columns: list = field(default_factory=list)  # Empty = all columns
     dedupe_keep: str = "first"  # "first", "last", "none"
+    dedupe_fuzzy_enabled: bool = False
+    dedupe_fuzzy_threshold: int = 90
+    dedupe_aggregate_mode: str = "none"  # "none", "max", "min", "sum", "concat"
+    dedupe_aggregate_separator: str = "; "
 
     # Filtering
     filters: list = field(default_factory=list)  # [(column, operator, value), ...]
@@ -133,6 +149,7 @@ class ProcessingConfig:
     output_quoting: str = "minimal"  # "minimal", "all", "nonnumeric", "none"
     include_header: bool = True
     line_ending: str = "auto"  # "auto", "unix", "windows"
+    streaming_enabled: bool = True
 
 
 @dataclass 
@@ -169,41 +186,127 @@ class CSVEngine:
         "greater_than_or_equal": lambda v, t: CSVEngine._numeric_compare(v, t, ">="),
         "less_than_or_equal": lambda v, t: CSVEngine._numeric_compare(v, t, "<="),
         "between": lambda v, t: CSVEngine._between(v, t),
+        "fuzzy": lambda v, t: CSVEngine._fuzzy_match(v, t),
         "in_list": lambda v, t: str(v).strip().lower() in [x.strip().lower() for x in str(t).split(",")],
         "not_in_list": lambda v, t: str(v).strip().lower() not in [x.strip().lower() for x in str(t).split(",")],
         "regex": lambda v, t: bool(re.search(t, str(v), re.IGNORECASE)),
     }
 
     @staticmethod
-    def _numeric_compare(v, t, op):
+    def _parse_number(value):
         try:
-            v_num = float(str(v).replace(",", ""))
-            t_num = float(str(t).replace(",", ""))
-            if op == ">":
-                return v_num > t_num
-            elif op == "<":
-                return v_num < t_num
-            elif op == ">=":
-                return v_num >= t_num
-            elif op == "<=":
-                return v_num <= t_num
-            return False
+            return float(str(value).replace(",", "").strip())
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _parse_datetime(value):
+        """Parse common date/time strings and normalize aware values to UTC."""
+        text = str(value).strip()
+        if not text:
+            return None
+
+        normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+        try:
+            parsed = datetime.fromisoformat(normalized)
         except ValueError:
+            parsed = None
+
+        if parsed is None:
+            formats = [
+                "%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d",
+                "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%d/%m/%Y %H:%M:%S",
+                "%Y-%m-%d %H:%M", "%m/%d/%Y %H:%M", "%d/%m/%Y %H:%M",
+                "%b %d %Y", "%B %d %Y", "%d %b %Y", "%d %B %Y",
+            ]
+            for fmt in formats:
+                try:
+                    parsed = datetime.strptime(text.replace(",", ""), fmt)
+                    break
+                except ValueError:
+                    continue
+
+        if parsed is None:
+            try:
+                from email.utils import parsedate_to_datetime
+                parsed = parsedate_to_datetime(text)
+            except (TypeError, ValueError, IndexError):
+                return None
+
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
+
+    @staticmethod
+    def _numeric_compare(v, t, op):
+        v_num = CSVEngine._parse_number(v)
+        t_num = CSVEngine._parse_number(t)
+        if v_num is None or t_num is None:
             return False
+        if op == ">":
+            return v_num > t_num
+        elif op == "<":
+            return v_num < t_num
+        elif op == ">=":
+            return v_num >= t_num
+        elif op == "<=":
+            return v_num <= t_num
+        return False
 
     @staticmethod
     def _between(v, t):
-        """Check if value is between two numbers separated by comma. E.g. '10,20'."""
-        try:
-            parts = str(t).split(",")
-            if len(parts) != 2:
-                return False
-            lo = float(parts[0].strip())
-            hi = float(parts[1].strip())
-            val = float(str(v).replace(",", ""))
-            return lo <= val <= hi
-        except ValueError:
+        """Check if a number or date is between two bounds."""
+        parts = None
+        target = str(t)
+        for separator in ("..", "|", ","):
+            split = target.split(separator)
+            if len(split) == 2:
+                parts = [split[0].strip(), split[1].strip()]
+                break
+        if parts is None:
             return False
+
+        val_num = CSVEngine._parse_number(v)
+        lo_num = CSVEngine._parse_number(parts[0])
+        hi_num = CSVEngine._parse_number(parts[1])
+        if val_num is not None and lo_num is not None and hi_num is not None:
+            return lo_num <= val_num <= hi_num
+
+        val_date = CSVEngine._parse_datetime(v)
+        lo_date = CSVEngine._parse_datetime(parts[0])
+        hi_date = CSVEngine._parse_datetime(parts[1])
+        if val_date and lo_date and hi_date:
+            return lo_date <= val_date <= hi_date
+
+        return False
+
+    @staticmethod
+    def _fuzzy_match(v, t):
+        """Return True when v is similar to target. Target may be 'text|90'."""
+        target = str(t).strip()
+        threshold = 85
+        for separator in ("|", ","):
+            candidate, sep, maybe_threshold = target.rpartition(separator)
+            if sep and maybe_threshold.strip().isdigit():
+                target = candidate.strip()
+                threshold = int(maybe_threshold.strip())
+                break
+
+        if not target:
+            return False
+
+        value = str(v).strip()
+        value_lower = value.lower()
+        target_lower = target.lower()
+        if target_lower in value_lower or value_lower in target_lower:
+            return True
+        try:
+            from rapidfuzz import fuzz
+            score = fuzz.partial_ratio(value_lower, target_lower)
+        except ImportError:
+            from difflib import SequenceMatcher
+            score = SequenceMatcher(None, value_lower, target_lower).ratio() * 100
+        return score >= threshold
 
     @staticmethod
     def _normalize_header(name: str, mode: str) -> str:
@@ -276,6 +379,132 @@ class CSVEngine:
                 continue
 
         return encoding, delimiter, quotechar
+
+    @staticmethod
+    def _cell_to_text(value) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, datetime):
+            return value.isoformat()
+        return str(value)
+
+    def _discover_structured_columns(self, file_path: Path) -> list[str]:
+        suffix = file_path.suffix.lower()
+        norm_mode = getattr(self.config, 'header_normalize', 'none')
+
+        if suffix == ".xlsx":
+            try:
+                from openpyxl import load_workbook
+            except ImportError as exc:
+                raise RuntimeError("openpyxl is required for .xlsx input") from exc
+
+            workbook = load_workbook(file_path, read_only=True, data_only=True)
+            try:
+                sheet = workbook.active
+                rows = sheet.iter_rows(values_only=True)
+                headers = next(rows, [])
+                return [
+                    self._normalize_header(self._cell_to_text(col), norm_mode)
+                    for col in headers
+                    if self._normalize_header(self._cell_to_text(col), norm_mode)
+                ]
+            finally:
+                workbook.close()
+
+        if suffix == ".parquet":
+            try:
+                import pyarrow.parquet as pq
+                schema = pq.read_schema(file_path)
+                return [
+                    self._normalize_header(name, norm_mode)
+                    for name in schema.names
+                    if self._normalize_header(name, norm_mode)
+                ]
+            except ImportError:
+                try:
+                    import polars as pl
+                    frame = pl.scan_parquet(file_path)
+                    return [
+                        self._normalize_header(name, norm_mode)
+                        for name in frame.collect_schema().names()
+                        if self._normalize_header(name, norm_mode)
+                    ]
+                except ImportError as exc:
+                    raise RuntimeError("pyarrow or polars is required for .parquet input") from exc
+
+        return []
+
+    def _read_structured_file(self, file_path: Path, all_columns: set, column_order: list) -> list[dict]:
+        suffix = file_path.suffix.lower()
+        norm_mode = getattr(self.config, 'header_normalize', 'none')
+        rows = []
+
+        if suffix == ".xlsx":
+            try:
+                from openpyxl import load_workbook
+
+                workbook = load_workbook(file_path, read_only=True, data_only=True)
+                try:
+                    sheet = workbook.active
+                    row_iter = sheet.iter_rows(values_only=True)
+                    raw_headers = next(row_iter, [])
+                    headers = [
+                        self._normalize_header(self._cell_to_text(header), norm_mode)
+                        for header in raw_headers
+                    ]
+
+                    for col in headers:
+                        if col and col not in all_columns:
+                            all_columns.add(col)
+                            column_order.append(col)
+
+                    for values in row_iter:
+                        cleaned_row = {}
+                        for idx, header in enumerate(headers):
+                            if not header:
+                                continue
+                            value = values[idx] if idx < len(values) else ""
+                            cleaned_row[header] = self._cell_to_text(value).strip() if self.config.trim_whitespace else self._cell_to_text(value)
+                        rows.append(cleaned_row)
+                finally:
+                    workbook.close()
+            except Exception as exc:
+                self.log(f"XX Error reading {file_path.name}: {exc}", "error")
+                self.stats.files_skipped += 1
+                self.stats.errors.append(f"{file_path.name}: {exc}")
+                return []
+
+        elif suffix == ".parquet":
+            try:
+                try:
+                    import pyarrow.parquet as pq
+                    table = pq.read_table(file_path)
+                    records = table.to_pylist()
+                except ImportError:
+                    import polars as pl
+                    records = pl.read_parquet(file_path).to_dicts()
+
+                for record in records:
+                    cleaned_row = {}
+                    for key, value in record.items():
+                        header = self._normalize_header(str(key), norm_mode)
+                        if not header:
+                            continue
+                        if header not in all_columns:
+                            all_columns.add(header)
+                            column_order.append(header)
+                        cleaned_row[header] = self._cell_to_text(value).strip() if self.config.trim_whitespace else self._cell_to_text(value)
+                    rows.append(cleaned_row)
+            except Exception as exc:
+                self.log(f"XX Error reading {file_path.name}: {exc}", "error")
+                self.stats.files_skipped += 1
+                self.stats.errors.append(f"{file_path.name}: {exc}")
+                return []
+
+        self.stats.files_processed += 1
+        self.stats.total_rows_read += len(rows)
+        self.log(f"OK {file_path.name} ({len(rows):,} rows)", "success")
+        return rows
     
     def __init__(self, config: ProcessingConfig, 
                  progress_callback: Callable = None,
@@ -307,18 +536,26 @@ class CSVEngine:
 
         for file_path in files:
             try:
-                encoding, delimiter, quotechar = self._detect_file_params(file_path)
-                with open(file_path, 'r', encoding=encoding, newline='') as f:
-                    reader = csv.reader(f, delimiter=delimiter, quotechar=quotechar)
-                    headers = next(reader, [])
-                    file_cols = []
-                    for col in headers:
-                        col = self._normalize_header(col, norm_mode)
-                        if col:
-                            file_cols.append(col)
-                            if col not in seen:
-                                all_columns.append(col)
-                                seen.add(col)
+                if file_path.suffix.lower() in SUPPORTED_TEXT_SUFFIXES:
+                    encoding, delimiter, quotechar = self._detect_file_params(file_path)
+                    with open(file_path, 'r', encoding=encoding, newline='') as f:
+                        reader = csv.reader(f, delimiter=delimiter, quotechar=quotechar)
+                        headers = next(reader, [])
+                        file_cols = []
+                        for col in headers:
+                            col = self._normalize_header(col, norm_mode)
+                            if col:
+                                file_cols.append(col)
+                                if col not in seen:
+                                    all_columns.append(col)
+                                    seen.add(col)
+                        per_file_columns.append(set(file_cols))
+                else:
+                    file_cols = self._discover_structured_columns(file_path)
+                    for col in file_cols:
+                        if col not in seen:
+                            all_columns.append(col)
+                            seen.add(col)
                     per_file_columns.append(set(file_cols))
             except Exception:
                 try:
@@ -353,6 +590,9 @@ class CSVEngine:
         """Process CSV files according to configuration."""
         self.cancelled = False
         self.stats = ProcessingStats()
+
+        if self._can_stream(input_files, output_file):
+            return self._process_streaming(input_files, output_file)
 
         all_rows = []
         all_columns = set()
@@ -402,6 +642,7 @@ class CSVEngine:
 
         # Determine final columns
         final_columns = self._get_final_columns(column_order)
+        final_columns = self._with_transform_columns(final_columns)
         
         # Phase 2: Apply filters
         if self.config.filters and not self.cancelled:
@@ -437,6 +678,106 @@ class CSVEngine:
         self.update_progress(100, "Complete!")
         
         return self.stats
+
+    def _can_stream(self, input_files: list[Path], output_file: Path) -> bool:
+        if not getattr(self.config, "streaming_enabled", True):
+            return False
+        if self.config.dedupe_enabled or self.config.sort_enabled:
+            return False
+        if output_file.suffix.lower() not in SUPPORTED_TEXT_SUFFIXES:
+            return False
+        return all(path.suffix.lower() in SUPPORTED_TEXT_SUFFIXES for path in input_files)
+
+    def _iter_text_rows(self, file_path: Path):
+        if not file_path.exists():
+            self.log(f"XX File not found: {file_path.name}", "error")
+            self.stats.files_skipped += 1
+            self.stats.errors.append(f"Not found: {file_path.name}")
+            return
+
+        norm_mode = getattr(self.config, 'header_normalize', 'none')
+        detected_enc, detected_delim, detected_quote = self._detect_file_params(file_path)
+        encodings_to_try = [detected_enc]
+        for fallback in ['utf-8', 'latin-1', 'cp1252', 'utf-16']:
+            if fallback not in encodings_to_try:
+                encodings_to_try.append(fallback)
+
+        for encoding in encodings_to_try:
+            try:
+                with open(file_path, 'r', encoding=encoding, newline='') as f:
+                    reader = csv.DictReader(f, delimiter=detected_delim, quotechar=detected_quote)
+                    row_count = 0
+                    for row in reader:
+                        cleaned_row = {}
+                        for key, value in row.items():
+                            normalized_key = self._normalize_header(key, norm_mode) if key else ""
+                            if normalized_key:
+                                text_value = value or ""
+                                cleaned_row[normalized_key] = text_value.strip() if self.config.trim_whitespace else text_value
+                        row_count += 1
+                        yield cleaned_row
+                    self.stats.files_processed += 1
+                    self.stats.total_rows_read += row_count
+                    self.log(f"OK {file_path.name} ({row_count:,} rows, {encoding}, delim={repr(detected_delim)})", "success")
+                    return
+            except UnicodeDecodeError:
+                continue
+            except Exception as exc:
+                if encoding == encodings_to_try[-1]:
+                    self.log(f"XX Error reading {file_path.name}: {exc}", "error")
+                    self.stats.files_skipped += 1
+                    self.stats.errors.append(f"{file_path.name}: {exc}")
+                continue
+
+    def _process_streaming(self, input_files: list[Path], output_file: Path) -> ProcessingStats:
+        self.log("Phase 1: Streaming rows...", "info")
+        discovered_order = self.discover_columns(input_files)
+        final_columns = self._with_transform_columns(self._get_final_columns(discovered_order))
+        output_columns = [self.config.column_mapping.get(c, c) for c in final_columns]
+        self.stats.unique_columns = len(discovered_order)
+
+        quoting_map = {
+            "minimal": csv.QUOTE_MINIMAL,
+            "all": csv.QUOTE_ALL,
+            "nonnumeric": csv.QUOTE_NONNUMERIC,
+            "none": csv.QUOTE_NONE,
+        }
+        quoting = quoting_map.get(self.config.output_quoting, csv.QUOTE_MINIMAL)
+        newline = "\n" if self.config.line_ending == "unix" else "\r\n" if self.config.line_ending == "windows" else ""
+
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_file, 'w', encoding=self.config.output_encoding, newline=newline if newline else '') as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=output_columns,
+                delimiter=self.config.output_delimiter,
+                quoting=quoting,
+                extrasaction='ignore'
+            )
+            if self.config.include_header:
+                writer.writeheader()
+
+            total_files = len(input_files)
+            for idx, csv_path in enumerate(input_files):
+                if self.cancelled:
+                    self.log("Processing cancelled", "warning")
+                    return self.stats
+
+                progress = (idx / total_files) * 90
+                self.update_progress(progress, f"Streaming {csv_path.name}...")
+
+                for row in self._iter_text_rows(csv_path):
+                    if self.config.filters and not self._row_matches_filters(row):
+                        self.stats.rows_filtered += 1
+                        continue
+
+                    transformed = self._apply_transformations([row], final_columns)[0]
+                    writer.writerow(transformed)
+                    self.stats.final_row_count += 1
+
+        self.update_progress(100, "Complete!")
+        self.log(f"OK Saved: {output_file.name} ({self.stats.final_row_count:,} rows)", "success")
+        return self.stats
     
     def _read_file(self, file_path: Path, all_columns: set, column_order: list) -> list[dict]:
         """Read a single CSV file."""
@@ -447,6 +788,9 @@ class CSVEngine:
             self.stats.files_skipped += 1
             self.stats.errors.append(f"Not found: {file_path.name}")
             return rows
+
+        if file_path.suffix.lower() not in SUPPORTED_TEXT_SUFFIXES:
+            return self._read_structured_file(file_path, all_columns, column_order)
 
         norm_mode = getattr(self.config, 'header_normalize', 'none')
 
@@ -512,6 +856,26 @@ class CSVEngine:
         
         # Apply column mapping for display names
         return columns
+
+    def _with_transform_columns(self, columns: list[str]) -> list[str]:
+        """Add output columns created by split, merge, and compute transforms."""
+        result = list(columns)
+        for ct in getattr(self.config, 'column_transforms', []):
+            if len(ct) >= 3 and ct[1] == "split":
+                num_parts = int(ct[3]) if len(ct) > 3 else 2
+                for i in range(1, num_parts + 1):
+                    new_col = f"{ct[0]}_{i}"
+                    if new_col not in result:
+                        result.append(new_col)
+            elif len(ct) >= 4 and ct[1] == "merge":
+                new_col = ct[0]
+                if new_col not in result:
+                    result.append(new_col)
+            elif len(ct) >= 3 and ct[1] == "compute":
+                new_col = ct[0]
+                if new_col not in result:
+                    result.append(new_col)
+        return result
     
     def _apply_filters(self, rows: list[dict]) -> list[dict]:
         """Apply configured filters to rows."""
@@ -522,27 +886,27 @@ class CSVEngine:
         original_count = len(rows)
         
         for row in rows:
-            results = []
-            for col, operator, value in self.config.filters:
-                cell_value = row.get(col, "")
-                op_func = self.FILTER_OPERATORS.get(operator)
-                if op_func:
-                    results.append(op_func(cell_value, value))
-                else:
-                    results.append(True)
-            
-            if self.config.filter_logic == "and":
-                keep = all(results) if results else True
-            else:
-                keep = any(results) if results else True
-            
-            if keep:
+            if self._row_matches_filters(row):
                 filtered.append(row)
         
         self.stats.rows_filtered = original_count - len(filtered)
         self.log(f"  Filtered out {self.stats.rows_filtered:,} rows", "info")
         
         return filtered
+
+    def _row_matches_filters(self, row: dict) -> bool:
+        results = []
+        for col, operator, value in self.config.filters:
+            cell_value = row.get(col, "")
+            op_func = self.FILTER_OPERATORS.get(operator)
+            if op_func:
+                results.append(op_func(cell_value, value))
+            else:
+                results.append(True)
+
+        if self.config.filter_logic == "and":
+            return all(results) if results else True
+        return any(results) if results else True
     
     def _apply_transformations(self, rows: list[dict], columns: list[str]) -> list[dict]:
         """Apply configured transformations to data."""
@@ -697,34 +1061,125 @@ class CSVEngine:
             return rows
         
         dedupe_cols = self.config.dedupe_columns if self.config.dedupe_columns else columns
-        
+        fuzzy_enabled = getattr(self.config, "dedupe_fuzzy_enabled", False)
+        fuzzy_threshold = int(getattr(self.config, "dedupe_fuzzy_threshold", 90))
+        aggregate_mode = getattr(self.config, "dedupe_aggregate_mode", "none")
+
         seen = {}
+        seen_keys = []
         result = []
         
-        for idx, row in enumerate(rows):
-            # Create key from dedupe columns
-            key_parts = []
-            for col in dedupe_cols:
-                mapped_col = self.config.column_mapping.get(col, col)
-                val = row.get(mapped_col, row.get(col, ""))
-                key_parts.append(str(val).lower() if not self.config.sort_case_sensitive else str(val))
-            key = tuple(key_parts)
-            
-            if key not in seen:
-                seen[key] = idx
-                result.append(row)
-            elif self.config.dedupe_keep == "last":
-                # Replace earlier occurrence
-                old_idx = seen[key]
-                for i, r in enumerate(result):
-                    if i == old_idx:
-                        result[i] = row
+        for row in rows:
+            key = self._dedupe_key(row, dedupe_cols)
+
+            matched_key = None
+            if fuzzy_enabled:
+                key_text = "\x1f".join(key)
+                for existing_key in seen_keys:
+                    existing_text = "\x1f".join(existing_key)
+                    if self._fuzzy_score(key_text, existing_text) >= fuzzy_threshold:
+                        matched_key = existing_key
                         break
+            elif key in seen:
+                matched_key = key
+
+            if matched_key is None:
+                seen[key] = len(result)
+                seen_keys.append(key)
+                result.append(row)
+            elif aggregate_mode != "none":
+                result[seen[matched_key]] = self._aggregate_duplicate_row(
+                    result[seen[matched_key]],
+                    row,
+                    dedupe_cols,
+                    columns,
+                    aggregate_mode,
+                )
+            elif self.config.dedupe_keep == "last":
+                result[seen[matched_key]] = row
         
         self.stats.duplicates_removed = len(rows) - len(result)
         self.log(f"  Removed {self.stats.duplicates_removed:,} duplicates", "info")
         
         return result
+
+    def _dedupe_key(self, row: dict, dedupe_cols: list[str]) -> tuple[str, ...]:
+        key_parts = []
+        for col in dedupe_cols:
+            mapped_col = self.config.column_mapping.get(col, col)
+            val = row.get(mapped_col, row.get(col, ""))
+            key_parts.append(str(val).lower() if not self.config.sort_case_sensitive else str(val))
+        return tuple(key_parts)
+
+    @staticmethod
+    def _fuzzy_score(left: str, right: str) -> float:
+        left_lower = left.lower()
+        right_lower = right.lower()
+        if left_lower in right_lower or right_lower in left_lower:
+            return 100
+        try:
+            from rapidfuzz import fuzz
+            return fuzz.partial_ratio(left_lower, right_lower)
+        except ImportError:
+            from difflib import SequenceMatcher
+            return SequenceMatcher(None, left_lower, right_lower).ratio() * 100
+
+    def _aggregate_duplicate_row(
+        self,
+        existing: dict,
+        incoming: dict,
+        dedupe_cols: list[str],
+        output_columns: list[str],
+        mode: str,
+    ) -> dict:
+        result = dict(existing)
+        key_columns = {
+            self.config.column_mapping.get(col, col)
+            for col in dedupe_cols
+        } | set(dedupe_cols)
+        separator = getattr(self.config, "dedupe_aggregate_separator", "; ")
+
+        for col in output_columns:
+            mapped_col = self.config.column_mapping.get(col, col)
+            if col in key_columns or mapped_col in key_columns:
+                continue
+
+            left = result.get(mapped_col, result.get(col, ""))
+            right = incoming.get(mapped_col, incoming.get(col, ""))
+            result[mapped_col] = self._aggregate_value(left, right, mode, separator)
+
+        return result
+
+    @staticmethod
+    def _aggregate_value(left, right, mode: str, separator: str):
+        left_text = "" if left is None else str(left)
+        right_text = "" if right is None else str(right)
+        if mode == "concat":
+            parts = []
+            for value in (left_text, right_text):
+                if value and value not in parts:
+                    parts.append(value)
+            return separator.join(parts)
+
+        left_num = CSVEngine._parse_number(left_text)
+        right_num = CSVEngine._parse_number(right_text)
+        if left_num is None or right_num is None:
+            if mode == "max":
+                return max(left_text, right_text)
+            if mode == "min":
+                return min(left_text, right_text)
+            return left_text or right_text
+
+        if mode == "sum":
+            value = left_num + right_num
+        elif mode == "max":
+            value = max(left_num, right_num)
+        elif mode == "min":
+            value = min(left_num, right_num)
+        else:
+            return left_text
+
+        return str(int(value)) if value == int(value) else str(value)
     
     def _sort_rows(self, rows: list[dict], columns: list[str]) -> list[dict]:
         """Sort rows by configured columns."""
@@ -763,11 +1218,14 @@ class CSVEngine:
             def make_key(row, mc=mapped_col, c=col, na=self.config.sort_numeric_aware, cs=self.config.sort_case_sensitive):
                 val = row.get(mc, row.get(c, ""))
                 if na:
-                    try:
-                        return (0, float(str(val).replace(",", "")))
-                    except ValueError:
-                        return (1, str(val).lower() if not cs else str(val))
-                return str(val).lower() if not cs else str(val)
+                    parsed_number = CSVEngine._parse_number(val)
+                    if parsed_number is not None:
+                        return (0, parsed_number)
+                    parsed_date = CSVEngine._parse_datetime(val)
+                    if parsed_date is not None:
+                        return (1, parsed_date.timestamp())
+                text = str(val) if cs else str(val).lower()
+                return (2, locale.strxfrm(text))
             
             sorted_rows.sort(key=make_key, reverse=not ascending)
         
@@ -783,6 +1241,14 @@ class CSVEngine:
         
         # Map columns to output names
         output_columns = [self.config.column_mapping.get(c, c) for c in columns]
+
+        suffix = output_file.suffix.lower()
+        if suffix == ".xlsx":
+            self._write_xlsx_output(rows, output_columns, output_file)
+            return
+        if suffix == ".parquet":
+            self._write_parquet_output(rows, output_columns, output_file)
+            return
         
         quoting_map = {
             "minimal": csv.QUOTE_MINIMAL,
@@ -824,6 +1290,48 @@ class CSVEngine:
         except Exception as e:
             self.log(f"✗ Error writing file: {e}", "error")
             self.stats.errors.append(f"Write error: {e}")
+
+    def _write_xlsx_output(self, rows: list[dict], output_columns: list[str], output_file: Path):
+        try:
+            from openpyxl import Workbook
+        except ImportError as exc:
+            self.log("XX openpyxl is required for .xlsx output", "error")
+            self.stats.errors.append(f"Write error: {exc}")
+            return
+
+        try:
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+            workbook = Workbook(write_only=True)
+            sheet = workbook.create_sheet("Data")
+            if self.config.include_header:
+                sheet.append(output_columns)
+            for row in rows:
+                sheet.append([row.get(column, "") for column in output_columns])
+            workbook.save(output_file)
+            self.log(f"OK Saved: {output_file.name} ({len(rows):,} rows)", "success")
+        except Exception as exc:
+            self.log(f"XX Error writing file: {exc}", "error")
+            self.stats.errors.append(f"Write error: {exc}")
+
+    def _write_parquet_output(self, rows: list[dict], output_columns: list[str], output_file: Path):
+        try:
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+            records = [
+                {column: row.get(column, "") for column in output_columns}
+                for row in rows
+            ]
+            try:
+                import pyarrow as pa
+                import pyarrow.parquet as pq
+                table = pa.Table.from_pylist(records)
+                pq.write_table(table, output_file)
+            except ImportError:
+                import polars as pl
+                pl.DataFrame(records).write_parquet(output_file)
+            self.log(f"OK Saved: {output_file.name} ({len(rows):,} rows)", "success")
+        except Exception as exc:
+            self.log(f"XX Error writing file: {exc}", "error")
+            self.stats.errors.append(f"Write error: {exc}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -908,9 +1416,16 @@ class FileListPanel(ctk.CTkFrame):
     
     def _browse_files(self):
         files = filedialog.askopenfilenames(
-            title="Select CSV Files",
-            filetypes=[("CSV Files", "*.csv"), ("TSV Files", "*.tsv"), 
-                       ("Text Files", "*.txt"), ("All Files", "*.*")]
+            title="Select Input Files",
+            filetypes=[
+                ("Supported Files", "*.csv *.tsv *.txt *.xlsx *.parquet"),
+                ("CSV Files", "*.csv"),
+                ("TSV Files", "*.tsv"),
+                ("Excel Files", "*.xlsx"),
+                ("Parquet Files", "*.parquet"),
+                ("Text Files", "*.txt"),
+                ("All Files", "*.*"),
+            ]
         )
         if files:
             self.add_files([Path(f) for f in files])
@@ -919,15 +1434,23 @@ class FileListPanel(ctk.CTkFrame):
         folder = filedialog.askdirectory(title="Select Folder")
         if folder:
             folder_path = Path(folder)
-            csv_files = list(folder_path.glob("*.csv")) + list(folder_path.glob("*.tsv"))
-            if csv_files:
-                self.add_files(csv_files)
+            input_files = [
+                path for path in folder_path.rglob("*")
+                if path.is_file() and path.suffix.lower() in SUPPORTED_INPUT_SUFFIXES
+            ]
+            if input_files:
+                self.add_files(input_files)
     
     def add_files(self, paths: list[Path]) -> int:
         added = 0
         for p in paths:
             path = Path(p) if not isinstance(p, Path) else p
-            if path.suffix.lower() in ['.csv', '.tsv', '.txt'] and path not in self.files:
+            if path.is_dir():
+                added += self.add_files([
+                    child for child in path.rglob("*")
+                    if child.is_file() and child.suffix.lower() in SUPPORTED_INPUT_SUFFIXES
+                ])
+            elif path.suffix.lower() in SUPPORTED_INPUT_SUFFIXES and path not in self.files:
                 self.files.append(path)
                 added += 1
         
@@ -1322,6 +1845,10 @@ class DedupePanel(ctk.CTkFrame):
         self.enabled = BooleanVar(value=True)
         self.keep_mode = StringVar(value="first")
         self.use_all_columns = BooleanVar(value=True)
+        self.fuzzy_enabled = BooleanVar(value=False)
+        self.fuzzy_threshold = IntVar(value=90)
+        self.aggregate_mode = StringVar(value="none")
+        self.aggregate_separator = StringVar(value="; ")
         
         # Header
         header = ctk.CTkFrame(self, fg_color="transparent")
@@ -1366,6 +1893,59 @@ class DedupePanel(ctk.CTkFrame):
             text_color=COLORS["text_secondary"],
             command=self._toggle_column_selection
         ).pack(side="left")
+
+        fuzzy_frame = ctk.CTkFrame(self, fg_color="transparent")
+        fuzzy_frame.pack(fill="x", padx=12, pady=(0, 8))
+
+        ctk.CTkCheckBox(
+            fuzzy_frame, text="Fuzzy duplicate matching",
+            variable=self.fuzzy_enabled,
+            font=ctk.CTkFont(size=11),
+            fg_color=COLORS["accent_blue"],
+            text_color=COLORS["text_secondary"],
+        ).pack(side="left", padx=(0, 12))
+
+        ctk.CTkLabel(
+            fuzzy_frame, text="Threshold",
+            font=ctk.CTkFont(size=11),
+            text_color=COLORS["text_muted"],
+        ).pack(side="left", padx=(0, 6))
+
+        ctk.CTkSlider(
+            fuzzy_frame, from_=50, to=100, number_of_steps=50,
+            variable=self.fuzzy_threshold,
+            width=100,
+            progress_color=COLORS["accent_blue"],
+            button_color=COLORS["accent_blue"],
+            button_hover_color=COLORS["accent_blue_hover"],
+        ).pack(side="left")
+
+        aggregate_frame = ctk.CTkFrame(self, fg_color="transparent")
+        aggregate_frame.pack(fill="x", padx=12, pady=(0, 8))
+
+        ctk.CTkLabel(
+            aggregate_frame, text="Aggregate:",
+            font=ctk.CTkFont(size=11),
+            text_color=COLORS["text_secondary"],
+        ).pack(side="left", padx=(0, 8))
+
+        ctk.CTkOptionMenu(
+            aggregate_frame, variable=self.aggregate_mode,
+            values=["none", "max", "min", "sum", "concat"],
+            font=ctk.CTkFont(size=11), height=28, width=90,
+            fg_color=COLORS["bg_dark"],
+            button_color=COLORS["bg_tertiary"],
+            dropdown_fg_color=COLORS["bg_secondary"],
+        ).pack(side="left", padx=(0, 8))
+
+        ctk.CTkEntry(
+            aggregate_frame, textvariable=self.aggregate_separator,
+            placeholder_text="separator",
+            font=ctk.CTkFont(size=11), height=28, width=80,
+            fg_color=COLORS["bg_dark"],
+            border_color=COLORS["border"],
+            text_color=COLORS["text_primary"],
+        ).pack(side="left")
         
         # Column list (hidden when use_all_columns is True)
         self.col_list_frame = ctk.CTkFrame(self, fg_color=COLORS["bg_dark"], corner_radius=6)
@@ -1408,9 +1988,17 @@ class DedupePanel(ctk.CTkFrame):
                 command=lambda c=col, v=var: self._toggle_column(c, v)
             ).pack(anchor="w", pady=1)
     
-    def get_config(self) -> tuple[bool, list, str]:
+    def get_config(self) -> tuple[bool, list, str, bool, int, str, str]:
         columns = [] if self.use_all_columns.get() else list(self.selected_columns)
-        return self.enabled.get(), columns, self.keep_mode.get()
+        return (
+            self.enabled.get(),
+            columns,
+            self.keep_mode.get(),
+            self.fuzzy_enabled.get(),
+            int(self.fuzzy_threshold.get()),
+            self.aggregate_mode.get(),
+            self.aggregate_separator.get(),
+        )
 
 
 class FilterPanel(ctk.CTkFrame):
@@ -1430,6 +2018,7 @@ class FilterPanel(ctk.CTkFrame):
         ("greater_than_or_equal", "Greater/Equal"),
         ("less_than_or_equal", "Less/Equal"),
         ("between", "Between"),
+        ("fuzzy", "Fuzzy Match"),
         ("in_list", "In List"),
         ("not_in_list", "Not In List"),
         ("regex", "Regex Match"),
@@ -2022,7 +2611,14 @@ class OutputPanel(ctk.CTkFrame):
         file = filedialog.asksaveasfilename(
             title="Save As",
             defaultextension=".csv",
-            filetypes=[("CSV Files", "*.csv"), ("TSV Files", "*.tsv"), ("All Files", "*.*")]
+            filetypes=[
+                ("CSV Files", "*.csv"),
+                ("TSV Files", "*.tsv"),
+                ("Excel Files", "*.xlsx"),
+                ("Parquet Files", "*.parquet"),
+                ("Text Files", "*.txt"),
+                ("All Files", "*.*"),
+            ]
         )
         if file:
             self.output_path.set(file)
@@ -2161,7 +2757,7 @@ class CSVPowerToolApp:
         else:
             self.root = ctk.CTk()
         
-        self.root.title("CSV Power Tool")
+        self.root.title(APP_NAME)
         self.root.geometry("1200x850")
         self.root.minsize(1000, 700)
         
@@ -2189,7 +2785,7 @@ class CSVPowerToolApp:
         title_frame.pack(side="left")
         
         ctk.CTkLabel(
-            title_frame, text="CSV Power Tool",
+            title_frame, text=APP_NAME,
             font=ctk.CTkFont(size=26, weight="bold"),
             text_color=COLORS["text_primary"]
         ).pack(anchor="w")
@@ -2203,7 +2799,7 @@ class CSVPowerToolApp:
         # Version
         ver_badge = ctk.CTkFrame(header, fg_color=COLORS["bg_tertiary"], corner_radius=12)
         ver_badge.pack(side="right")
-        ctk.CTkLabel(ver_badge, text="v3.0", font=ctk.CTkFont(size=11),
+        ctk.CTkLabel(ver_badge, text=f"v{APP_VERSION}", font=ctk.CTkFont(size=11),
                      text_color=COLORS["text_muted"]).pack(padx=12, pady=4)
         
         # Content: 3 columns
@@ -2384,10 +2980,22 @@ class CSVPowerToolApp:
         config.sort_numeric_aware = numeric
         
         # Dedupe
-        enabled, columns, keep = self.dedupe_panel.get_config()
+        (
+            enabled,
+            columns,
+            keep,
+            fuzzy_enabled,
+            fuzzy_threshold,
+            aggregate_mode,
+            aggregate_separator,
+        ) = self.dedupe_panel.get_config()
         config.dedupe_enabled = enabled
         config.dedupe_columns = columns
         config.dedupe_keep = keep
+        config.dedupe_fuzzy_enabled = fuzzy_enabled
+        config.dedupe_fuzzy_threshold = fuzzy_threshold
+        config.dedupe_aggregate_mode = aggregate_mode
+        config.dedupe_aggregate_separator = aggregate_separator
         
         # Filter
         filters, logic = self.filter_panel.get_config()
@@ -2483,6 +3091,10 @@ class CSVPowerToolApp:
                 "dedupe_enabled": config.dedupe_enabled,
                 "dedupe_columns": config.dedupe_columns,
                 "dedupe_keep": config.dedupe_keep,
+                "dedupe_fuzzy_enabled": config.dedupe_fuzzy_enabled,
+                "dedupe_fuzzy_threshold": config.dedupe_fuzzy_threshold,
+                "dedupe_aggregate_mode": config.dedupe_aggregate_mode,
+                "dedupe_aggregate_separator": config.dedupe_aggregate_separator,
                 "filters": config.filters,
                 "filter_logic": config.filter_logic,
                 "trim_whitespace": config.trim_whitespace,
@@ -2524,6 +3136,10 @@ class CSVPowerToolApp:
                 self.dedupe_panel.enabled.set(data.get("dedupe_enabled", True))
                 self.dedupe_panel.selected_columns = set(data.get("dedupe_columns", []))
                 self.dedupe_panel.keep_mode.set(data.get("dedupe_keep", "first"))
+                self.dedupe_panel.fuzzy_enabled.set(data.get("dedupe_fuzzy_enabled", False))
+                self.dedupe_panel.fuzzy_threshold.set(data.get("dedupe_fuzzy_threshold", 90))
+                self.dedupe_panel.aggregate_mode.set(data.get("dedupe_aggregate_mode", "none"))
+                self.dedupe_panel.aggregate_separator.set(data.get("dedupe_aggregate_separator", "; "))
                 
                 self.filter_panel.filters = data.get("filters", [])
                 self.filter_panel.logic.set(data.get("filter_logic", "and"))
@@ -2568,12 +3184,20 @@ def cli_main():
     )
     parser.add_argument("--config", "-c", help="JSON preset configuration file")
     parser.add_argument("--inputs", "-i", nargs="+", required=True,
-                        help="Input CSV files or glob patterns (e.g. *.csv)")
+                        help="Input files, folders, or glob patterns (e.g. *.csv)")
     parser.add_argument("--output", "-o", required=True, help="Output file path")
     parser.add_argument("--delimiter", "-d", default=None, help="Output delimiter")
     parser.add_argument("--encoding", "-e", default=None, help="Output encoding")
     parser.add_argument("--no-header", action="store_true", help="Exclude header row")
     parser.add_argument("--no-dedupe", action="store_true", help="Disable deduplication")
+    parser.add_argument("--fuzzy-dedupe-threshold", type=int, metavar="50-100",
+                        help="Enable fuzzy dedupe at the supplied similarity threshold")
+    parser.add_argument("--dedupe-aggregate", choices=["max", "min", "sum", "concat"],
+                        help="Aggregate non-key duplicate columns with the selected mode")
+    parser.add_argument("--dedupe-aggregate-separator", default="; ",
+                        help="Separator for --dedupe-aggregate concat")
+    parser.add_argument("--filter", action="append", metavar="COL:OP:VALUE",
+                        help="Add a filter rule. Operators include between, fuzzy, regex, contains")
     parser.add_argument("--sort", nargs="+", metavar="COL[:asc|desc]",
                         help="Sort by columns, e.g. name:asc age:desc")
     parser.add_argument("--columns", nargs="+", help="Include only these columns")
@@ -2582,27 +3206,42 @@ def cli_main():
                         default="none", help="Header normalization mode")
     parser.add_argument("--schema-mode", choices=["union", "intersection", "first_file"],
                         default="union", help="Schema unification mode")
+    parser.add_argument("--no-stream", action="store_true", help="Disable bounded-memory streaming path")
+    parser.add_argument("--watch", action="store_true",
+                        help="Watch inputs and re-run whenever matching files change")
+    parser.add_argument("--watch-interval", type=float, default=2.0,
+                        help="Polling interval for --watch, in seconds")
     parser.add_argument("--quiet", "-q", action="store_true", help="Suppress log output")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    parser.add_argument("--version", action="version", version=f"{APP_NAME} v{APP_VERSION}")
 
     args = parser.parse_args()
 
-    # Expand glob patterns in inputs
-    input_files = []
-    for pattern in args.inputs:
-        expanded = globmod.glob(pattern)
-        if expanded:
-            input_files.extend([Path(f) for f in expanded])
-        else:
+    def expand_inputs(patterns):
+        input_files = []
+        seen = set()
+        for pattern in patterns:
             p = Path(pattern)
-            if p.exists():
-                input_files.append(p)
+            candidates = []
+            if p.is_dir():
+                candidates = [child for child in p.rglob("*") if child.is_file()]
             else:
-                print(f"Warning: No files matched: {pattern}", file=sys.stderr)
+                expanded = globmod.glob(pattern, recursive=True)
+                if expanded:
+                    candidates = [Path(f) for f in expanded]
+                elif p.exists():
+                    candidates = [p]
+                else:
+                    print(f"Warning: No files matched: {pattern}", file=sys.stderr)
 
-    if not input_files:
-        print("Error: No input files found", file=sys.stderr)
-        sys.exit(1)
+            for candidate in candidates:
+                if candidate.suffix.lower() not in SUPPORTED_INPUT_SUFFIXES:
+                    continue
+                resolved = candidate.resolve()
+                if resolved not in seen:
+                    seen.add(resolved)
+                    input_files.append(candidate)
+        return sorted(input_files, key=lambda path: str(path).lower())
 
     # Build config
     config = ProcessingConfig()
@@ -2635,6 +3274,19 @@ def cli_main():
     if args.no_dedupe:
         config.dedupe_enabled = False
 
+    if args.fuzzy_dedupe_threshold is not None:
+        if not 50 <= args.fuzzy_dedupe_threshold <= 100:
+            print("Error: --fuzzy-dedupe-threshold must be between 50 and 100", file=sys.stderr)
+            sys.exit(3)
+        config.dedupe_enabled = True
+        config.dedupe_fuzzy_enabled = True
+        config.dedupe_fuzzy_threshold = args.fuzzy_dedupe_threshold
+
+    if args.dedupe_aggregate:
+        config.dedupe_enabled = True
+        config.dedupe_aggregate_mode = args.dedupe_aggregate
+        config.dedupe_aggregate_separator = args.dedupe_aggregate_separator
+
     if args.columns:
         config.columns_mode = "select"
         config.selected_columns = args.columns
@@ -2645,6 +3297,19 @@ def cli_main():
 
     config.header_normalize = args.header_normalize
     config.schema_mode = args.schema_mode
+    config.streaming_enabled = not args.no_stream
+
+    if args.filter:
+        for spec in args.filter:
+            parts = spec.split(":", 2)
+            if len(parts) != 3:
+                print(f"Error: Invalid filter format: {spec}", file=sys.stderr)
+                sys.exit(3)
+            col, operator, value = parts
+            if operator not in CSVEngine.FILTER_OPERATORS:
+                print(f"Error: Unknown filter operator: {operator}", file=sys.stderr)
+                sys.exit(3)
+            config.filters.append((col, operator, value))
 
     if args.sort:
         config.sort_enabled = True
@@ -2669,32 +3334,65 @@ def cli_main():
         if args.verbose and not args.quiet:
             print(f"  ... {status} ({value:.0f}%)", file=sys.stderr)
 
-    # Run engine
-    engine = CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg)
     output_path = Path(args.output)
 
-    if not args.quiet:
-        print(f"CSV Power Tool - Processing {len(input_files)} file(s)...", file=sys.stderr)
+    def run_once(input_files):
+        if not input_files:
+            print("Error: No input files found", file=sys.stderr)
+            return 1
 
-    stats = engine.process(input_files, output_path)
+        engine = CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg)
 
-    # Print summary
-    if not args.quiet:
-        print(f"\nResults:", file=sys.stderr)
-        print(f"  Files processed:    {stats.files_processed}", file=sys.stderr)
-        print(f"  Files skipped:      {stats.files_skipped}", file=sys.stderr)
-        print(f"  Total rows read:    {stats.total_rows_read:,}", file=sys.stderr)
-        print(f"  Rows filtered:      {stats.rows_filtered:,}", file=sys.stderr)
-        print(f"  Duplicates removed: {stats.duplicates_removed:,}", file=sys.stderr)
-        print(f"  Final row count:    {stats.final_row_count:,}", file=sys.stderr)
-        print(f"  Output: {output_path}", file=sys.stderr)
+        if not args.quiet:
+            print(f"CSV Power Tool - Processing {len(input_files)} file(s)...", file=sys.stderr)
 
-    # Exit codes: 0 OK, 1 no input matched, 2 schema mismatch, 3 filter/transform error
-    if stats.files_processed == 0:
-        sys.exit(1)
-    if stats.errors:
-        sys.exit(3)
-    sys.exit(0)
+        stats = engine.process(input_files, output_path)
+
+        if not args.quiet:
+            print(f"\nResults:", file=sys.stderr)
+            print(f"  Files processed:    {stats.files_processed}", file=sys.stderr)
+            print(f"  Files skipped:      {stats.files_skipped}", file=sys.stderr)
+            print(f"  Total rows read:    {stats.total_rows_read:,}", file=sys.stderr)
+            print(f"  Rows filtered:      {stats.rows_filtered:,}", file=sys.stderr)
+            print(f"  Duplicates removed: {stats.duplicates_removed:,}", file=sys.stderr)
+            print(f"  Final row count:    {stats.final_row_count:,}", file=sys.stderr)
+            print(f"  Output: {output_path}", file=sys.stderr)
+
+        if stats.files_processed == 0:
+            return 1
+        if stats.errors:
+            return 3
+        return 0
+
+    def input_signature(input_files):
+        signature = []
+        for path in input_files:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            signature.append((str(path.resolve()), stat.st_mtime_ns, stat.st_size))
+        return tuple(signature)
+
+    if args.watch:
+        last_signature = None
+        last_exit = 0
+        try:
+            while True:
+                watched_files = expand_inputs(args.inputs)
+                signature = input_signature(watched_files)
+                if signature != last_signature:
+                    if watched_files:
+                        last_exit = run_once(watched_files)
+                    elif not args.quiet:
+                        print("CSV Power Tool - waiting for input files...", file=sys.stderr)
+                    last_signature = signature
+                time.sleep(max(args.watch_interval, 0.1))
+        except KeyboardInterrupt:
+            sys.exit(last_exit)
+
+    input_files = expand_inputs(args.inputs)
+    sys.exit(run_once(input_files))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2703,8 +3401,15 @@ def cli_main():
 
 if __name__ == "__main__":
     # If CLI arguments are present, run headless; otherwise launch GUI
-    if len(sys.argv) > 1 and any(a in sys.argv for a in ['--inputs', '-i', '--help', '-h']):
+    if len(sys.argv) > 1:
         cli_main()
     else:
+        if GUI_IMPORT_ERROR is not None:
+            print(
+                "GUI mode requires customtkinter. Install dependencies with: "
+                "python -m pip install -r requirements.txt",
+                file=sys.stderr,
+            )
+            sys.exit(4)
         app = CSVPowerToolApp()
         app.run()

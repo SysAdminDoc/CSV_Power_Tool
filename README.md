@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/Python-3.10+-3776ab?style=for-the-badge&logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/Platform-Windows%20|%20macOS%20|%20Linux-blue?style=for-the-badge" alt="Platform">
   <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License">
-  <img src="https://img.shields.io/badge/Version-2.0-orange?style=for-the-badge" alt="Version">
+  <img src="https://img.shields.io/badge/Version-v3.1.0-orange?style=for-the-badge" alt="Version">
 </p>
 
 <p align="center">
@@ -24,8 +24,9 @@
 ### 📁 File Management
 - **Drag & drop** support for adding files
 - Add individual files or entire folders
-- Support for CSV, TSV, and TXT files
+- Support for CSV, TSV, TXT, Excel `.xlsx`, and Parquet files
 - Auto-detection of file delimiters and encodings
+- Recursive folder import
 - Process unlimited files at once
 
 ### 📊 Column Control
@@ -47,13 +48,15 @@
 
 ### 🔍 Advanced Filtering
 - Multiple filter rules with AND/OR logic
-- 11 filter operators:
+- 17 filter operators:
   - Equals / Not Equals
   - Contains / Not Contains
   - Starts With / Ends With
   - Is Empty / Is Not Empty
   - Greater Than / Less Than
   - Regex Match
+- Date-aware `Between` filtering with timezone normalization
+- Fuzzy match filtering
 
 ### ⚙️ Data Transformations
 - Trim whitespace from all cells
@@ -65,10 +68,13 @@
 - **Encodings:** UTF-8, UTF-16, Latin-1, CP1252
 - **Quoting:** Minimal, All, Non-numeric, None
 - **Line endings:** Auto, Unix (LF), Windows (CRLF)
+- **Formats:** CSV, TSV, TXT, Excel `.xlsx`, Parquet
 - Include or exclude header row
 
 ### 🎯 Additional Features
 - Save and load configuration presets (JSON)
+- CLI mode with recursive inputs, filters, fuzzy dedupe, and watch mode
+- Bounded-memory streaming for text inputs when sort and dedupe are disabled
 - Real-time processing log with color-coded messages
 - Live statistics panel
 - Cancel button for long operations
@@ -91,16 +97,16 @@
 
 2. **Run the application:**
    ```bash
-   python csv_power_tool.py
+   python -m pip install -r requirements.txt
+   python CSV_Consolidator.py
    ```
 
-   The application will automatically install required dependencies on first run:
-   - `customtkinter` - Modern GUI framework
-   - `tkinterdnd2` - Drag and drop support
-
-### Manual Dependency Installation (Optional)
+### CLI Mode
 ```bash
-pip install customtkinter tkinterdnd2
+python CSV_Consolidator.py --inputs data/*.csv --output combined.csv
+python CSV_Consolidator.py --inputs exports --filter "date:between:2024-01-01..2024-12-31" --output filtered.xlsx
+python CSV_Consolidator.py --inputs exports --fuzzy-dedupe-threshold 88 --output deduped.parquet
+python CSV_Consolidator.py --watch --inputs exports --output combined.csv
 ```
 
 ---
@@ -159,6 +165,8 @@ Load a saved configuration:
 | `Is Not Empty` | Cell has value | Only complete records |
 | `Greater Than` | Numeric comparison | Sales > 1000 |
 | `Less Than` | Numeric comparison | Age < 30 |
+| `Between` | Numeric or date range comparison | `2024-01-01..2024-12-31` |
+| `Fuzzy Match` | Similarity match with optional threshold | `acme inc|85` |
 | `Regex Match` | Regular expression | Pattern matching |
 
 ### Output Encodings
@@ -179,6 +187,10 @@ Load a saved configuration:
 | Python | 3.10+ | Runtime |
 | customtkinter | Latest | Modern GUI framework |
 | tkinterdnd2 | Latest | Drag and drop support |
+| chardet | Latest | Encoding detection |
+| openpyxl | Latest | Excel input/output |
+| pyarrow or polars | Latest | Parquet input/output |
+| rapidfuzz | Latest | Fuzzy filters and dedupe |
 
 ---
 
