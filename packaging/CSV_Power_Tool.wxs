@@ -3,7 +3,7 @@
   <Package
       Name="CSV Power Tool"
       Manufacturer="SysAdminDoc"
-      Version="3.1.0"
+      Version="3.2.0"
       UpgradeCode="5B3F4E55-338C-4F8E-9A5A-4D6B6C9B9D72"
       Scope="perMachine">
     <MajorUpgrade DowngradeErrorMessage="A newer version of CSV Power Tool is already installed." />

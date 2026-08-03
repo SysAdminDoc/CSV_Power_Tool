@@ -14,6 +14,10 @@ import threading
 import time
 import locale
 import tempfile
+from email.parser import BytesParser
+from email.policy import default as email_default_policy
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 from collections import Counter, defaultdict
 from pathlib import Path
 from datetime import datetime, timezone
@@ -22,7 +26,7 @@ from typing import Callable
 from tkinter import filedialog, StringVar, BooleanVar, IntVar, END
 
 APP_NAME = "CSV Power Tool"
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.2.0"
 SUPPORTED_INPUT_SUFFIXES = {".csv", ".tsv", ".txt", ".xlsx", ".parquet", ".jsonl", ".ndjson"}
 SUPPORTED_TEXT_SUFFIXES = {".csv", ".tsv", ".txt"}
 SUPPORTED_JSONL_SUFFIXES = {".jsonl", ".ndjson"}
@@ -986,6 +990,38 @@ class CSVEngine:
         with open(report_path, "w", encoding="utf-8") as handle:
             json.dump(report, handle, indent=2, ensure_ascii=False)
         return report
+
+    def sql_query(self, files: list[Path], query: str) -> tuple[list[dict], list[str]]:
+        """Run SQL against input files exposed as input_0, input_1, and so on."""
+        try:
+            import duckdb
+        except ImportError as exc:
+            raise RuntimeError("duckdb is required for SQL queries") from exc
+
+        connection = duckdb.connect(database=":memory:")
+        try:
+            for index, file_path in enumerate(files):
+                escaped_path = str(file_path.resolve()).replace("'", "''")
+                suffix = file_path.suffix.lower()
+                if suffix == ".parquet":
+                    source = f"read_parquet('{escaped_path}')"
+                elif suffix in SUPPORTED_JSONL_SUFFIXES:
+                    source = f"read_json_auto('{escaped_path}', format='newline_delimited')"
+                else:
+                    source = f"read_csv_auto('{escaped_path}')"
+                connection.execute(
+                    f"CREATE OR REPLACE VIEW input_{index} AS SELECT * FROM {source}"
+                )
+
+            result = connection.execute(query)
+            columns = [description[0] for description in (result.description or [])]
+            rows = [
+                {column: self._cell_to_text(value) for column, value in zip(columns, values)}
+                for values in result.fetchall()
+            ]
+            return rows, columns
+        finally:
+            connection.close()
 
     @staticmethod
     def join_rows(
@@ -4351,6 +4387,121 @@ class CSVPowerToolApp:
 # CLI MODE
 # ══════════════════════════════════════════════════════════════════════════════
 
+class UploadRequestHandler(BaseHTTPRequestHandler):
+    """Loopback upload endpoint that runs the same CSV engine as the CLI."""
+
+    MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+
+    def _send_json(self, status: int, payload: dict):
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _read_body(self) -> bytes:
+        try:
+            length = int(self.headers.get("Content-Length", "-1"))
+        except ValueError:
+            length = -1
+        if length < 0 or length > self.MAX_UPLOAD_BYTES:
+            raise ValueError(f"Content-Length must be between 0 and {self.MAX_UPLOAD_BYTES} bytes")
+        return self.rfile.read(length)
+
+    def _parse_files(self, body: bytes) -> list[tuple[str, bytes]]:
+        content_type = self.headers.get("Content-Type", "")
+        if content_type.startswith("multipart/form-data"):
+            envelope = (
+                f"Content-Type: {content_type}\r\n"
+                "MIME-Version: 1.0\r\n\r\n"
+            ).encode("utf-8") + body
+            message = BytesParser(policy=email_default_policy).parsebytes(envelope)
+            files = []
+            for part in message.iter_parts():
+                if part.get_content_disposition() != "form-data" or not part.get_filename():
+                    continue
+                payload = part.get_payload(decode=True) or b""
+                files.append((Path(part.get_filename()).name, payload))
+            return files
+
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        filename = query.get("filename", ["upload.csv"])[0]
+        return [(Path(filename).name, body)]
+
+    def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler API
+        if urlparse(self.path).path == "/health":
+            self._send_json(200, {"status": "ok", "service": APP_NAME, "version": APP_VERSION})
+            return
+        self._send_json(404, {"error": "Use GET /health or POST /process"})
+
+    def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
+        if urlparse(self.path).path != "/process":
+            self._send_json(404, {"error": "Use POST /process"})
+            return
+        try:
+            files = self._parse_files(self._read_body())
+            if not files:
+                raise ValueError("No upload files were supplied")
+            paths = []
+            with tempfile.TemporaryDirectory(prefix="csv-power-upload-") as temp_dir:
+                temp_root = Path(temp_dir)
+                for index, (filename, payload) in enumerate(files):
+                    suffix = Path(filename).suffix.lower()
+                    if suffix not in SUPPORTED_INPUT_SUFFIXES:
+                        raise ValueError(f"Unsupported upload type: {suffix or '(none)'}")
+                    path = temp_root / f"upload_{index}{suffix}"
+                    path.write_bytes(payload)
+                    paths.append(path)
+
+                output_path = temp_root / "output.csv"
+                engine = CSVEngine(copy.deepcopy(self.server.csv_config))
+                stats = engine.process(paths, output_path)
+                if stats.errors and not output_path.exists():
+                    raise RuntimeError("; ".join(stats.errors))
+                output = output_path.read_bytes() if output_path.exists() else b""
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Length", str(len(output)))
+            self.send_header("X-CSV-Power-Rows", str(stats.final_row_count))
+            self.send_header("X-CSV-Power-Files", str(stats.files_processed))
+            self.end_headers()
+            self.wfile.write(output)
+        except (OSError, ValueError, RuntimeError) as exc:
+            self._send_json(400, {"error": str(exc)})
+
+    def log_message(self, _format, *_args):
+        return
+
+
+class UploadHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def create_upload_server(config: ProcessingConfig, host: str = "127.0.0.1", port: int = 0):
+    """Create a loopback-only upload server without starting its serving thread."""
+    if host not in {"127.0.0.1", "localhost"}:
+        raise ValueError("The upload server only binds to localhost")
+    server = UploadHTTPServer((host, int(port)), UploadRequestHandler)
+    server.csv_config = copy.deepcopy(config)
+    return server
+
+
+def serve_upload_server(config: ProcessingConfig, host: str = "127.0.0.1", port: int = 0):
+    server = create_upload_server(config, host, port)
+    print(f"CSV Power Tool upload server: http://{host}:{server.server_address[1]}", file=sys.stderr)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        server.server_close()
+    return 0
+
+
 def register_git_driver() -> None:
     """Register a local, unsigned three-way CSV merge driver in Git."""
     import subprocess
@@ -4410,6 +4561,8 @@ def cli_main():
     parser.add_argument("--source-column", help="Add a provenance column containing each source file")
     parser.add_argument("--source-path", action="store_true", help="Store the full source path instead of the file name")
     parser.add_argument("--schema-report", help="Write a JSON schema-drift, sample, and type report")
+    parser.add_argument("--sql", help="Run DuckDB SQL against input_0, input_1, ...")
+    parser.add_argument("--sql-file", help="Read the DuckDB SQL query from a UTF-8 file")
     parser.add_argument("--redact-sensitive", action="store_true", help="Redact likely email, phone, SSN, card, and secret fields")
     parser.add_argument("--redaction-token", default="[REDACTED]", help="Replacement text used by --redact-sensitive")
     parser.add_argument("--unpivot", nargs="+", metavar="COLUMN", help="Unpivot these columns into name/value rows")
@@ -4428,6 +4581,9 @@ def cli_main():
     parser.add_argument("--key-columns", nargs="+", metavar="COLUMN", help="Key columns for a three-way merge")
     parser.add_argument("--conflict-resolution", choices=["ours", "theirs", "base", "mark"], default="ours")
     parser.add_argument("--register-git-driver", action="store_true", help="Register the local csvpower merge driver")
+    parser.add_argument("--serve", action="store_true", help="Start the loopback-only upload API")
+    parser.add_argument("--host", default="127.0.0.1", help="Upload API host; only localhost is accepted")
+    parser.add_argument("--port", type=int, default=0, help="Upload API port; 0 selects an available port")
     parser.add_argument("--no-stream", action="store_true", help="Disable bounded-memory streaming path")
     parser.add_argument("--watch", action="store_true",
                         help="Watch inputs and re-run whenever matching files change")
@@ -4447,10 +4603,12 @@ def cli_main():
             sys.exit(3)
         return
 
-    if not args.inputs or (not args.output and not args.dedupe_preview):
+    if not args.serve and (not args.inputs or (not args.output and not args.dedupe_preview)):
         parser.error("--inputs and --output are required unless --register-git-driver or --dedupe-preview is used")
     if (args.join_on or args.three_way_base or args.three_way_ours or args.three_way_theirs) and not args.output:
         parser.error("--output is required for join and three-way merge operations")
+    if args.sql and args.sql_file:
+        parser.error("--sql and --sql-file are mutually exclusive")
 
     def expand_inputs(patterns):
         input_files = []
@@ -4579,6 +4737,13 @@ def cli_main():
                 ascending = True
             config.sort_columns.append((col, ascending))
 
+    if args.serve:
+        try:
+            return serve_upload_server(config, args.host, args.port)
+        except (OSError, ValueError) as exc:
+            print(f"Error starting upload server: {exc}", file=sys.stderr)
+            return 3
+
     # Log callback
     def log_msg(message, level="info"):
         if args.quiet:
@@ -4660,12 +4825,42 @@ def cli_main():
             print(f"!! Three-way merge produced {len(conflicts)} conflict(s) using {args.conflict_resolution}", file=sys.stderr)
         return 3 if engine.stats.errors else 0
 
+    def run_sql(input_files):
+        query = args.sql
+        if args.sql_file:
+            try:
+                query = Path(args.sql_file).read_text(encoding="utf-8")
+            except OSError as exc:
+                print(f"Error reading --sql-file: {exc}", file=sys.stderr)
+                return 3
+        if not query or not query.strip():
+            print("Error: SQL query cannot be empty", file=sys.stderr)
+            return 3
+        engine = CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg)
+        try:
+            rows, columns = engine.sql_query(input_files, query)
+        except Exception as exc:
+            print(f"Error executing SQL: {exc}", file=sys.stderr)
+            return 3
+        engine.stats.files_processed = len(input_files)
+        engine.stats.total_rows_read = len(rows)
+        engine.stats.unique_columns = len(columns)
+        engine.stats.final_row_count = len(rows)
+        engine._compute_column_summary(rows, columns)
+        engine._write_output(rows, columns, output_path)
+        if not args.quiet:
+            print(f"  SQL rows: {len(rows):,}", file=sys.stderr)
+        return 3 if engine.stats.errors else 0
+
     def run_once(input_files):
         if not input_files:
             print("Error: No input files found", file=sys.stderr)
             return 1
 
         engine = CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg)
+
+        if args.sql or args.sql_file:
+            return run_sql(input_files)
 
         if args.schema_report:
             engine.write_schema_report(input_files, Path(args.schema_report))
@@ -4752,7 +4947,7 @@ def cli_main():
 if __name__ == "__main__":
     # If CLI arguments are present, run headless; otherwise launch GUI
     if len(sys.argv) > 1:
-        cli_main()
+        sys.exit(cli_main())
     else:
         if GUI_IMPORT_ERROR is not None:
             print(

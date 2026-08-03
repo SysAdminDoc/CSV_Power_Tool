@@ -2,7 +2,9 @@ import csv
 import importlib.util
 import json
 import tempfile
+import threading
 import unittest
+from urllib.request import Request, urlopen
 from pathlib import Path
 
 
@@ -15,6 +17,7 @@ CSVEngine = csv_consolidator.CSVEngine
 ProcessingConfig = csv_consolidator.ProcessingConfig
 ConfigHistory = csv_consolidator.ConfigHistory
 PreviewPanel = csv_consolidator.PreviewPanel
+create_upload_server = csv_consolidator.create_upload_server
 
 
 class CSVEngineTests(unittest.TestCase):
@@ -175,6 +178,40 @@ class CSVEngineTests(unittest.TestCase):
             self.assertEqual(report["files"][0]["samples"][0]["name"], "A")
             self.assertIn("delimiter_confidence", report["files"][0]["diagnostics"])
             self.assertEqual(json.loads(report_path.read_text(encoding="utf-8"))["version"], 1)
+
+    def test_duckdb_sql_query_can_filter_loaded_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "input.csv"
+            input_path.write_text("id,name\n1,A\n2,B\n", encoding="utf-8")
+
+            rows, columns = CSVEngine(ProcessingConfig()).sql_query(
+                [input_path], "SELECT id, name FROM input_0 WHERE id > 1"
+            )
+
+            self.assertEqual(columns, ["id", "name"])
+            self.assertEqual(rows, [{"id": "2", "name": "B"}])
+
+    def test_loopback_upload_endpoint_runs_the_engine(self):
+        server = create_upload_server(ProcessingConfig(dedupe_enabled=False), port=0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            request = Request(
+                f"http://127.0.0.1:{port}/process?filename=input.csv",
+                data=b"id,name\n1,A\n",
+                method="POST",
+                headers={"Content-Type": "text/csv", "Content-Length": "12"},
+            )
+            with urlopen(request, timeout=10) as response:
+                body = response.read().decode("utf-8")
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers["X-CSV-Power-Rows"], "1")
+            self.assertEqual(body.splitlines(), ["id,name", "1,A"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def test_unpivot_and_pivot(self):
         unpivot_config = ProcessingConfig(

@@ -2,7 +2,7 @@
 
 All notable changes to CSV_Power_Tool will be documented in this file.
 
-## [Unreleased] - 2026-08-03
+## [v3.2.0] - 2026-08-03
 
 - Added: JSONL/NDJSON streaming input and output.
 - Added: Source-file provenance columns, canonical column templates, schema-drift reports, type inference, and delimiter/encoding confidence diagnostics.
@@ -12,6 +12,7 @@ All notable changes to CSV_Power_Tool will be documented in this file.
 - Added: Non-mutating duplicate previews through the engine and `--dedupe-preview` CLI export.
 - Added: Projected-output preview, per-column summary statistics, drag-reorderable columns, preset undo/redo, and Dark/Light/System appearance modes.
 - Added: Reproducible unsigned PyInstaller one-file and WiX MSI build automation with SHA-256 output.
+- Added: DuckDB SQL queries over named input views and a localhost-only upload/process endpoint with request cleanup.
 
 ## [v3.1.0] - 2026-06-27
 

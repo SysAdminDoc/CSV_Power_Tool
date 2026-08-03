@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/Python-3.10+-3776ab?style=for-the-badge&logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/Platform-Windows%20|%20macOS%20|%20Linux-blue?style=for-the-badge" alt="Platform">
   <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License">
-  <img src="https://img.shields.io/badge/Version-v3.1.0-orange?style=for-the-badge" alt="Version">
+  <img src="https://img.shields.io/badge/Version-v3.2.0-orange?style=for-the-badge" alt="Version">
 </p>
 
 <p align="center">
@@ -75,13 +75,14 @@
 - **Encodings:** UTF-8, UTF-16, Latin-1, CP1252
 - **Quoting:** Minimal, All, Non-numeric, None
 - **Line endings:** Auto, Unix (LF), Windows (CRLF)
-- **Formats:** CSV, TSV, TXT, Excel `.xlsx`, Parquet
+- **Formats:** CSV, TSV, TXT, JSONL/NDJSON, Excel `.xlsx`, Parquet
 - Include or exclude header row
 
 ### 🎯 Additional Features
 - Save and load configuration presets (JSON)
 - CLI mode with recursive inputs, filters, fuzzy dedupe, and watch mode
 - CLI pivot/unpivot reshaping and machine-readable schema reports
+- DuckDB SQL mode over named input views and a loopback-only upload API
 - Optional Polars text backend for large in-memory jobs (`--backend polars`)
 - Bounded-memory streaming for text inputs when sort and dedupe are disabled
 - Real-time processing log with color-coded messages
@@ -123,7 +124,11 @@ python CSV_Consolidator.py --watch --inputs exports --output combined.csv
 python CSV_Consolidator.py --inputs exports --source-column "(Source)" --schema-report schema.json --output combined.csv
 python CSV_Consolidator.py --inputs left.csv right.csv --join-on id --join-type outer --output joined.csv
 python CSV_Consolidator.py --three-way-base base.csv --three-way-ours ours.csv --three-way-theirs theirs.csv --key-columns id --output merged.csv
+python CSV_Consolidator.py --inputs data/*.csv --sql "SELECT * FROM input_0 WHERE amount > 100" --output query.csv
+python CSV_Consolidator.py --serve --port 8765
 ```
+
+SQL mode exposes each input as `input_0`, `input_1`, and so on through DuckDB. The upload API accepts raw file POSTs or browser-style multipart uploads at `POST /process` and exposes `GET /health`; it binds to localhost only and removes request files after processing.
 
 ### Packaging
 
@@ -218,6 +223,7 @@ Load a saved configuration:
 | openpyxl | Latest | Excel input/output |
 | pyarrow or polars | Latest | Parquet input/output |
 | rapidfuzz | Latest | Fuzzy filters and dedupe |
+| duckdb | Latest | SQL queries over input files |
 
 ---
 
