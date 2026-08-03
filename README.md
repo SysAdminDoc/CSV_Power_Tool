@@ -82,6 +82,7 @@
 - Save and load configuration presets (JSON)
 - CLI mode with recursive inputs, filters, fuzzy dedupe, and watch mode
 - CLI pivot/unpivot reshaping and machine-readable schema reports
+- Optional Polars text backend for large in-memory jobs (`--backend polars`)
 - Bounded-memory streaming for text inputs when sort and dedupe are disabled
 - Real-time processing log with color-coded messages
 - Live statistics panel

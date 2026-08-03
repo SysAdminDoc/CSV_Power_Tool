@@ -164,6 +164,10 @@ class ProcessingConfig:
     redact_sensitive: bool = False
     redaction_token: str = "[REDACTED]"
 
+    # Dataframe backend
+    engine_backend: str = "auto"  # "auto", "python", or "polars"
+    polars_threshold_bytes: int = 5_000_000
+
     # Output
     output_delimiter: str = ","
     output_encoding: str = "utf-8"
@@ -1170,6 +1174,8 @@ class CSVEngine:
     def _can_stream(self, input_files: list[Path], output_file: Path) -> bool:
         if not getattr(self.config, "streaming_enabled", True):
             return False
+        if getattr(self.config, "engine_backend", "auto") == "polars":
+            return False
         if self.config.dedupe_enabled or self.config.sort_enabled:
             return False
         if getattr(self.config, "unpivot_columns", None) or getattr(self.config, "pivot_column", ""):
@@ -1332,6 +1338,70 @@ class CSVEngine:
         self.log(f"OK Saved: {output_file.name} ({self.stats.final_row_count:,} rows)", "success")
         return self.stats
     
+    def _should_use_polars(self, file_path: Path) -> bool:
+        backend = getattr(self.config, "engine_backend", "auto")
+        if backend == "python" or file_path.suffix.lower() not in SUPPORTED_TEXT_SUFFIXES:
+            return False
+        if backend == "polars":
+            return True
+        try:
+            return file_path.stat().st_size >= int(getattr(self.config, "polars_threshold_bytes", 5_000_000))
+        except OSError:
+            return False
+
+    def _read_text_file_polars(self, file_path: Path, all_columns: set, column_order: list):
+        """Read a UTF text input through Polars while preserving string semantics."""
+        try:
+            import polars as pl
+        except ImportError:
+            if getattr(self.config, "engine_backend", "auto") == "polars":
+                raise RuntimeError("polars is required when engine_backend='polars'")
+            return None
+
+        details = self._detect_file_details(file_path)
+        encoding = details["encoding"].lower().replace("-", "")
+        if encoding not in {"utf8", "utf8sig", "ascii"}:
+            return None
+        norm_mode = getattr(self.config, "header_normalize", "none")
+        try:
+            frame = pl.read_csv(
+                file_path,
+                separator=details["delimiter"],
+                quote_char=details["quotechar"],
+                has_header=True,
+                infer_schema=False,
+                try_parse_dates=False,
+                null_values=[],
+                encoding="utf8-lossy",
+            )
+        except Exception:
+            if getattr(self.config, "engine_backend", "auto") == "polars":
+                raise
+            return None
+
+        rows = []
+        for column in frame.columns:
+            normalized = self._normalize_header(column, norm_mode)
+            if normalized and normalized not in all_columns:
+                all_columns.add(normalized)
+                column_order.append(normalized)
+        for record in frame.iter_rows(named=True):
+            cleaned = {}
+            for raw_column, value in record.items():
+                normalized = self._normalize_header(raw_column, norm_mode)
+                if normalized:
+                    text_value = self._cell_to_text(value)
+                    cleaned[normalized] = text_value.strip() if self.config.trim_whitespace else text_value
+            rows.append(cleaned)
+
+        self.stats.files_processed += 1
+        self.stats.total_rows_read += len(rows)
+        self.log(
+            f"OK {file_path.name} ({len(rows):,} rows, polars, delim={repr(details['delimiter'])})",
+            "success",
+        )
+        return self._add_source_column(rows, file_path, all_columns, column_order)
+
     def _read_file(self, file_path: Path, all_columns: set, column_order: list) -> list[dict]:
         """Read a single CSV file."""
         rows = []
@@ -1351,6 +1421,11 @@ class CSVEngine:
         if file_path.suffix.lower() not in SUPPORTED_TEXT_SUFFIXES:
             rows = self._read_structured_file(file_path, all_columns, column_order)
             return self._add_source_column(rows, file_path, all_columns, column_order)
+
+        if self._should_use_polars(file_path):
+            polars_rows = self._read_text_file_polars(file_path, all_columns, column_order)
+            if polars_rows is not None:
+                return polars_rows
 
         norm_mode = getattr(self.config, 'header_normalize', 'none')
 
@@ -3882,6 +3957,8 @@ def cli_main():
                         default="none", help="Header normalization mode")
     parser.add_argument("--schema-mode", choices=["union", "intersection", "first_file"],
                         default="union", help="Schema unification mode")
+    parser.add_argument("--backend", choices=["auto", "python", "polars"], default="auto",
+                        help="Text parsing backend; polars is recommended for large in-memory jobs")
     parser.add_argument("--column-template", help="Use this input's column order as the output template")
     parser.add_argument("--source-column", help="Add a provenance column containing each source file")
     parser.add_argument("--source-path", action="store_true", help="Store the full source path instead of the file name")
@@ -4006,6 +4083,7 @@ def cli_main():
 
     config.header_normalize = args.header_normalize
     config.schema_mode = args.schema_mode
+    config.engine_backend = args.backend
     config.streaming_enabled = not args.no_stream
     if args.column_template:
         config.column_template = args.column_template

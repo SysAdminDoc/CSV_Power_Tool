@@ -113,6 +113,18 @@ class CSVEngineTests(unittest.TestCase):
             self.assertEqual(rows[0]["email"], "[REDACTED]")
             self.assertEqual(stats.column_summary["id"]["distinct_count"], 2)
 
+    def test_polars_backend_reads_text_inputs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "input.csv"
+            output_path = Path(temp_dir) / "output.csv"
+            input_path.write_text("id,name\n1,A\n2,B\n", encoding="utf-8")
+            config = ProcessingConfig(dedupe_enabled=False, engine_backend="polars")
+
+            stats = CSVEngine(config).process([input_path], output_path)
+
+            self.assertEqual(stats.final_row_count, 2)
+            self.assertEqual(output_path.read_text(encoding="utf-8").splitlines()[1], "1,A")
+
     def test_schema_report_contains_drift_samples_and_detection(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             first = Path(temp_dir) / "first.csv"

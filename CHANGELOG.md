@@ -8,6 +8,7 @@ All notable changes to CSV_Power_Tool will be documented in this file.
 - Added: Source-file provenance columns, canonical column templates, schema-drift reports, type inference, and delimiter/encoding confidence diagnostics.
 - Added: Pivot/unpivot reshaping, SQL-style keyed joins, and keyed three-way merge primitives with conflict resolution.
 - Added: Optional sensitive-value redaction and per-column processing summaries.
+- Added: Explicit Polars text parsing backend for large in-memory jobs, with the existing Python and streaming paths preserved.
 
 ## [v3.1.0] - 2026-06-27
 
