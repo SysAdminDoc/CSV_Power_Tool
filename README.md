@@ -125,6 +125,17 @@ python CSV_Consolidator.py --inputs left.csv right.csv --join-on id --join-type 
 python CSV_Consolidator.py --three-way-base base.csv --three-way-ours ours.csv --three-way-theirs theirs.csv --key-columns id --output merged.csv
 ```
 
+### Packaging
+
+Build unsigned Windows artifacts locally:
+
+```bash
+python packaging/build.py
+python packaging/build.py --msi
+```
+
+The build prints SHA-256 hashes for the one-file executable and optional WiX MSI. No code-signing step is used.
+
 ---
 
 ## 📖 Usage

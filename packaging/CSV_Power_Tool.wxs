@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="CSV Power Tool"
+      Manufacturer="SysAdminDoc"
+      Version="3.1.0"
+      UpgradeCode="5B3F4E55-338C-4F8E-9A5A-4D6B6C9B9D72"
+      Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of CSV Power Tool is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Feature Id="MainFeature" Title="CSV Power Tool" Level="1">
+      <ComponentGroupRef Id="ApplicationComponents" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="CSV Power Tool" />
+    </StandardDirectory>
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="ApplicationComponents" Directory="INSTALLFOLDER">
+      <Component Id="ApplicationExecutable" Guid="*" Bitness="always64">
+        <File Id="CSVPowerToolExecutable" Source="$(var.PublishDir)\CSV_Power_Tool.exe" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

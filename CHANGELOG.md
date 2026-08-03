@@ -11,6 +11,7 @@ All notable changes to CSV_Power_Tool will be documented in this file.
 - Added: Explicit Polars text parsing backend for large in-memory jobs, with the existing Python and streaming paths preserved.
 - Added: Non-mutating duplicate previews through the engine and `--dedupe-preview` CLI export.
 - Added: Projected-output preview, per-column summary statistics, drag-reorderable columns, preset undo/redo, and Dark/Light/System appearance modes.
+- Added: Reproducible unsigned PyInstaller one-file and WiX MSI build automation with SHA-256 output.
 
 ## [v3.1.0] - 2026-06-27
 
