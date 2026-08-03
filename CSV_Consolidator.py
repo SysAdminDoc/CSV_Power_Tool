@@ -13,10 +13,11 @@ import copy
 import threading
 import time
 import locale
+import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
 from datetime import datetime, timezone
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Callable
 from tkinter import filedialog, StringVar, BooleanVar, IntVar, END
 
@@ -86,6 +87,23 @@ COLORS = {
     "error": "#ef4444",
     "tab_active": "#1e293b",
     "tab_inactive": "#0f172a",
+}
+
+DARK_COLORS = COLORS.copy()
+LIGHT_COLORS = {
+    **DARK_COLORS,
+    "bg_dark": "#f8fafc",
+    "bg_secondary": "#ffffff",
+    "bg_tertiary": "#e2e8f0",
+    "bg_input": "#f1f5f9",
+    "bg_hover": "#cbd5e1",
+    "border": "#cbd5e1",
+    "border_light": "#94a3b8",
+    "text_primary": "#0f172a",
+    "text_secondary": "#334155",
+    "text_muted": "#64748b",
+    "tab_active": "#e2e8f0",
+    "tab_inactive": "#f1f5f9",
 }
 
 FONTS = {
@@ -190,6 +208,46 @@ class ProcessingStats:
     errors: list = field(default_factory=list)
     column_summary: dict = field(default_factory=dict)
     input_diagnostics: dict = field(default_factory=dict)
+
+
+class ConfigHistory:
+    """Bounded undo/redo history for JSON-serializable preset snapshots."""
+
+    def __init__(self, initial=None, limit: int = 50):
+        self.limit = max(2, int(limit))
+        self._states = [copy.deepcopy(initial or {})]
+        self._index = 0
+
+    def record(self, state: dict):
+        snapshot = copy.deepcopy(state)
+        if snapshot == self._states[self._index]:
+            return
+        self._states = self._states[: self._index + 1]
+        self._states.append(snapshot)
+        if len(self._states) > self.limit:
+            trim = len(self._states) - self.limit
+            self._states = self._states[trim:]
+        self._index = len(self._states) - 1
+
+    @property
+    def can_undo(self) -> bool:
+        return self._index > 0
+
+    @property
+    def can_redo(self) -> bool:
+        return self._index < len(self._states) - 1
+
+    def undo(self):
+        if not self.can_undo:
+            return None
+        self._index -= 1
+        return copy.deepcopy(self._states[self._index])
+
+    def redo(self):
+        if not self.can_redo:
+            return None
+        self._index += 1
+        return copy.deepcopy(self._states[self._index])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1337,6 +1395,36 @@ class CSVEngine:
         self.update_progress(100, "Complete!")
         self.log(f"OK Saved: {output_file.name} ({self.stats.final_row_count:,} rows)", "success")
         return self.stats
+
+    def preview(self, input_files: list[Path], limit: int = 100) -> dict:
+        """Process into a private temporary CSV and return the projected first rows."""
+        limit = max(1, int(limit))
+        preview_config = copy.deepcopy(self.config)
+        preview_config.streaming_enabled = False
+        preview_config.include_header = True
+        preview_config.output_encoding = "utf-8"
+        preview_config.output_delimiter = ","
+        preview_config.output_quoting = "minimal"
+        preview_config.line_ending = "unix"
+
+        with tempfile.TemporaryDirectory(prefix="csv-power-preview-") as temp_dir:
+            output_path = Path(temp_dir) / "preview.csv"
+            preview_engine = CSVEngine(preview_config)
+            stats = preview_engine.process(input_files, output_path)
+            if not output_path.exists():
+                return {
+                    "columns": preview_engine.discover_columns(input_files),
+                    "rows": [],
+                    "stats": stats,
+                }
+            with output_path.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                rows = list(reader)
+            return {
+                "columns": list(reader.fieldnames or []),
+                "rows": rows[:limit],
+                "stats": stats,
+            }
     
     def _should_use_polars(self, file_path: Path) -> bool:
         backend = getattr(self.config, "engine_backend", "auto")
@@ -1477,9 +1565,6 @@ class CSVEngine:
     
     def _get_final_columns(self, discovered_order: list) -> list[str]:
         """Determine final column list based on configuration."""
-        if self.config.column_order:
-            return self.config.column_order
-        
         if self.config.columns_mode == "all":
             columns = discovered_order
         elif self.config.columns_mode == "select":
@@ -1488,6 +1573,10 @@ class CSVEngine:
             columns = [c for c in discovered_order if c not in self.config.selected_columns]
         else:
             columns = discovered_order
+
+        if self.config.column_order:
+            preferred = [column for column in self.config.column_order if column in columns]
+            columns = preferred + [column for column in columns if column not in preferred]
         
         # Apply column mapping for display names
         return columns
@@ -2209,11 +2298,12 @@ class FileListPanel(ctk.CTkFrame):
         files = filedialog.askopenfilenames(
             title="Select Input Files",
             filetypes=[
-                ("Supported Files", "*.csv *.tsv *.txt *.xlsx *.parquet"),
+                ("Supported Files", "*.csv *.tsv *.txt *.xlsx *.parquet *.jsonl *.ndjson"),
                 ("CSV Files", "*.csv"),
                 ("TSV Files", "*.tsv"),
                 ("Excel Files", "*.xlsx"),
                 ("Parquet Files", "*.parquet"),
+                ("JSON Lines", "*.jsonl *.ndjson"),
                 ("Text Files", "*.txt"),
                 ("All Files", "*.*"),
             ]
@@ -2320,6 +2410,7 @@ class ColumnPanel(ctk.CTkFrame):
     """Column selection and configuration."""
     
     def __init__(self, master, **kwargs):
+        self.on_order_change = kwargs.pop("on_order_change", None)
         if "fg_color" not in kwargs:
             kwargs["fg_color"] = COLORS["bg_secondary"]
         if "corner_radius" not in kwargs:
@@ -2329,6 +2420,8 @@ class ColumnPanel(ctk.CTkFrame):
         self.columns: list[str] = []
         self.selected: set[str] = set()
         self.column_mapping: dict[str, str] = {}
+        self._drag_column = None
+        self._row_frames = {}
         self.mode = StringVar(value="all")
         
         # Header
@@ -2401,9 +2494,36 @@ class ColumnPanel(ctk.CTkFrame):
         ).pack(side="left")
     
     def set_columns(self, columns: list[str]):
-        self.columns = columns
-        self.selected = set(columns)
+        existing_order = [column for column in self.columns if column in columns]
+        self.columns = existing_order + [column for column in columns if column not in existing_order]
+        self.selected = {column for column in self.selected if column in self.columns} or set(self.columns)
         self._refresh()
+
+    def get_column_order(self) -> list[str]:
+        return list(self.columns)
+
+    def _start_drag(self, column: str, _event=None):
+        self._drag_column = column
+
+    def _drag_motion(self, event):
+        if not self._drag_column:
+            return
+        target = None
+        for column, frame in self._row_frames.items():
+            midpoint = frame.winfo_rooty() + max(frame.winfo_height(), 1) / 2
+            if event.y_root < midpoint:
+                target = column
+                break
+        if target and target != self._drag_column:
+            source_index = self.columns.index(self._drag_column)
+            target_index = self.columns.index(target)
+            self.columns.insert(target_index, self.columns.pop(source_index))
+            self._refresh()
+            if self.on_order_change:
+                self.on_order_change()
+
+    def _finish_drag(self, _event=None):
+        self._drag_column = None
     
     def _select_all(self):
         self.selected = set(self.columns)
@@ -2422,6 +2542,7 @@ class ColumnPanel(ctk.CTkFrame):
     def _refresh(self):
         for w in self.scroll_frame.winfo_children():
             w.destroy()
+        self._row_frames = {}
         
         if not self.columns:
             self.placeholder = ctk.CTkLabel(
@@ -2438,6 +2559,18 @@ class ColumnPanel(ctk.CTkFrame):
                 
                 frame = ctk.CTkFrame(self.scroll_frame, fg_color="transparent", height=28)
                 frame.pack(fill="x", pady=1)
+                self._row_frames[col] = frame
+
+                grip = ctk.CTkLabel(
+                    frame, text="⋮⋮", width=24,
+                    font=ctk.CTkFont(size=11),
+                    text_color=COLORS["text_muted"],
+                    cursor="hand2",
+                )
+                grip.pack(side="left")
+                grip.bind("<ButtonPress-1>", lambda event, c=col: self._start_drag(c, event))
+                grip.bind("<B1-Motion>", self._drag_motion)
+                grip.bind("<ButtonRelease-1>", self._finish_drag)
                 
                 ctk.CTkCheckBox(
                     frame, text=col, variable=var,
@@ -3407,6 +3540,7 @@ class OutputPanel(ctk.CTkFrame):
                 ("TSV Files", "*.tsv"),
                 ("Excel Files", "*.xlsx"),
                 ("Parquet Files", "*.parquet"),
+                ("JSON Lines", "*.jsonl *.ndjson"),
                 ("Text Files", "*.txt"),
                 ("All Files", "*.*"),
             ]
@@ -3489,6 +3623,85 @@ class LogPanel(ctk.CTkFrame):
         self.log_text.configure(state="disabled")
 
 
+class PreviewPanel(ctk.CTkFrame):
+    """Projected output preview, capped to the first 100 rows."""
+
+    @staticmethod
+    def format_preview(columns: list[str], rows: list[dict], max_width: int = 24) -> str:
+        if not columns:
+            return "No columns discovered."
+        values = []
+        for row in rows:
+            values.append([
+                str(row.get(column, "")).replace("\r", " ").replace("\n", " ")
+                for column in columns
+            ])
+        widths = [min(max_width, max(len(column), *(len(row[index]) for row in values)) if values else len(column))
+                  for index, column in enumerate(columns)]
+
+        def render(row):
+            return " | ".join(value[:width].ljust(width) for value, width in zip(row, widths))
+
+        lines = [render(columns), "-+-".join("-" * width for width in widths)]
+        lines.extend(render(row) for row in values)
+        if not values:
+            lines.append("(no rows)")
+        return "\n".join(lines)
+
+    def __init__(self, master, on_refresh: Callable = None, **kwargs):
+        if "fg_color" not in kwargs:
+            kwargs["fg_color"] = COLORS["bg_secondary"]
+        if "corner_radius" not in kwargs:
+            kwargs["corner_radius"] = 8
+        super().__init__(master, **kwargs)
+        self.on_refresh = on_refresh
+
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=12, pady=(10, 6))
+        ctk.CTkLabel(
+            header, text="🔎 Preview",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=COLORS["text_primary"],
+        ).pack(side="left")
+        ctk.CTkButton(
+            header, text="Refresh", width=64, height=24,
+            font=ctk.CTkFont(size=10),
+            fg_color=COLORS["bg_tertiary"], hover_color=COLORS["accent_blue"],
+            text_color=COLORS["text_secondary"], corner_radius=4,
+            command=lambda: self.on_refresh() if self.on_refresh else None,
+        ).pack(side="right")
+
+        self.status_label = ctk.CTkLabel(
+            self, text="Add files to preview projected output",
+            font=ctk.CTkFont(size=10), text_color=COLORS["text_muted"], anchor="w",
+        )
+        self.status_label.pack(fill="x", padx=12, pady=(0, 4))
+        self.preview_text = ctk.CTkTextbox(
+            self, fg_color=COLORS["bg_dark"], text_color=COLORS["text_primary"],
+            font=ctk.CTkFont(family="Consolas", size=10), corner_radius=6,
+        )
+        self.preview_text.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+        self.preview_text.configure(state="disabled")
+
+    def update_preview(self, preview: dict):
+        columns = preview.get("columns", [])
+        rows = preview.get("rows", [])
+        stats = preview.get("stats")
+        text = self.format_preview(columns, rows)
+        self.preview_text.configure(state="normal")
+        self.preview_text.delete("1.0", END)
+        self.preview_text.insert("1.0", text)
+        self.preview_text.configure(state="disabled")
+        final_count = getattr(stats, "final_row_count", len(rows)) if stats else len(rows)
+        self.status_label.configure(text=f"Showing {len(rows):,} of {final_count:,} projected row(s)")
+
+    def reset(self, message: str = "Add files to preview projected output"):
+        self.preview_text.configure(state="normal")
+        self.preview_text.delete("1.0", END)
+        self.preview_text.configure(state="disabled")
+        self.status_label.configure(text=message)
+
+
 class StatsPanel(ctk.CTkFrame):
     """Processing statistics display."""
     
@@ -3524,15 +3737,41 @@ class StatsPanel(ctk.CTkFrame):
             )
             val_label.pack(side="right")
             self.labels[key] = val_label
+
+        ctk.CTkLabel(
+            self, text="Column Summary", font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=COLORS["text_secondary"], anchor="w",
+        ).pack(fill="x", padx=12, pady=(2, 4))
+        self.summary_text = ctk.CTkTextbox(
+            self, height=96, fg_color=COLORS["bg_dark"],
+            text_color=COLORS["text_secondary"],
+            font=ctk.CTkFont(family="Consolas", size=9), corner_radius=6,
+        )
+        self.summary_text.pack(fill="x", padx=12, pady=(0, 10))
+        self.summary_text.configure(state="disabled")
     
     def update(self, stats: ProcessingStats):
         for key, label in self.labels.items():
             val = getattr(stats, key, 0)
             label.configure(text=f"{val:,}")
+        lines = []
+        for column, summary in stats.column_summary.items():
+            lines.append(
+                f"{column[:18]:18} rows={summary.get('row_count', 0):>6,} "
+                f"distinct={summary.get('distinct_count', 0):>6,} "
+                f"type={summary.get('inferred_type', 'empty')}"
+            )
+        self.summary_text.configure(state="normal")
+        self.summary_text.delete("1.0", END)
+        self.summary_text.insert("1.0", "\n".join(lines) if lines else "(no column summary)")
+        self.summary_text.configure(state="disabled")
     
     def reset(self):
         for label in self.labels.values():
             label.configure(text="—")
+        self.summary_text.configure(state="normal")
+        self.summary_text.delete("1.0", END)
+        self.summary_text.configure(state="disabled")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3552,13 +3791,23 @@ class CSVPowerToolApp:
         self.root.geometry("1200x850")
         self.root.minsize(1000, 700)
         
+        COLORS.update(DARK_COLORS)
         ctk.set_appearance_mode("dark")
         self.root.configure(bg=COLORS["bg_dark"])
         
         self.engine: CSVEngine = None
         self.processing = False
+        self.appearance_mode = StringVar(value="Dark")
+        self._config_overrides = {}
+        self._preview_job = None
+        self._preview_generation = 0
+        self.history = None
         
         self._build_ui()
+        self.history = ConfigHistory(self._config_to_data())
+        self._update_history_buttons()
+        self.root.bind_all("<ButtonRelease-1>", self._on_ui_edit, add="+")
+        self.root.bind_all("<KeyRelease>", self._on_ui_edit, add="+")
         
         if DND_AVAILABLE:
             self._setup_dnd()
@@ -3592,6 +3841,20 @@ class CSVPowerToolApp:
         ver_badge.pack(side="right")
         ctk.CTkLabel(ver_badge, text=f"v{APP_VERSION}", font=ctk.CTkFont(size=11),
                      text_color=COLORS["text_muted"]).pack(padx=12, pady=4)
+
+        appearance_frame = ctk.CTkFrame(header, fg_color="transparent")
+        appearance_frame.pack(side="right", padx=(0, 10))
+        ctk.CTkLabel(
+            appearance_frame, text="Theme", font=ctk.CTkFont(size=10),
+            text_color=COLORS["text_muted"],
+        ).pack(side="left", padx=(0, 6))
+        ctk.CTkOptionMenu(
+            appearance_frame, variable=self.appearance_mode,
+            values=["Dark", "Light", "System"], width=86, height=26,
+            font=ctk.CTkFont(size=10), fg_color=COLORS["bg_tertiary"],
+            button_color=COLORS["bg_hover"], dropdown_fg_color=COLORS["bg_secondary"],
+            command=self._set_appearance_mode,
+        ).pack(side="left")
         
         # Content: 3 columns
         content = ctk.CTkFrame(main, fg_color="transparent")
@@ -3630,7 +3893,9 @@ class CSVPowerToolApp:
         tab_output = self.tabview.add("Output")
         
         # Tab contents
-        self.column_panel = ColumnPanel(tab_columns, fg_color="transparent")
+        self.column_panel = ColumnPanel(
+            tab_columns, fg_color="transparent", on_order_change=self._schedule_preview
+        )
         self.column_panel.pack(fill="both", expand=True)
         
         self.sort_panel = SortPanel(tab_sort, fg_color="transparent")
@@ -3655,6 +3920,10 @@ class CSVPowerToolApp:
         
         self.stats_panel = StatsPanel(right_col)
         self.stats_panel.pack(fill="x", pady=(0, 8))
+
+        self.preview_panel = PreviewPanel(right_col, on_refresh=self._refresh_preview, height=260)
+        self.preview_panel.pack(fill="x", pady=(0, 8))
+        self.preview_panel.pack_propagate(False)
         
         self.log_panel = LogPanel(right_col)
         self.log_panel.pack(fill="both", expand=True)
@@ -3706,6 +3975,22 @@ class CSVPowerToolApp:
             text_color=COLORS["text_secondary"],
             corner_radius=6, command=self._load_config
         ).pack(side="left")
+
+        self.undo_btn = ctk.CTkButton(
+            preset_frame, text="↶ Undo", font=ctk.CTkFont(size=11),
+            height=36, width=64, fg_color=COLORS["bg_tertiary"],
+            hover_color=COLORS["bg_hover"], text_color=COLORS["text_secondary"],
+            corner_radius=6, command=self._undo, state="disabled",
+        )
+        self.undo_btn.pack(side="left", padx=(8, 2))
+
+        self.redo_btn = ctk.CTkButton(
+            preset_frame, text="↷ Redo", font=ctk.CTkFont(size=11),
+            height=36, width=64, fg_color=COLORS["bg_tertiary"],
+            hover_color=COLORS["bg_hover"], text_color=COLORS["text_secondary"],
+            corner_radius=6, command=self._redo, state="disabled",
+        )
+        self.redo_btn.pack(side="left", padx=(2, 0))
         
         # Action buttons
         action_frame = ctk.CTkFrame(btn_frame, fg_color="transparent")
@@ -3749,6 +4034,65 @@ class CSVPowerToolApp:
             self.dedupe_panel.set_columns(columns)
             self.filter_panel.set_columns(columns)
             self.transform_panel.set_columns(columns)
+            self._schedule_preview()
+        else:
+            self.preview_panel.reset()
+
+    def _set_appearance_mode(self, value: str):
+        mode = value.lower()
+        ctk.set_appearance_mode(mode)
+        active_mode = ctk.get_appearance_mode().lower() if mode == "system" else mode
+        COLORS.update(LIGHT_COLORS if active_mode == "light" else DARK_COLORS)
+        config_data = self._config_to_data()
+        files = list(self.file_panel.files)
+        for child in self.root.winfo_children():
+            child.destroy()
+        self.root.configure(bg=COLORS["bg_dark"])
+        self._build_ui()
+        self._apply_config_data(config_data)
+        self.file_panel.files = files
+        self.file_panel._refresh()
+        if files:
+            self._on_files_changed()
+        self._update_history_buttons()
+
+    def _schedule_preview(self):
+        if not hasattr(self, "preview_panel"):
+            return
+        if self._preview_job is not None:
+            try:
+                self.root.after_cancel(self._preview_job)
+            except Exception:
+                pass
+        self._preview_job = self.root.after(250, self._refresh_preview)
+
+    def _refresh_preview(self):
+        self._preview_job = None
+        if self.processing or not self.file_panel.files:
+            return
+        files = list(self.file_panel.files)
+        config = self._build_config()
+        self._preview_generation += 1
+        generation = self._preview_generation
+        self.preview_panel.status_label.configure(text="Preparing projected output…")
+
+        def run():
+            try:
+                preview = CSVEngine(config).preview(files, limit=100)
+                self.root.after(
+                    0,
+                    lambda: self.preview_panel.update_preview(preview)
+                    if generation == self._preview_generation else None,
+                )
+            except Exception as exc:
+                error_message = str(exc)
+                self.root.after(
+                    0,
+                    lambda message=error_message: self.preview_panel.reset(f"Preview error: {message}")
+                    if generation == self._preview_generation else None,
+                )
+
+        threading.Thread(target=run, daemon=True).start()
     
     def _update_progress(self, value: float, status: str):
         self.progress_bar.set(value / 100)
@@ -3762,6 +4106,7 @@ class CSVPowerToolApp:
         mode, selected = self.column_panel.get_config()
         config.columns_mode = mode
         config.selected_columns = selected
+        config.column_order = self.column_panel.get_column_order()
         
         # Sort
         enabled, rules, case_sens, numeric = self.sort_panel.get_config()
@@ -3809,7 +4154,106 @@ class CSVPowerToolApp:
         config.include_header = output_config["include_header"]
         config.line_ending = output_config["line_ending"]
 
+        for key, value in self._config_overrides.items():
+            if hasattr(config, key):
+                setattr(config, key, copy.deepcopy(value))
+
         return config
+
+    def _config_to_data(self) -> dict:
+        return asdict(self._build_config())
+
+    def _apply_config_data(self, data: dict):
+        self._config_overrides = {
+            key: copy.deepcopy(value)
+            for key, value in data.items()
+            if key not in {
+                "columns_mode", "selected_columns", "column_order",
+                "sort_enabled", "sort_columns", "sort_case_sensitive", "sort_numeric_aware",
+                "dedupe_enabled", "dedupe_columns", "dedupe_keep", "dedupe_fuzzy_enabled",
+                "dedupe_fuzzy_threshold", "dedupe_aggregate_mode", "dedupe_aggregate_separator",
+                "filters", "filter_logic", "trim_whitespace", "case_transform", "empty_value",
+                "header_normalize", "column_transforms", "output_delimiter", "output_encoding",
+                "output_quoting", "include_header", "line_ending",
+            }
+        }
+
+        self.column_panel.mode.set(data.get("columns_mode", "all"))
+        self.column_panel.selected = set(data.get("selected_columns", []))
+        requested_order = data.get("column_order", [])
+        if requested_order:
+            known = [column for column in requested_order if column in self.column_panel.columns]
+            self.column_panel.columns = known + [
+                column for column in self.column_panel.columns if column not in known
+            ]
+        self.column_panel._refresh()
+
+        self.sort_panel.enabled.set(data.get("sort_enabled", False))
+        self.sort_panel.sort_rules = [tuple(rule) for rule in data.get("sort_columns", [])]
+        self.sort_panel.case_sensitive.set(data.get("sort_case_sensitive", False))
+        self.sort_panel.numeric_aware.set(data.get("sort_numeric_aware", True))
+        self.sort_panel._refresh_rules()
+
+        self.dedupe_panel.enabled.set(data.get("dedupe_enabled", True))
+        self.dedupe_panel.selected_columns = set(data.get("dedupe_columns", []))
+        self.dedupe_panel.keep_mode.set(data.get("dedupe_keep", "first"))
+        self.dedupe_panel.use_all_columns.set(not bool(data.get("dedupe_columns", [])))
+        self.dedupe_panel.fuzzy_enabled.set(data.get("dedupe_fuzzy_enabled", False))
+        self.dedupe_panel.fuzzy_threshold.set(data.get("dedupe_fuzzy_threshold", 90))
+        self.dedupe_panel.aggregate_mode.set(data.get("dedupe_aggregate_mode", "none"))
+        self.dedupe_panel.aggregate_separator.set(data.get("dedupe_aggregate_separator", "; "))
+        self.dedupe_panel._toggle_column_selection()
+
+        self.filter_panel.filters = [tuple(rule) for rule in data.get("filters", [])]
+        self.filter_panel.logic.set(data.get("filter_logic", "and"))
+        self.filter_panel._refresh()
+
+        self.transform_panel.trim_whitespace.set(data.get("trim_whitespace", True))
+        self.transform_panel.case_transform.set(data.get("case_transform", "none"))
+        self.transform_panel.empty_value.set(data.get("empty_value", ""))
+        self.transform_panel.header_normalize.set(data.get("header_normalize", "none"))
+        self.transform_panel.column_transforms = [tuple(item) for item in data.get("column_transforms", [])]
+        self.transform_panel._refresh_transforms()
+
+        delimiter = data.get("output_delimiter", ",")
+        self.output_panel.delimiter.set("\\t (Tab)" if delimiter == "\t" else delimiter)
+        self.output_panel.encoding.set(data.get("output_encoding", "utf-8"))
+        self.output_panel.quoting.set(data.get("output_quoting", "minimal"))
+        self.output_panel.include_header.set(data.get("include_header", True))
+        line_ending = data.get("line_ending", "auto")
+        self.output_panel.line_ending.set(
+            "unix (LF)" if line_ending == "unix" else
+            "windows (CRLF)" if line_ending == "windows" else "auto"
+        )
+
+    def _on_ui_edit(self, _event=None):
+        if self.history is None or self.processing:
+            return
+        self.history.record(self._config_to_data())
+        self._update_history_buttons()
+        self._schedule_preview()
+
+    def _update_history_buttons(self):
+        if not self.history or not hasattr(self, "undo_btn"):
+            return
+        self.undo_btn.configure(state="normal" if self.history.can_undo else "disabled")
+        self.redo_btn.configure(state="normal" if self.history.can_redo else "disabled")
+
+    def _undo(self):
+        state = self.history.undo() if self.history else None
+        if state is not None:
+            self._apply_config_data(state)
+            self._update_history_buttons()
+            self.log_panel.log("Preset edit undone", "info")
+            self._schedule_preview()
+
+    def _redo(self):
+        state = self.history.redo() if self.history else None
+        if state is not None:
+            self._apply_config_data(state)
+            self._update_history_buttons()
+            self.log_panel.log("Preset edit redone", "info")
+            self._schedule_preview()
     
     def _process(self):
         if not self.file_panel.files:
@@ -3871,37 +4315,12 @@ class CSVPowerToolApp:
             filetypes=[("JSON Files", "*.json")]
         )
         if file:
-            config = self._build_config()
-            data = {
-                "columns_mode": config.columns_mode,
-                "selected_columns": config.selected_columns,
-                "sort_enabled": config.sort_enabled,
-                "sort_columns": config.sort_columns,
-                "sort_case_sensitive": config.sort_case_sensitive,
-                "sort_numeric_aware": config.sort_numeric_aware,
-                "dedupe_enabled": config.dedupe_enabled,
-                "dedupe_columns": config.dedupe_columns,
-                "dedupe_keep": config.dedupe_keep,
-                "dedupe_fuzzy_enabled": config.dedupe_fuzzy_enabled,
-                "dedupe_fuzzy_threshold": config.dedupe_fuzzy_threshold,
-                "dedupe_aggregate_mode": config.dedupe_aggregate_mode,
-                "dedupe_aggregate_separator": config.dedupe_aggregate_separator,
-                "filters": config.filters,
-                "filter_logic": config.filter_logic,
-                "trim_whitespace": config.trim_whitespace,
-                "case_transform": config.case_transform,
-                "empty_value": config.empty_value,
-                "header_normalize": config.header_normalize,
-                "column_transforms": config.column_transforms,
-                "schema_mode": config.schema_mode,
-                "output_delimiter": config.output_delimiter,
-                "output_encoding": config.output_encoding,
-                "output_quoting": config.output_quoting,
-                "include_header": config.include_header,
-                "line_ending": config.line_ending,
-            }
+            data = self._config_to_data()
             with open(file, 'w') as f:
                 json.dump(data, f, indent=2)
+            if self.history:
+                self.history.record(data)
+                self._update_history_buttons()
             self.log_panel.log(f"Configuration saved: {Path(file).name}", "success")
     
     def _load_config(self):
@@ -3913,45 +4332,13 @@ class CSVPowerToolApp:
             try:
                 with open(file, 'r') as f:
                     data = json.load(f)
-                
-                # Apply to panels
-                self.column_panel.mode.set(data.get("columns_mode", "all"))
-                self.column_panel.selected = set(data.get("selected_columns", []))
-                
-                self.sort_panel.enabled.set(data.get("sort_enabled", False))
-                self.sort_panel.sort_rules = data.get("sort_columns", [])
-                self.sort_panel.case_sensitive.set(data.get("sort_case_sensitive", False))
-                self.sort_panel.numeric_aware.set(data.get("sort_numeric_aware", True))
-                self.sort_panel._refresh_rules()
-                
-                self.dedupe_panel.enabled.set(data.get("dedupe_enabled", True))
-                self.dedupe_panel.selected_columns = set(data.get("dedupe_columns", []))
-                self.dedupe_panel.keep_mode.set(data.get("dedupe_keep", "first"))
-                self.dedupe_panel.fuzzy_enabled.set(data.get("dedupe_fuzzy_enabled", False))
-                self.dedupe_panel.fuzzy_threshold.set(data.get("dedupe_fuzzy_threshold", 90))
-                self.dedupe_panel.aggregate_mode.set(data.get("dedupe_aggregate_mode", "none"))
-                self.dedupe_panel.aggregate_separator.set(data.get("dedupe_aggregate_separator", "; "))
-                
-                self.filter_panel.filters = data.get("filters", [])
-                self.filter_panel.logic.set(data.get("filter_logic", "and"))
-                self.filter_panel._refresh()
-                
-                self.transform_panel.trim_whitespace.set(data.get("trim_whitespace", True))
-                self.transform_panel.case_transform.set(data.get("case_transform", "none"))
-                self.transform_panel.empty_value.set(data.get("empty_value", ""))
-                self.transform_panel.header_normalize.set(data.get("header_normalize", "none"))
-                self.transform_panel.column_transforms = data.get("column_transforms", [])
-                self.transform_panel._refresh_transforms()
-
-                delim = data.get("output_delimiter", ",")
-                if delim == "\t":
-                    delim = "\\t (Tab)"
-                self.output_panel.delimiter.set(delim)
-                self.output_panel.encoding.set(data.get("output_encoding", "utf-8"))
-                self.output_panel.quoting.set(data.get("output_quoting", "minimal"))
-                self.output_panel.include_header.set(data.get("include_header", True))
+                self._apply_config_data(data)
+                if self.history:
+                    self.history.record(self._config_to_data())
+                    self._update_history_buttons()
                 
                 self.log_panel.log(f"Configuration loaded: {Path(file).name}", "success")
+                self._schedule_preview()
                 
             except Exception as e:
                 self.log_panel.log(f"Error loading config: {e}", "error")

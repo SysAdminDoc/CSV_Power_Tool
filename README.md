@@ -86,6 +86,9 @@
 - Bounded-memory streaming for text inputs when sort and dedupe are disabled
 - Real-time processing log with color-coded messages
 - Live statistics panel
+- Projected-output preview (first 100 rows) with per-column row/distinct/type summary
+- Drag-reorderable output columns and undo/redo for preset edits
+- Dark, Light, and System appearance modes
 - Cancel button for long operations
 - Modern dark theme UI
 

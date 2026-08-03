@@ -10,6 +10,7 @@ All notable changes to CSV_Power_Tool will be documented in this file.
 - Added: Optional sensitive-value redaction and per-column processing summaries.
 - Added: Explicit Polars text parsing backend for large in-memory jobs, with the existing Python and streaming paths preserved.
 - Added: Non-mutating duplicate previews through the engine and `--dedupe-preview` CLI export.
+- Added: Projected-output preview, per-column summary statistics, drag-reorderable columns, preset undo/redo, and Dark/Light/System appearance modes.
 
 ## [v3.1.0] - 2026-06-27
 

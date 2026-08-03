@@ -13,6 +13,8 @@ SPEC.loader.exec_module(csv_consolidator)
 
 CSVEngine = csv_consolidator.CSVEngine
 ProcessingConfig = csv_consolidator.ProcessingConfig
+ConfigHistory = csv_consolidator.ConfigHistory
+PreviewPanel = csv_consolidator.PreviewPanel
 
 
 class CSVEngineTests(unittest.TestCase):
@@ -51,6 +53,25 @@ class CSVEngineTests(unittest.TestCase):
         self.assertEqual(report["group_count"], 1)
         self.assertEqual(report["groups"][0]["kept_index"], 1)
         self.assertEqual(report["groups"][0]["dropped_indexes"], [0])
+
+    def test_config_history_undo_redo_truncates_redo_branch(self):
+        history = ConfigHistory({"mode": "all"})
+        history.record({"mode": "select"})
+        history.record({"mode": "exclude"})
+
+        self.assertEqual(history.undo(), {"mode": "select"})
+        self.assertEqual(history.undo(), {"mode": "all"})
+        self.assertEqual(history.redo(), {"mode": "select"})
+        history.record({"mode": "all"})
+        self.assertFalse(history.can_redo)
+
+    def test_preview_formatter_is_column_aligned_and_capped(self):
+        text = PreviewPanel.format_preview(
+            ["id", "name"], [{"id": "1", "name": "A\nB"}]
+        )
+
+        self.assertIn("id | name", text)
+        self.assertIn("1  | A B", text)
 
     def test_dedup_can_aggregate_duplicate_rows(self):
         config = ProcessingConfig(
