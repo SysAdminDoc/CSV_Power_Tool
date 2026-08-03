@@ -1819,6 +1819,65 @@ class CSVEngine:
         
         return result
 
+    def preview_duplicates(self, rows: list[dict], columns: list[str] | None = None) -> dict:
+        """Describe duplicate groups without changing the supplied rows."""
+        if not rows:
+            return {"duplicate_count": 0, "group_count": 0, "groups": []}
+
+        columns = list(columns or rows[0].keys())
+        dedupe_cols = self.config.dedupe_columns if self.config.dedupe_columns else columns
+        fuzzy_enabled = getattr(self.config, "dedupe_fuzzy_enabled", False)
+        threshold = int(getattr(self.config, "dedupe_fuzzy_threshold", 90))
+        groups = []
+        exact_index = {}
+
+        for index, row in enumerate(rows):
+            key = self._dedupe_key(row, dedupe_cols)
+            matched = None
+            if fuzzy_enabled:
+                key_text = "\x1f".join(key)
+                for group in groups:
+                    existing_text = "\x1f".join(group["key"])
+                    if self._fuzzy_score(key_text, existing_text) >= threshold:
+                        matched = group
+                        break
+            else:
+                matched = exact_index.get(key)
+
+            if matched is None:
+                matched = {"key": key, "indexes": [], "rows": []}
+                groups.append(matched)
+                exact_index[key] = matched
+            matched["indexes"].append(index)
+            matched["rows"].append(copy.deepcopy(row))
+
+        duplicate_groups = []
+        duplicate_count = 0
+        for group in groups:
+            if len(group["indexes"]) < 2:
+                continue
+            if self.config.dedupe_keep == "last" and getattr(self.config, "dedupe_aggregate_mode", "none") == "none":
+                kept_position = len(group["indexes"]) - 1
+            else:
+                kept_position = 0
+            dropped_positions = [
+                position for position in range(len(group["indexes"])) if position != kept_position
+            ]
+            duplicate_count += len(dropped_positions)
+            duplicate_groups.append({
+                "key": list(group["key"]),
+                "kept_index": group["indexes"][kept_position],
+                "dropped_indexes": [group["indexes"][position] for position in dropped_positions],
+                "kept_row": group["rows"][kept_position],
+                "dropped_rows": [group["rows"][position] for position in dropped_positions],
+            })
+
+        return {
+            "duplicate_count": duplicate_count,
+            "group_count": len(duplicate_groups),
+            "groups": duplicate_groups,
+        }
+
     def _dedupe_key(self, row: dict, dedupe_cols: list[str]) -> tuple[str, ...]:
         key_parts = []
         for col in dedupe_cols:
@@ -3947,6 +4006,7 @@ def cli_main():
                         help="Aggregate non-key duplicate columns with the selected mode")
     parser.add_argument("--dedupe-aggregate-separator", default="; ",
                         help="Separator for --dedupe-aggregate concat")
+    parser.add_argument("--dedupe-preview", help="Write a JSON duplicate preview without requiring an output file")
     parser.add_argument("--filter", action="append", metavar="COL:OP:VALUE",
                         help="Add a filter rule. Operators include between, fuzzy, regex, contains")
     parser.add_argument("--sort", nargs="+", metavar="COL[:asc|desc]",
@@ -4000,8 +4060,10 @@ def cli_main():
             sys.exit(3)
         return
 
-    if not args.inputs or not args.output:
-        parser.error("--inputs and --output are required unless --register-git-driver is used")
+    if not args.inputs or (not args.output and not args.dedupe_preview):
+        parser.error("--inputs and --output are required unless --register-git-driver or --dedupe-preview is used")
+    if (args.join_on or args.three_way_base or args.three_way_ours or args.three_way_theirs) and not args.output:
+        parser.error("--output is required for join and three-way merge operations")
 
     def expand_inputs(patterns):
         input_files = []
@@ -4141,13 +4203,30 @@ def cli_main():
         if args.verbose and not args.quiet:
             print(f"  ... {status} ({value:.0f}%)", file=sys.stderr)
 
-    output_path = Path(args.output)
+    output_path = Path(args.output) if args.output else None
 
     def read_operation_file(engine, path):
         all_columns = set()
         column_order = []
         rows = engine._read_file(Path(path), all_columns, column_order)
         return rows, column_order
+
+    def build_dedupe_preview(engine, input_files):
+        all_rows = []
+        all_columns = set()
+        column_order = []
+        for path in input_files:
+            all_rows.extend(engine._read_file(path, all_columns, column_order))
+        final_columns = engine._with_transform_columns(engine._get_final_columns(column_order))
+        if config.filters:
+            all_rows = engine._apply_filters(all_rows)
+        all_rows = engine._apply_transformations(all_rows, final_columns)
+        all_rows, final_columns = engine._apply_reshape(all_rows, final_columns)
+        return {
+            "columns": final_columns,
+            "rows_read": len(all_rows),
+            "preview": engine.preview_duplicates(all_rows, final_columns),
+        }
 
     def run_join(input_files):
         if len(input_files) < 2:
@@ -4205,6 +4284,21 @@ def cli_main():
             engine.write_schema_report(input_files, Path(args.schema_report))
             if not args.quiet:
                 print(f"  Schema report: {args.schema_report}", file=sys.stderr)
+
+        if args.dedupe_preview:
+            preview_report = build_dedupe_preview(engine, input_files)
+            preview_path = Path(args.dedupe_preview)
+            preview_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(preview_path, "w", encoding="utf-8") as handle:
+                json.dump(preview_report, handle, indent=2, ensure_ascii=False)
+            if not args.quiet:
+                print(
+                    f"  Dedupe preview: {preview_report['preview']['duplicate_count']:,} row(s) in "
+                    f"{preview_report['preview']['group_count']:,} group(s)",
+                    file=sys.stderr,
+                )
+            if not args.output:
+                return 3 if engine.stats.errors else 0
 
         if args.join_on:
             return run_join(input_files)

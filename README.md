@@ -115,6 +115,7 @@
 python CSV_Consolidator.py --inputs data/*.csv --output combined.csv
 python CSV_Consolidator.py --inputs exports --filter "date:between:2024-01-01..2024-12-31" --output filtered.xlsx
 python CSV_Consolidator.py --inputs exports --fuzzy-dedupe-threshold 88 --output deduped.parquet
+python CSV_Consolidator.py --inputs exports --dedupe-preview duplicate-preview.json
 python CSV_Consolidator.py --watch --inputs exports --output combined.csv
 python CSV_Consolidator.py --inputs exports --source-column "(Source)" --schema-report schema.json --output combined.csv
 python CSV_Consolidator.py --inputs left.csv right.csv --join-on id --join-type outer --output joined.csv

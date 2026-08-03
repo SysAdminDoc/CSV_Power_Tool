@@ -40,6 +40,18 @@ class CSVEngineTests(unittest.TestCase):
         self.assertEqual([row["name"] for row in result], ["Acme Inc", "Contoso"])
         self.assertEqual(engine.stats.duplicates_removed, 1)
 
+    def test_dedupe_preview_reports_rows_that_would_be_dropped(self):
+        config = ProcessingConfig(dedupe_columns=["id"], dedupe_keep="last")
+        report = CSVEngine(config).preview_duplicates(
+            [{"id": "1", "value": "old"}, {"id": "1", "value": "new"}, {"id": "2", "value": "ok"}],
+            ["id", "value"],
+        )
+
+        self.assertEqual(report["duplicate_count"], 1)
+        self.assertEqual(report["group_count"], 1)
+        self.assertEqual(report["groups"][0]["kept_index"], 1)
+        self.assertEqual(report["groups"][0]["dropped_indexes"], [0])
+
     def test_dedup_can_aggregate_duplicate_rows(self):
         config = ProcessingConfig(
             dedupe_enabled=True,
