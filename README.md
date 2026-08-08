@@ -144,6 +144,9 @@ python packaging/build.py --msi
 ```
 
 The build prints SHA-256 hashes for the one-file executable and optional WiX MSI. No code-signing step is used.
+The default build removes stale executable output, performs a clean PyInstaller build, and writes
+`dist/CSV_Power_Tool.dependencies.json` with the locked runtime component versions and detected license metadata.
+Use `python packaging/build.py --reuse` only when intentionally reusing an already verified executable.
 
 ---
 
@@ -221,13 +224,17 @@ Load a saved configuration:
 | Package | Version | Purpose |
 |---------|---------|---------|
 | Python | 3.10+ | Runtime |
-| customtkinter | Latest | Modern GUI framework |
-| tkinterdnd2 | Latest | Drag and drop support |
-| chardet | Latest | Encoding detection |
-| openpyxl | Latest | Excel input/output |
-| pyarrow or polars | Latest | Parquet input/output |
-| rapidfuzz | Latest | Fuzzy filters and dedupe |
-| duckdb | Latest | SQL queries over input files |
+| customtkinter | 5.2.2 | Modern GUI framework |
+| tkinterdnd2 | 0.4.3 | Drag and drop support |
+| chardet | 5.2.0 | Encoding detection |
+| openpyxl | 3.1.5 | Excel input/output |
+| pyarrow | 25.0.0 | Parquet input/output |
+| polars | 1.43.2 | Optional large-file text backend |
+| rapidfuzz | 3.14.3 | Fuzzy filters and dedupe |
+| duckdb | 1.5.2 | SQL queries over input files |
+
+The exact runtime set is maintained in [`requirements.lock`](requirements.lock); install it through
+`requirements.txt` so local and release environments resolve the same versions.
 
 ---
 

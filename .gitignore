@@ -6,6 +6,7 @@ dist/
 build/
 *.egg
 *.spec
+!CSV_Power_Tool.spec
 .env
 .venv/
 venv/

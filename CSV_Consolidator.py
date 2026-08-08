@@ -10,6 +10,7 @@ import csv
 import re
 import json
 import copy
+import importlib
 import hashlib
 import hmac
 import os
@@ -39,6 +40,11 @@ SUPPORTED_TEXT_SUFFIXES = {".csv", ".tsv", ".txt"}
 SUPPORTED_JSONL_SUFFIXES = {".jsonl", ".ndjson"}
 SUPPORTED_STREAM_SUFFIXES = SUPPORTED_TEXT_SUFFIXES | SUPPORTED_JSONL_SUFFIXES
 SUPPORTED_OUTPUT_SUFFIXES = {".csv", ".tsv", ".txt", ".xlsx", ".parquet", ".jsonl", ".ndjson"}
+
+
+def _optional_module(name: str):
+    """Load a feature dependency lazily so headless/package startup stays small."""
+    return importlib.import_module(name)
 
 try:
     locale.setlocale(locale.LC_COLLATE, "")
@@ -487,7 +493,7 @@ class CSVEngine:
         if target_lower in value_lower or value_lower in target_lower:
             return True
         try:
-            from rapidfuzz import fuzz
+            fuzz = _optional_module("rapidfuzz.fuzz")
             score = fuzz.partial_ratio(value_lower, target_lower)
         except ImportError:
             from difflib import SequenceMatcher
@@ -598,7 +604,7 @@ class CSVEngine:
 
         if suffix == ".xlsx":
             try:
-                from openpyxl import load_workbook
+                load_workbook = _optional_module("openpyxl").load_workbook
             except ImportError as exc:
                 raise RuntimeError("openpyxl is required for .xlsx input") from exc
 
@@ -617,7 +623,7 @@ class CSVEngine:
 
         if suffix == ".parquet":
             try:
-                import pyarrow.parquet as pq
+                pq = _optional_module("pyarrow.parquet")
                 schema = pq.read_schema(file_path)
                 return [
                     self._normalize_header(name, norm_mode)
@@ -626,7 +632,7 @@ class CSVEngine:
                 ]
             except ImportError:
                 try:
-                    import polars as pl
+                    pl = _optional_module("polars")
                     frame = pl.scan_parquet(file_path)
                     return [
                         self._normalize_header(name, norm_mode)
@@ -740,7 +746,7 @@ class CSVEngine:
 
         if suffix == ".xlsx":
             try:
-                from openpyxl import load_workbook
+                load_workbook = _optional_module("openpyxl").load_workbook
 
                 workbook = load_workbook(file_path, read_only=True, data_only=True)
                 try:
@@ -805,7 +811,7 @@ class CSVEngine:
         elif suffix == ".parquet":
             try:
                 try:
-                    import pyarrow.parquet as pq
+                    pq = _optional_module("pyarrow.parquet")
                     parquet_file = pq.ParquetFile(file_path)
                     metadata = parquet_file.metadata
                     if not self._check_column_limit(file_path, metadata.num_columns):
@@ -815,7 +821,7 @@ class CSVEngine:
                     table = pq.read_table(file_path)
                     records = table.to_pylist()
                 except ImportError:
-                    import polars as pl
+                    pl = _optional_module("polars")
                     frame = pl.read_parquet(file_path)
                     if not self._check_column_limit(file_path, len(frame.columns)):
                         return []
@@ -1423,7 +1429,7 @@ class CSVEngine:
     def sql_query(self, files: list[Path], query: str) -> tuple[list[dict], list[str]]:
         """Run SQL against input files exposed as input_0, input_1, and so on."""
         try:
-            import duckdb
+            duckdb = _optional_module("duckdb")
         except ImportError as exc:
             raise RuntimeError("duckdb is required for SQL queries") from exc
 
@@ -1989,7 +1995,7 @@ class CSVEngine:
     def _read_text_file_polars(self, file_path: Path, all_columns: set, column_order: list):
         """Read a UTF text input through Polars while preserving string semantics."""
         try:
-            import polars as pl
+            pl = _optional_module("polars")
         except ImportError:
             if getattr(self.config, "engine_backend", "auto") == "polars":
                 raise RuntimeError("polars is required when engine_backend='polars'")
@@ -2564,7 +2570,7 @@ class CSVEngine:
         if left_lower in right_lower or right_lower in left_lower:
             return 100
         try:
-            from rapidfuzz import fuzz
+            fuzz = _optional_module("rapidfuzz.fuzz")
             return fuzz.partial_ratio(left_lower, right_lower)
         except ImportError:
             from difflib import SequenceMatcher
@@ -2761,7 +2767,7 @@ class CSVEngine:
 
     def _write_xlsx_output(self, rows: list[dict], output_columns: list[str], output_file: Path):
         try:
-            from openpyxl import Workbook
+            Workbook = _optional_module("openpyxl").Workbook
         except ImportError as exc:
             self.log("XX openpyxl is required for .xlsx output", "error")
             self.stats.errors.append(f"Write error: {exc}")
@@ -2811,12 +2817,12 @@ class CSVEngine:
             if self.cancelled:
                 raise ProcessingCancelled()
             try:
-                import pyarrow as pa
-                import pyarrow.parquet as pq
+                pa = _optional_module("pyarrow")
+                pq = _optional_module("pyarrow.parquet")
                 table = pa.Table.from_pylist(records)
                 pq.write_table(table, output_file)
             except ImportError:
-                import polars as pl
+                pl = _optional_module("polars")
                 pl.DataFrame(records).write_parquet(output_file)
             self.log(f"OK Saved: {output_file.name} ({len(rows):,} rows)", "success")
         except Exception as exc:

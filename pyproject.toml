@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=70"]
+requires = ["setuptools==81.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -10,20 +10,25 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
-    "customtkinter>=5.2.2",
-    "tkinterdnd2>=0.4.3",
-    "chardet>=5.2.0",
-    "openpyxl>=3.1.5",
-    "pyarrow>=16.1.0",
-    "polars>=1.0.0",
-    "rapidfuzz>=3.9.6",
-    "duckdb>=1.5.0",
+    "customtkinter==5.2.2",
+    "tkinterdnd2==0.4.3",
+    "darkdetect==0.8.0",
+    "packaging==26.2",
+    "chardet==5.2.0",
+    "openpyxl==3.1.5",
+    "et-xmlfile==2.0.0",
+    "pyarrow==25.0.0",
+    "polars==1.43.2",
+    "polars-runtime-32==1.43.2",
+    "rapidfuzz==3.14.3",
+    "duckdb==1.5.2",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.2.0",
-    "pyinstaller>=6.9.0",
+    "pytest==9.1.1",
+    "pyinstaller==6.20.0",
+    "ruff==0.15.22",
 ]
 
 [project.scripts]
