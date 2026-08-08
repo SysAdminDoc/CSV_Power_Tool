@@ -2,6 +2,10 @@
 
 All notable changes to CSV_Power_Tool will be documented in this file.
 
+## Unreleased
+
+- Security: Hardened the opt-in loopback upload API with per-run authentication tokens, loopback Host/Origin checks, bounded request concurrency and timeouts, multipart limits, SQL exclusion, and stable JSON errors.
+
 ## [v3.2.0] - 2026-08-03
 
 - Added: JSONL/NDJSON streaming input and output.

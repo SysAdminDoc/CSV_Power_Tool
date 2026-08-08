@@ -18,6 +18,7 @@ ProcessingConfig = csv_consolidator.ProcessingConfig
 ConfigHistory = csv_consolidator.ConfigHistory
 PreviewPanel = csv_consolidator.PreviewPanel
 create_upload_server = csv_consolidator.create_upload_server
+UploadRequestHandler = csv_consolidator.UploadRequestHandler
 
 
 class CSVEngineTests(unittest.TestCase):
@@ -201,13 +202,148 @@ class CSVEngineTests(unittest.TestCase):
                 f"http://127.0.0.1:{port}/process?filename=input.csv",
                 data=b"id,name\n1,A\n",
                 method="POST",
-                headers={"Content-Type": "text/csv", "Content-Length": "12"},
+                headers={
+                    "Content-Type": "text/csv",
+                    "Content-Length": "12",
+                    "X-CSV-Power-Token": server.auth_token,
+                },
             )
             with urlopen(request, timeout=10) as response:
                 body = response.read().decode("utf-8")
                 self.assertEqual(response.status, 200)
                 self.assertEqual(response.headers["X-CSV-Power-Rows"], "1")
             self.assertEqual(body.splitlines(), ["id,name", "1,A"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_loopback_upload_rejects_missing_token(self):
+        server = create_upload_server(ProcessingConfig(dedupe_enabled=False), port=0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            request = Request(
+                f"http://127.0.0.1:{port}/process?filename=input.csv",
+                data=b"id\n1\n",
+                method="POST",
+                headers={"Content-Type": "text/csv", "Content-Length": "5"},
+            )
+            with self.assertRaises(Exception) as raised:
+                urlopen(request, timeout=10)
+            response = raised.exception
+            self.assertEqual(response.code, 401)
+            payload = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(payload["error"]["code"], "unauthorized")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_loopback_upload_rejects_non_loopback_origin(self):
+        server = create_upload_server(ProcessingConfig(dedupe_enabled=False), port=0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            request = Request(
+                f"http://127.0.0.1:{port}/process?filename=input.csv",
+                data=b"id\n1\n",
+                method="POST",
+                headers={
+                    "Content-Type": "text/csv",
+                    "Content-Length": "5",
+                    "X-CSV-Power-Token": server.auth_token,
+                    "Origin": "https://example.invalid",
+                },
+            )
+            with self.assertRaises(Exception) as raised:
+                urlopen(request, timeout=10)
+            response = raised.exception
+            self.assertEqual(response.code, 403)
+            payload = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(payload["error"]["code"], "invalid_origin")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_loopback_upload_accepts_multipart_files(self):
+        server = create_upload_server(ProcessingConfig(dedupe_enabled=False), port=0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            boundary = "csv-power-test-boundary"
+            body = (
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="file"; filename="input.csv"\r\n'
+                "Content-Type: text/csv\r\n\r\n"
+                "id,name\r\n1,A\r\n"
+                f"--{boundary}--\r\n"
+            ).encode("utf-8")
+            request = Request(
+                f"http://127.0.0.1:{server.server_address[1]}/process",
+                data=body,
+                method="POST",
+                headers={
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    "X-CSV-Power-Token": server.auth_token,
+                },
+            )
+            with urlopen(request, timeout=10) as response:
+                self.assertEqual(response.status, 200)
+                self.assertIn("1,A", response.read().decode("utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_loopback_upload_rejects_oversized_body_before_parsing(self):
+        server = create_upload_server(ProcessingConfig(dedupe_enabled=False), port=0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = Request(
+                f"http://127.0.0.1:{server.server_address[1]}/process?filename=input.csv",
+                data=b"x",
+                method="POST",
+                headers={
+                    "Content-Type": "text/csv",
+                    "Content-Length": str(UploadRequestHandler.MAX_UPLOAD_BYTES + 1),
+                    "X-CSV-Power-Token": server.auth_token,
+                },
+            )
+            with self.assertRaises(Exception) as raised:
+                urlopen(request, timeout=10)
+            self.assertEqual(raised.exception.code, 413)
+            payload = json.loads(raised.exception.read().decode("utf-8"))
+            self.assertEqual(payload["error"]["code"], "request_too_large")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_loopback_upload_enforces_active_request_limit(self):
+        server = create_upload_server(ProcessingConfig(dedupe_enabled=False), port=0)
+        server.request_slots = threading.BoundedSemaphore(0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = Request(
+                f"http://127.0.0.1:{server.server_address[1]}/process?filename=input.csv",
+                data=b"id\n1\n",
+                method="POST",
+                headers={
+                    "Content-Type": "text/csv",
+                    "X-CSV-Power-Token": server.auth_token,
+                },
+            )
+            with self.assertRaises(Exception) as raised:
+                urlopen(request, timeout=10)
+            self.assertEqual(raised.exception.code, 429)
+            payload = json.loads(raised.exception.read().decode("utf-8"))
+            self.assertEqual(payload["error"]["code"], "busy")
         finally:
             server.shutdown()
             server.server_close()

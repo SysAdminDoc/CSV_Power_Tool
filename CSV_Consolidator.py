@@ -10,6 +10,9 @@ import csv
 import re
 import json
 import copy
+import hmac
+import secrets
+import socket
 import threading
 import time
 import locale
@@ -4391,6 +4394,49 @@ class UploadRequestHandler(BaseHTTPRequestHandler):
     """Loopback upload endpoint that runs the same CSV engine as the CLI."""
 
     MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+    MAX_FILE_COUNT = 32
+    MAX_FILE_BYTES = 50 * 1024 * 1024
+    MAX_FORM_FIELD_BYTES = 64 * 1024
+    MAX_FILENAME_BYTES = 512
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(self.server.request_timeout)
+
+    @staticmethod
+    def _loopback_host(host: str | None) -> bool:
+        if not host:
+            return False
+        try:
+            parsed = urlparse(f"//{host}")
+            return parsed.hostname in {"127.0.0.1", "localhost"}
+        except ValueError:
+            return False
+
+    def _validate_origin(self):
+        host = self.headers.get("Host", "")
+        if not self._loopback_host(host):
+            raise UploadRequestError(403, "invalid_host", "Host must identify the loopback server")
+
+        origin = self.headers.get("Origin")
+        if origin:
+            parsed = urlparse(origin)
+            if parsed.scheme not in {"http", "https"} or not self._loopback_host(parsed.netloc):
+                raise UploadRequestError(403, "invalid_origin", "Origin must identify the loopback server")
+
+    def _authorize(self):
+        self._validate_origin()
+        supplied = self.headers.get("X-CSV-Power-Token", "")
+        if not supplied:
+            authorization = self.headers.get("Authorization", "")
+            if authorization.lower().startswith("bearer "):
+                supplied = authorization[7:].strip()
+        expected = self.server.auth_token
+        if not supplied or not hmac.compare_digest(supplied, expected):
+            raise UploadRequestError(401, "unauthorized", "A valid CSV Power Tool upload token is required")
+
+    def _request_error(self, error: "UploadRequestError"):
+        self._send_json(error.status, {"error": {"code": error.code, "message": str(error)}})
 
     def _send_json(self, status: int, payload: dict):
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -4401,13 +4447,20 @@ class UploadRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
     def _read_body(self) -> bytes:
+        if self.headers.get("Transfer-Encoding"):
+            raise UploadRequestError(411, "length_required", "Transfer-Encoding is not supported")
         try:
             length = int(self.headers.get("Content-Length", "-1"))
         except ValueError:
             length = -1
-        if length < 0 or length > self.MAX_UPLOAD_BYTES:
-            raise ValueError(f"Content-Length must be between 0 and {self.MAX_UPLOAD_BYTES} bytes")
-        return self.rfile.read(length)
+        if length < 0:
+            raise UploadRequestError(411, "length_required", "Content-Length is required")
+        if length > self.MAX_UPLOAD_BYTES:
+            raise UploadRequestError(413, "request_too_large", f"Request exceeds {self.MAX_UPLOAD_BYTES} bytes")
+        body = self.rfile.read(length)
+        if len(body) != length:
+            raise UploadRequestError(400, "incomplete_request", "Request body ended before Content-Length")
+        return body
 
     def _parse_files(self, body: bytes) -> list[tuple[str, bytes]]:
         content_type = self.headers.get("Content-Type", "")
@@ -4418,39 +4471,63 @@ class UploadRequestHandler(BaseHTTPRequestHandler):
             ).encode("utf-8") + body
             message = BytesParser(policy=email_default_policy).parsebytes(envelope)
             files = []
+            part_count = 0
             for part in message.iter_parts():
+                part_count += 1
                 if part.get_content_disposition() != "form-data" or not part.get_filename():
+                    payload = part.get_payload(decode=True) or b""
+                    if len(payload) > self.MAX_FORM_FIELD_BYTES:
+                        raise UploadRequestError(413, "field_too_large", "Multipart form field exceeds the size limit")
                     continue
+                if part_count > self.MAX_FILE_COUNT:
+                    raise UploadRequestError(413, "too_many_files", "Multipart file count exceeds the limit")
+                filename = str(part.get_filename())
+                if len(filename.encode("utf-8")) > self.MAX_FILENAME_BYTES:
+                    raise UploadRequestError(413, "filename_too_long", "Multipart filename exceeds the size limit")
                 payload = part.get_payload(decode=True) or b""
-                files.append((Path(part.get_filename()).name, payload))
+                if len(payload) > self.MAX_FILE_BYTES:
+                    raise UploadRequestError(413, "file_too_large", "Multipart file exceeds the size limit")
+                files.append((Path(filename).name, payload))
             return files
 
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
+        if "sql" in query or "query" in query:
+            raise UploadRequestError(400, "unsupported_operation", "SQL is not available through the upload endpoint")
         filename = query.get("filename", ["upload.csv"])[0]
+        if len(filename.encode("utf-8")) > self.MAX_FILENAME_BYTES:
+            raise UploadRequestError(413, "filename_too_long", "Upload filename exceeds the size limit")
         return [(Path(filename).name, body)]
 
     def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler API
-        if urlparse(self.path).path == "/health":
-            self._send_json(200, {"status": "ok", "service": APP_NAME, "version": APP_VERSION})
-            return
-        self._send_json(404, {"error": "Use GET /health or POST /process"})
+        try:
+            self._authorize()
+            if urlparse(self.path).path == "/health":
+                self._send_json(200, {"status": "ok", "service": APP_NAME, "version": APP_VERSION})
+                return
+            self._send_json(404, {"error": {"code": "not_found", "message": "Use GET /health or POST /process"}})
+        except UploadRequestError as exc:
+            self._request_error(exc)
 
     def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
         if urlparse(self.path).path != "/process":
-            self._send_json(404, {"error": "Use POST /process"})
+            self._send_json(404, {"error": {"code": "not_found", "message": "Use POST /process"}})
+            return
+        if not self.server.request_slots.acquire(blocking=False):
+            self._request_error(UploadRequestError(429, "busy", "The upload server is at its concurrency limit"))
             return
         try:
+            self._authorize()
             files = self._parse_files(self._read_body())
             if not files:
-                raise ValueError("No upload files were supplied")
+                raise UploadRequestError(400, "no_files", "No upload files were supplied")
             paths = []
             with tempfile.TemporaryDirectory(prefix="csv-power-upload-") as temp_dir:
                 temp_root = Path(temp_dir)
                 for index, (filename, payload) in enumerate(files):
                     suffix = Path(filename).suffix.lower()
                     if suffix not in SUPPORTED_INPUT_SUFFIXES:
-                        raise ValueError(f"Unsupported upload type: {suffix or '(none)'}")
+                        raise UploadRequestError(415, "unsupported_type", f"Unsupported upload type: {suffix or '(none)'}")
                     path = temp_root / f"upload_{index}{suffix}"
                     path.write_bytes(payload)
                     paths.append(path)
@@ -4458,9 +4535,11 @@ class UploadRequestHandler(BaseHTTPRequestHandler):
                 output_path = temp_root / "output.csv"
                 engine = CSVEngine(copy.deepcopy(self.server.csv_config))
                 stats = engine.process(paths, output_path)
-                if stats.errors and not output_path.exists():
-                    raise RuntimeError("; ".join(stats.errors))
+                if stats.errors:
+                    raise UploadRequestError(422, "processing_failed", "; ".join(stats.errors))
                 output = output_path.read_bytes() if output_path.exists() else b""
+                if len(output) > self.MAX_UPLOAD_BYTES:
+                    raise UploadRequestError(413, "response_too_large", "Processed output exceeds the response size limit")
 
             self.send_response(200)
             self.send_header("Content-Type", "text/csv; charset=utf-8")
@@ -4469,8 +4548,14 @@ class UploadRequestHandler(BaseHTTPRequestHandler):
             self.send_header("X-CSV-Power-Files", str(stats.files_processed))
             self.end_headers()
             self.wfile.write(output)
-        except (OSError, ValueError, RuntimeError) as exc:
-            self._send_json(400, {"error": str(exc)})
+        except UploadRequestError as exc:
+            self._request_error(exc)
+        except socket.timeout:
+            self._request_error(UploadRequestError(408, "request_timeout", "Upload request timed out"))
+        except (OSError, RuntimeError, ValueError) as exc:
+            self._request_error(UploadRequestError(400, "request_failed", str(exc)))
+        finally:
+            self.server.request_slots.release()
 
     def log_message(self, _format, *_args):
         return
@@ -4481,18 +4566,39 @@ class UploadHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
 
-def create_upload_server(config: ProcessingConfig, host: str = "127.0.0.1", port: int = 0):
+class UploadRequestError(ValueError):
+    def __init__(self, status: int, code: str, message: str):
+        super().__init__(message)
+        self.status = int(status)
+        self.code = code
+
+
+def create_upload_server(
+    config: ProcessingConfig,
+    host: str = "127.0.0.1",
+    port: int = 0,
+    auth_token: str | None = None,
+):
     """Create a loopback-only upload server without starting its serving thread."""
     if host not in {"127.0.0.1", "localhost"}:
         raise ValueError("The upload server only binds to localhost")
     server = UploadHTTPServer((host, int(port)), UploadRequestHandler)
     server.csv_config = copy.deepcopy(config)
+    server.auth_token = auth_token or secrets.token_urlsafe(32)
+    server.request_timeout = 30.0
+    server.request_slots = threading.BoundedSemaphore(4)
     return server
 
 
-def serve_upload_server(config: ProcessingConfig, host: str = "127.0.0.1", port: int = 0):
-    server = create_upload_server(config, host, port)
+def serve_upload_server(
+    config: ProcessingConfig,
+    host: str = "127.0.0.1",
+    port: int = 0,
+    auth_token: str | None = None,
+):
+    server = create_upload_server(config, host, port, auth_token)
     print(f"CSV Power Tool upload server: http://{host}:{server.server_address[1]}", file=sys.stderr)
+    print(f"CSV Power Tool upload token: {server.auth_token}", file=sys.stderr)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -4584,6 +4690,7 @@ def cli_main():
     parser.add_argument("--serve", action="store_true", help="Start the loopback-only upload API")
     parser.add_argument("--host", default="127.0.0.1", help="Upload API host; only localhost is accepted")
     parser.add_argument("--port", type=int, default=0, help="Upload API port; 0 selects an available port")
+    parser.add_argument("--upload-token", help="Use this upload API token; otherwise generate one per server run")
     parser.add_argument("--no-stream", action="store_true", help="Disable bounded-memory streaming path")
     parser.add_argument("--watch", action="store_true",
                         help="Watch inputs and re-run whenever matching files change")
@@ -4739,7 +4846,7 @@ def cli_main():
 
     if args.serve:
         try:
-            return serve_upload_server(config, args.host, args.port)
+            return serve_upload_server(config, args.host, args.port, args.upload_token)
         except (OSError, ValueError) as exc:
             print(f"Error starting upload server: {exc}", file=sys.stderr)
             return 3

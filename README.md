@@ -128,7 +128,7 @@ python CSV_Consolidator.py --inputs data/*.csv --sql "SELECT * FROM input_0 WHER
 python CSV_Consolidator.py --serve --port 8765
 ```
 
-SQL mode exposes each input as `input_0`, `input_1`, and so on through DuckDB. The upload API accepts raw file POSTs or browser-style multipart uploads at `POST /process` and exposes `GET /health`; it binds to localhost only and removes request files after processing.
+SQL mode exposes each input as `input_0`, `input_1`, and so on through DuckDB. The opt-in upload API accepts raw file POSTs or browser-style multipart uploads at `POST /process` and exposes `GET /health`; it binds to localhost only, requires the per-run token printed at startup in `X-CSV-Power-Token` (or `Authorization: Bearer ...`), validates loopback Host/Origin headers, limits requests to 50 MiB and four active requests, and removes request files after processing. SQL is intentionally unavailable through the upload endpoint.
 
 ### Packaging
 
