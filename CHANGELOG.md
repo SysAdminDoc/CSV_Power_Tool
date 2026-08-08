@@ -5,6 +5,7 @@ All notable changes to CSV_Power_Tool will be documented in this file.
 ## Unreleased
 
 - Security: Hardened the opt-in loopback upload API with per-run authentication tokens, loopback Host/Origin checks, bounded request concurrency and timeouts, multipart limits, SQL exclusion, and stable JSON errors.
+- Reliability: Added configurable input byte/row/column/cell/container limits, explicit malformed-row fail/warn/quarantine policies, safe rejection of partial inputs, atomic output replacement, collision backups, and hash-based run manifests.
 
 ## [v3.2.0] - 2026-08-03
 

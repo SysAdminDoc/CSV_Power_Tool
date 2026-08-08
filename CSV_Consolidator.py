@@ -10,13 +10,17 @@ import csv
 import re
 import json
 import copy
+import hashlib
 import hmac
+import os
 import secrets
+import shutil
 import socket
 import threading
 import time
 import locale
 import tempfile
+import zipfile
 from email.parser import BytesParser
 from email.policy import default as email_default_policy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -164,6 +168,19 @@ class ProcessingConfig:
     header_normalize: str = "none"  # "none", "trim", "lowercase", "snake_case"
     strip_bom: bool = True
 
+    # Input safety and malformed-row policy
+    max_input_bytes: int = 512 * 1024 * 1024
+    max_decompressed_bytes: int = 1024 * 1024 * 1024
+    max_input_rows: int = 1_000_000
+    max_input_columns: int = 16_384
+    max_cell_bytes: int = 1 * 1024 * 1024
+    max_json_nesting: int = 32
+    max_workbook_sheets: int = 100
+    max_sheet_rows: int = 1_048_576
+    max_sheet_columns: int = 16_384
+    invalid_row_policy: str = "fail"  # "fail", "warn", or "quarantine"
+    quarantine_path: str = ""
+
     # Advanced transforms (per-column)
     column_transforms: list = field(default_factory=list)  # [(column, transform_type, *args)]
     # transform_type: "trim", "upper", "lower", "title", "replace", "regex_replace",
@@ -200,6 +217,9 @@ class ProcessingConfig:
     include_header: bool = True
     line_ending: str = "auto"  # "auto", "unix", "windows"
     streaming_enabled: bool = True
+    output_collision_policy: str = "replace"  # "replace", "fail", or "backup"
+    run_manifest_enabled: bool = True
+    run_manifest_path: str = ""
 
 
 @dataclass 
@@ -213,6 +233,10 @@ class ProcessingStats:
     final_row_count: int = 0
     unique_columns: int = 0
     errors: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
+    fatal_input_errors: list = field(default_factory=list)
+    quarantined_rows: int = 0
+    cancelled: bool = False
     column_summary: dict = field(default_factory=dict)
     input_diagnostics: dict = field(default_factory=dict)
 
@@ -255,6 +279,10 @@ class ConfigHistory:
             return None
         self._index += 1
         return copy.deepcopy(self._states[self._index])
+
+
+class ProcessingCancelled(Exception):
+    """Internal signal used to discard an unfinished output temporary file."""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -612,29 +640,11 @@ class CSVEngine:
 
     def _discover_jsonl_columns(self, file_path: Path) -> list[str]:
         """Discover the union of object keys in a JSON Lines input."""
+        if not self._validate_input_file(file_path):
+            return []
         norm_mode = getattr(self.config, "header_normalize", "none")
         columns = []
         seen = set()
-        try:
-            with open(file_path, "r", encoding="utf-8-sig") as handle:
-                for line in handle:
-                    if not line.strip():
-                        continue
-                    value = json.loads(line)
-                    if not isinstance(value, dict):
-                        continue
-                    for key in value:
-                        normalized = self._normalize_header(str(key), norm_mode)
-                        if normalized and normalized not in seen:
-                            seen.add(normalized)
-                            columns.append(normalized)
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            return []
-        return columns
-
-    def _read_jsonl_file(self, file_path: Path, all_columns: set, column_order: list) -> list[dict]:
-        rows = []
-        norm_mode = getattr(self.config, "header_normalize", "none")
         try:
             with open(file_path, "r", encoding="utf-8-sig") as handle:
                 for line_number, line in enumerate(handle, 1):
@@ -642,12 +652,62 @@ class CSVEngine:
                         continue
                     try:
                         value = json.loads(line)
-                    except json.JSONDecodeError as exc:
-                        self.stats.errors.append(f"{file_path.name}:{line_number}: {exc}")
+                    except (json.JSONDecodeError, RecursionError) as exc:
+                        action = self._record_invalid_row(file_path, str(exc), line_number, line)
+                        if action == "stop":
+                            break
                         continue
                     if not isinstance(value, dict):
-                        self.stats.errors.append(f"{file_path.name}:{line_number}: expected a JSON object")
+                        action = self._record_invalid_row(
+                            file_path, "expected a JSON object", line_number, line
+                        )
+                        if action == "stop":
+                            break
                         continue
+                    if not self._check_json_value(file_path, value, line_number):
+                        break
+                    if not self._check_column_limit(file_path, len(value)):
+                        break
+                    for key in value:
+                        normalized = self._normalize_header(str(key), norm_mode)
+                        if normalized and normalized not in seen:
+                            seen.add(normalized)
+                            columns.append(normalized)
+        except (OSError, UnicodeDecodeError) as exc:
+            self._record_fatal_input(file_path, f"error reading JSONL: {exc}")
+        return columns
+
+    def _read_jsonl_file(self, file_path: Path, all_columns: set, column_order: list) -> list[dict]:
+        rows = []
+        norm_mode = getattr(self.config, "header_normalize", "none")
+        if not self._validate_input_file(file_path):
+            return rows
+        try:
+            with open(file_path, "r", encoding="utf-8-sig") as handle:
+                for line_number, line in enumerate(handle, 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        value = json.loads(line)
+                    except (json.JSONDecodeError, RecursionError) as exc:
+                        action = self._record_invalid_row(file_path, str(exc), line_number, line)
+                        if action == "stop":
+                            break
+                        continue
+                    if not isinstance(value, dict):
+                        action = self._record_invalid_row(
+                            file_path, "expected a JSON object", line_number, line
+                        )
+                        if action == "stop":
+                            break
+                        continue
+                    if not self._check_json_value(file_path, value, line_number):
+                        break
+                    if not self._check_column_limit(file_path, len(value)):
+                        break
+                    if not self._check_row_limit(file_path, len(rows) + 1, line_number):
+                        break
+
                     cleaned = {}
                     for key, raw_value in value.items():
                         normalized = self._normalize_header(str(key), norm_mode)
@@ -662,8 +722,7 @@ class CSVEngine:
                     rows.append(cleaned)
         except (OSError, UnicodeDecodeError) as exc:
             self.stats.files_skipped += 1
-            self.stats.errors.append(f"{file_path.name}: {exc}")
-            self.log(f"XX Error reading {file_path.name}: {exc}", "error")
+            self._record_fatal_input(file_path, str(exc))
             return []
 
         self.stats.files_processed += 1
@@ -676,15 +735,40 @@ class CSVEngine:
         norm_mode = getattr(self.config, 'header_normalize', 'none')
         rows = []
 
+        if not self._validate_input_file(file_path):
+            return rows
+
         if suffix == ".xlsx":
             try:
                 from openpyxl import load_workbook
 
                 workbook = load_workbook(file_path, read_only=True, data_only=True)
                 try:
+                    if len(workbook.sheetnames) > self._input_limit("max_workbook_sheets", 100):
+                        self._record_fatal_input(
+                            file_path,
+                            f"workbook has {len(workbook.sheetnames):,} sheets, exceeding the configured limit",
+                        )
+                        return []
                     sheet = workbook.active
+                    max_columns = int(sheet.max_column or 0)
+                    max_rows = int(sheet.max_row or 0)
+                    if max_columns > self._input_limit("max_sheet_columns", 16_384):
+                        self._record_fatal_input(
+                            file_path,
+                            f"active sheet has {max_columns:,} columns, exceeding the configured limit",
+                        )
+                        return []
+                    if max_rows > self._input_limit("max_sheet_rows", 1_048_576):
+                        self._record_fatal_input(
+                            file_path,
+                            f"active sheet has {max_rows:,} rows, exceeding the configured limit",
+                        )
+                        return []
                     row_iter = sheet.iter_rows(values_only=True)
                     raw_headers = next(row_iter, [])
+                    if not self._check_column_limit(file_path, len(raw_headers)):
+                        return []
                     headers = [
                         self._normalize_header(self._cell_to_text(header), norm_mode)
                         for header in raw_headers
@@ -695,38 +779,58 @@ class CSVEngine:
                             all_columns.add(col)
                             column_order.append(col)
 
-                    for values in row_iter:
+                    for row_number, values in enumerate(row_iter, 2):
+                        if not self._check_row_limit(file_path, len(rows) + 1, row_number):
+                            break
                         cleaned_row = {}
+                        valid_row = True
                         for idx, header in enumerate(headers):
                             if not header:
                                 continue
                             value = values[idx] if idx < len(values) else ""
+                            if not self._check_cell_limit(file_path, value, header, row_number):
+                                valid_row = False
+                                break
                             cleaned_row[header] = self._cell_to_text(value).strip() if self.config.trim_whitespace else self._cell_to_text(value)
-                        rows.append(cleaned_row)
+                        if valid_row:
+                            rows.append(cleaned_row)
                 finally:
                     workbook.close()
             except Exception as exc:
                 self.log(f"XX Error reading {file_path.name}: {exc}", "error")
                 self.stats.files_skipped += 1
-                self.stats.errors.append(f"{file_path.name}: {exc}")
+                self._record_fatal_input(file_path, str(exc))
                 return []
 
         elif suffix == ".parquet":
             try:
                 try:
                     import pyarrow.parquet as pq
+                    parquet_file = pq.ParquetFile(file_path)
+                    metadata = parquet_file.metadata
+                    if not self._check_column_limit(file_path, metadata.num_columns):
+                        return []
+                    if not self._check_row_limit(file_path, metadata.num_rows):
+                        return []
                     table = pq.read_table(file_path)
                     records = table.to_pylist()
                 except ImportError:
                     import polars as pl
-                    records = pl.read_parquet(file_path).to_dicts()
+                    frame = pl.read_parquet(file_path)
+                    if not self._check_column_limit(file_path, len(frame.columns)):
+                        return []
+                    if not self._check_row_limit(file_path, frame.height):
+                        return []
+                    records = frame.to_dicts()
 
-                for record in records:
+                for row_number, record in enumerate(records, 1):
                     cleaned_row = {}
                     for key, value in record.items():
                         header = self._normalize_header(str(key), norm_mode)
                         if not header:
                             continue
+                        if not self._check_cell_limit(file_path, value, header, row_number):
+                            return []
                         if header not in all_columns:
                             all_columns.add(header)
                             column_order.append(header)
@@ -735,7 +839,7 @@ class CSVEngine:
             except Exception as exc:
                 self.log(f"XX Error reading {file_path.name}: {exc}", "error")
                 self.stats.files_skipped += 1
-                self.stats.errors.append(f"{file_path.name}: {exc}")
+                self._record_fatal_input(file_path, str(exc))
                 return []
 
         self.stats.files_processed += 1
@@ -756,11 +860,326 @@ class CSVEngine:
         self._summary_non_empty = Counter()
         self._summary_rows = Counter()
         self._summary_types = defaultdict(Counter)
-        self._input_diagnostics = {}
-        self._summary_distinct = defaultdict(set)
-        self._summary_non_empty = Counter()
-        self._summary_rows = Counter()
-        self._summary_types = defaultdict(Counter)
+        self._validated_inputs = {}
+        self._reported_input_issues = {}
+        self._quarantine_records = []
+        self._manifest_input_files = []
+
+    INPUT_POLICIES = {"fail", "warn", "quarantine"}
+    MAX_QUARANTINE_RECORDS = 10_000
+
+    def _input_limit(self, name: str, default: int) -> int:
+        try:
+            return max(1, int(getattr(self.config, name, default)))
+        except (TypeError, ValueError):
+            return default
+
+    def _invalid_row_policy(self) -> str:
+        policy = str(getattr(self.config, "invalid_row_policy", "fail")).lower().strip()
+        return policy if policy in self.INPUT_POLICIES else "fail"
+
+    @staticmethod
+    def _issue_message(file_path: Path, reason: str, line_number: int | None = None) -> str:
+        location = f"{file_path.name}:{line_number}" if line_number else file_path.name
+        return f"{location}: {reason}"
+
+    def _record_fatal_input(self, file_path: Path, reason: str, line_number: int | None = None) -> None:
+        message = self._issue_message(file_path, reason, line_number)
+        key = (str(file_path), line_number, reason, "fatal")
+        if key in self._reported_input_issues:
+            return
+        self._reported_input_issues[key] = "stop"
+        self.stats.errors.append(message)
+        self.stats.fatal_input_errors.append(message)
+        self.log(f"XX {message}", "error")
+
+    def _record_invalid_row(
+        self,
+        file_path: Path,
+        reason: str,
+        line_number: int | None = None,
+        raw: str | None = None,
+    ) -> str:
+        """Record a malformed row and return keep, skip, or stop."""
+        policy = self._invalid_row_policy()
+        key = (str(file_path), line_number, reason, policy)
+        if key in self._reported_input_issues:
+            return self._reported_input_issues[key]
+
+        if policy == "fail":
+            self._record_fatal_input(file_path, reason, line_number)
+            action = "stop"
+        else:
+            message = self._issue_message(file_path, reason, line_number)
+            self.stats.warnings.append(message)
+            self.log(f"!! {message}", "warning")
+            if policy == "quarantine":
+                self.stats.quarantined_rows += 1
+                if len(self._quarantine_records) < self.MAX_QUARANTINE_RECORDS:
+                    self._quarantine_records.append({
+                        "file": str(file_path),
+                        "line": line_number,
+                        "reason": reason,
+                        "raw": (raw or "")[:4096],
+                    })
+                action = "skip"
+            else:
+                action = "keep"
+        self._reported_input_issues[key] = action
+        return action
+
+    def _validate_input_file(self, file_path: Path) -> bool:
+        key = str(file_path.resolve())
+        if key in self._validated_inputs:
+            return self._validated_inputs[key]
+
+        try:
+            size = file_path.stat().st_size
+        except OSError as exc:
+            self._record_fatal_input(file_path, f"cannot stat input: {exc}")
+            self._validated_inputs[key] = False
+            return False
+
+        if size > self._input_limit("max_input_bytes", 512 * 1024 * 1024):
+            self._record_fatal_input(
+                file_path,
+                f"input size {size:,} bytes exceeds the configured limit",
+            )
+            self._validated_inputs[key] = False
+            return False
+
+        if file_path.suffix.lower() == ".xlsx":
+            try:
+                with zipfile.ZipFile(file_path) as archive:
+                    expanded = sum(max(0, info.file_size) for info in archive.infolist())
+                    if expanded > self._input_limit(
+                        "max_decompressed_bytes", 1024 * 1024 * 1024
+                    ):
+                        self._record_fatal_input(
+                            file_path,
+                            f"decompressed workbook size {expanded:,} bytes exceeds the configured limit",
+                        )
+                        self._validated_inputs[key] = False
+                        return False
+            except (OSError, zipfile.BadZipFile) as exc:
+                self._record_fatal_input(file_path, f"invalid workbook container: {exc}")
+                self._validated_inputs[key] = False
+                return False
+
+        self._validated_inputs[key] = True
+        return True
+
+    def _check_column_limit(self, file_path: Path, count: int) -> bool:
+        limit = self._input_limit("max_input_columns", 16_384)
+        if count > limit:
+            self._record_fatal_input(file_path, f"column count {count:,} exceeds the limit of {limit:,}")
+            return False
+        return True
+
+    def _check_row_limit(self, file_path: Path, count: int, line_number: int | None = None) -> bool:
+        limit = self._input_limit("max_input_rows", 1_000_000)
+        if count > limit:
+            self._record_fatal_input(
+                file_path,
+                f"row count exceeds the limit of {limit:,}",
+                line_number,
+            )
+            return False
+        return True
+
+    def _check_cell_limit(
+        self,
+        file_path: Path,
+        value,
+        column: str | None = None,
+        line_number: int | None = None,
+    ) -> bool:
+        text = self._cell_to_text(value)
+        size = len(text.encode("utf-8"))
+        limit = self._input_limit("max_cell_bytes", 1 * 1024 * 1024)
+        if size > limit:
+            label = f"cell {column!r} is" if column else "cell is"
+            self._record_fatal_input(
+                file_path,
+                f"{label} {size:,} bytes, exceeding the limit of {limit:,}",
+                line_number,
+            )
+            return False
+        return True
+
+    def _json_depth(self, value) -> int:
+        maximum = 0
+        pending = [(value, 0)]
+        while pending:
+            current, depth = pending.pop()
+            maximum = max(maximum, depth)
+            if isinstance(current, dict):
+                pending.extend((item, depth + 1) for item in current.values())
+            elif isinstance(current, list):
+                pending.extend((item, depth + 1) for item in current)
+        return maximum
+
+    def _check_json_value(self, file_path: Path, value, line_number: int) -> bool:
+        depth_limit = self._input_limit("max_json_nesting", 32)
+        if self._json_depth(value) > depth_limit:
+            self._record_fatal_input(
+                file_path,
+                f"JSON nesting exceeds the limit of {depth_limit}",
+                line_number,
+            )
+            return False
+        if isinstance(value, dict):
+            values = value.values()
+        elif isinstance(value, list):
+            values = value
+        else:
+            values = [value]
+        return all(self._check_cell_limit(file_path, item, line_number=line_number) for item in values)
+
+    def _write_quarantine(self) -> None:
+        quarantine_path = str(getattr(self.config, "quarantine_path", "") or "").strip()
+        if not quarantine_path or not self._quarantine_records:
+            return
+        try:
+            path = Path(quarantine_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8", newline="\n") as handle:
+                for record in self._quarantine_records:
+                    json.dump(record, handle, ensure_ascii=False)
+                    handle.write("\n")
+        except OSError as exc:
+            message = f"Quarantine write error: {exc}"
+            self.stats.errors.append(message)
+            self.log(f"XX {message}", "error")
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def _output_policy(self) -> str:
+        policy = str(getattr(self.config, "output_collision_policy", "replace")).lower().strip()
+        return policy if policy in {"replace", "fail", "backup"} else "replace"
+
+    @staticmethod
+    def _temporary_output_path(output_file: Path) -> Path:
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        suffix = output_file.suffix or ".tmp"
+        handle = tempfile.NamedTemporaryFile(
+            prefix=f".{output_file.name}.",
+            suffix=suffix,
+            dir=output_file.parent,
+            delete=False,
+        )
+        path = Path(handle.name)
+        handle.close()
+        return path
+
+    @staticmethod
+    def _fsync_file(path: Path) -> None:
+        with path.open("rb+") as handle:
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def _backup_path(self, output_file: Path) -> Path:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        candidate = output_file.with_name(f"{output_file.name}.{stamp}.bak")
+        suffix = 1
+        while candidate.exists():
+            candidate = output_file.with_name(f"{output_file.name}.{stamp}.{suffix}.bak")
+            suffix += 1
+        return candidate
+
+    def _commit_output(self, temporary: Path, output_file: Path) -> Path | None:
+        policy = self._output_policy()
+        if output_file.exists() and policy == "fail":
+            raise RuntimeError(f"Output already exists: {output_file}")
+
+        backup = None
+        if output_file.exists() and policy == "backup":
+            backup = self._backup_path(output_file)
+            shutil.copy2(output_file, backup)
+
+        os.replace(temporary, output_file)
+        return backup
+
+    def _manifest_path(self, output_file: Path) -> Path | None:
+        if not getattr(self.config, "run_manifest_enabled", True):
+            return None
+        configured = str(getattr(self.config, "run_manifest_path", "") or "").strip()
+        path = Path(configured) if configured else Path(f"{output_file}.manifest.json")
+        if path.resolve() == output_file.resolve():
+            raise RuntimeError("Run manifest path must differ from output path")
+        return path
+
+    def _write_run_manifest(
+        self,
+        output_file: Path,
+        output_columns: list[str],
+        backup_path: Path | None = None,
+    ) -> None:
+        manifest_path = self._manifest_path(output_file)
+        if manifest_path is None:
+            return
+
+        config_data = asdict(self.config)
+        config_json = json.dumps(config_data, sort_keys=True, ensure_ascii=False, default=str)
+        inputs = []
+        for input_path in self._manifest_input_files:
+            try:
+                stat = input_path.stat()
+                inputs.append({
+                    "path": str(input_path),
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "sha256": self._sha256_file(input_path),
+                })
+            except OSError as exc:
+                inputs.append({"path": str(input_path), "error": str(exc)})
+
+        manifest = {
+            "version": 1,
+            "tool": APP_NAME,
+            "tool_version": APP_VERSION,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "config_sha256": hashlib.sha256(config_json.encode("utf-8")).hexdigest(),
+            "inputs": inputs,
+            "output": {
+                "path": str(output_file),
+                "size": output_file.stat().st_size,
+                "sha256": self._sha256_file(output_file),
+                "backup": str(backup_path) if backup_path else None,
+            },
+            "schema": {"columns": output_columns, "column_count": len(output_columns)},
+            "stats": {
+                "files_processed": self.stats.files_processed,
+                "files_skipped": self.stats.files_skipped,
+                "rows_read": self.stats.total_rows_read,
+                "rows_filtered": self.stats.rows_filtered,
+                "duplicates_removed": self.stats.duplicates_removed,
+                "rows_written": self.stats.final_row_count,
+                "warnings": self.stats.warnings,
+                "errors": self.stats.errors,
+                "quarantined_rows": self.stats.quarantined_rows,
+            },
+        }
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._temporary_output_path(manifest_path)
+        try:
+            with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                json.dump(manifest, handle, indent=2, ensure_ascii=False)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, manifest_path)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
     
     def log(self, message: str, level: str = "info"):
         if self.log_callback:
@@ -792,6 +1211,8 @@ class CSVEngine:
         return rows
 
     def _record_input_diagnostic(self, file_path: Path):
+        if not self._validate_input_file(file_path):
+            return
         if file_path.suffix.lower() in SUPPORTED_TEXT_SUFFIXES:
             details = self._detect_file_details(file_path)
         else:
@@ -862,12 +1283,16 @@ class CSVEngine:
 
         for file_path in files:
             try:
+                if not self._validate_input_file(file_path):
+                    continue
                 self._record_input_diagnostic(file_path)
                 if file_path.suffix.lower() in SUPPORTED_TEXT_SUFFIXES:
                     encoding, delimiter, quotechar = self._detect_file_params(file_path)
                     with open(file_path, 'r', encoding=encoding, newline='') as f:
                         reader = csv.reader(f, delimiter=delimiter, quotechar=quotechar)
                         headers = next(reader, [])
+                        if not self._check_column_limit(file_path, len(headers)):
+                            continue
                         file_cols = []
                         for col in headers:
                             col = self._normalize_header(col, norm_mode)
@@ -905,6 +1330,7 @@ class CSVEngine:
                                 file_cols.append(col)
                         per_file_columns.append(set(file_cols))
                 except Exception:
+                    self._record_fatal_input(file_path, "unable to discover input columns")
                     pass
 
         # Apply schema unification mode
@@ -1167,6 +1593,11 @@ class CSVEngine:
         """Process CSV files according to configuration."""
         self.cancelled = False
         self.stats = ProcessingStats()
+        self._validated_inputs = {}
+        self._reported_input_issues = {}
+        self._quarantine_records = []
+        self._input_diagnostics = {}
+        self._manifest_input_files = [Path(path) for path in input_files]
 
         if self._can_stream(input_files, output_file):
             return self._process_streaming(input_files, output_file)
@@ -1184,6 +1615,7 @@ class CSVEngine:
         for idx, csv_path in enumerate(input_files):
             if self.cancelled:
                 self.log("Processing cancelled", "warning")
+                self.stats.cancelled = True
                 return self.stats
 
             progress = (idx / total_files) * 40
@@ -1197,6 +1629,11 @@ class CSVEngine:
                 file_cols = set(rows_from_file[0].keys())
             per_file_columns.append(file_cols)
             all_rows.extend(rows_from_file)
+
+        self._write_quarantine()
+        if self.stats.fatal_input_errors:
+            self.log("Input validation failed; no output was written", "error")
+            return self.stats
 
         if not all_rows:
             self.log("No data to process", "warning")
@@ -1258,12 +1695,14 @@ class CSVEngine:
         self._compute_column_summary(all_rows, output_columns)
         
         # Phase 6: Write output
+        self.stats.final_row_count = len(all_rows)
         if not self.cancelled:
             self.update_progress(90, "Writing output file...")
             self.log("Phase 6: Writing output...", "info")
             self._write_output(all_rows, final_columns, output_file)
-        
-        self.stats.final_row_count = len(all_rows)
+        else:
+            self.stats.cancelled = True
+
         self.update_progress(100, "Complete!")
         
         return self.stats
@@ -1279,13 +1718,17 @@ class CSVEngine:
             return False
         if output_file.suffix.lower() not in SUPPORTED_STREAM_SUFFIXES:
             return False
+        try:
+            output_resolved = output_file.resolve()
+            if any(path.resolve() == output_resolved for path in input_files):
+                return False
+        except OSError:
+            return False
         return all(path.suffix.lower() in SUPPORTED_STREAM_SUFFIXES for path in input_files)
 
     def _iter_jsonl_rows(self, file_path: Path):
-        if not file_path.exists():
-            self.log(f"XX File not found: {file_path.name}", "error")
+        if not self._validate_input_file(file_path):
             self.stats.files_skipped += 1
-            self.stats.errors.append(f"Not found: {file_path.name}")
             return
 
         norm_mode = getattr(self.config, "header_normalize", "none")
@@ -1297,12 +1740,24 @@ class CSVEngine:
                         continue
                     try:
                         value = json.loads(line)
-                    except json.JSONDecodeError as exc:
-                        self.stats.errors.append(f"{file_path.name}:{line_number}: {exc}")
+                    except (json.JSONDecodeError, RecursionError) as exc:
+                        action = self._record_invalid_row(file_path, str(exc), line_number, line)
+                        if action == "stop":
+                            break
                         continue
                     if not isinstance(value, dict):
-                        self.stats.errors.append(f"{file_path.name}:{line_number}: expected a JSON object")
+                        action = self._record_invalid_row(
+                            file_path, "expected a JSON object", line_number, line
+                        )
+                        if action == "stop":
+                            break
                         continue
+                    if not self._check_json_value(file_path, value, line_number):
+                        break
+                    if not self._check_column_limit(file_path, len(value)):
+                        break
+                    if not self._check_row_limit(file_path, row_count + 1, line_number):
+                        break
                     row = {}
                     for key, raw_value in value.items():
                         normalized_key = self._normalize_header(str(key), norm_mode)
@@ -1315,8 +1770,7 @@ class CSVEngine:
                     yield row
         except (OSError, UnicodeDecodeError) as exc:
             self.stats.files_skipped += 1
-            self.stats.errors.append(f"{file_path.name}: {exc}")
-            self.log(f"XX Error reading {file_path.name}: {exc}", "error")
+            self._record_fatal_input(file_path, str(exc))
             return
 
         self.stats.files_processed += 1
@@ -1324,10 +1778,8 @@ class CSVEngine:
         self.log(f"OK {file_path.name} ({row_count:,} JSON rows)", "success")
 
     def _iter_text_rows(self, file_path: Path):
-        if not file_path.exists():
-            self.log(f"XX File not found: {file_path.name}", "error")
+        if not self._validate_input_file(file_path):
             self.stats.files_skipped += 1
-            self.stats.errors.append(f"Not found: {file_path.name}")
             return
 
         norm_mode = getattr(self.config, 'header_normalize', 'none')
@@ -1341,14 +1793,38 @@ class CSVEngine:
             try:
                 with open(file_path, 'r', encoding=encoding, newline='') as f:
                     reader = csv.DictReader(f, delimiter=detected_delim, quotechar=detected_quote)
+                    if reader.fieldnames and not self._check_column_limit(file_path, len(reader.fieldnames)):
+                        return
                     row_count = 0
                     for row in reader:
+                        line_number = reader.line_num
+                        if not self._check_row_limit(file_path, row_count + 1, line_number):
+                            break
+                        if None in row or any(value is None for key, value in row.items() if key is not None):
+                            action = self._record_invalid_row(
+                                file_path,
+                                "ragged row has missing or extra fields",
+                                line_number,
+                                repr(row),
+                            )
+                            if action == "stop":
+                                break
+                            if action == "skip":
+                                continue
                         cleaned_row = {}
+                        valid_row = True
                         for key, value in row.items():
+                            if key is None:
+                                continue
                             normalized_key = self._normalize_header(key, norm_mode) if key else ""
                             if normalized_key:
                                 text_value = value or ""
+                                if not self._check_cell_limit(file_path, text_value, normalized_key, line_number):
+                                    valid_row = False
+                                    break
                                 cleaned_row[normalized_key] = text_value.strip() if self.config.trim_whitespace else text_value
+                        if not valid_row:
+                            break
                         if self.config.source_column:
                             cleaned_row[self.config.source_column] = self._source_for_file(file_path)
                         row_count += 1
@@ -1363,12 +1839,20 @@ class CSVEngine:
                 if encoding == encodings_to_try[-1]:
                     self.log(f"XX Error reading {file_path.name}: {exc}", "error")
                     self.stats.files_skipped += 1
-                    self.stats.errors.append(f"{file_path.name}: {exc}")
+                    self._record_fatal_input(file_path, str(exc))
+                    return
                 continue
+
+        self.stats.files_skipped += 1
+        self._record_fatal_input(file_path, "unable to decode input with supported encodings")
 
     def _process_streaming(self, input_files: list[Path], output_file: Path) -> ProcessingStats:
         self.log("Phase 1: Streaming rows...", "info")
         discovered_order = self.discover_columns(input_files)
+        if self.stats.fatal_input_errors:
+            self._write_quarantine()
+            self.log("Input validation failed; no output was written", "error")
+            return self.stats
         final_columns = self._with_transform_columns(self._get_final_columns(discovered_order))
         output_columns = [self.config.column_mapping.get(c, c) for c in final_columns]
         self.stats.unique_columns = len(discovered_order)
@@ -1383,56 +1867,82 @@ class CSVEngine:
         quoting = quoting_map.get(self.config.output_quoting, csv.QUOTE_MINIMAL)
         newline = "\n" if self.config.line_ending == "unix" else "\r\n" if self.config.line_ending == "windows" else ""
 
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_file, 'w', encoding=self.config.output_encoding, newline=newline if newline else '') as f:
-            writer = None
-            if not is_jsonl:
-                writer = csv.DictWriter(
-                    f,
-                    fieldnames=output_columns,
-                    delimiter=self.config.output_delimiter,
-                    quoting=quoting,
-                    extrasaction='ignore'
-                )
-                if self.config.include_header:
-                    writer.writeheader()
+        temporary = None
+        try:
+            temporary = self._temporary_output_path(output_file)
+            with open(temporary, 'w', encoding=self.config.output_encoding, newline=newline if newline else '') as handle:
+                writer = None
+                if not is_jsonl:
+                    writer = csv.DictWriter(
+                        handle,
+                        fieldnames=output_columns,
+                        delimiter=self.config.output_delimiter,
+                        quoting=quoting,
+                        extrasaction='ignore',
+                    )
+                    if self.config.include_header:
+                        writer.writeheader()
 
-            total_files = len(input_files)
-            for idx, csv_path in enumerate(input_files):
-                if self.cancelled:
-                    self.log("Processing cancelled", "warning")
-                    return self.stats
+                total_files = len(input_files)
+                for idx, csv_path in enumerate(input_files):
+                    if self.cancelled:
+                        raise ProcessingCancelled()
 
-                progress = (idx / total_files) * 90
-                self.update_progress(progress, f"Streaming {csv_path.name}...")
+                    progress = (idx / total_files) * 90
+                    self.update_progress(progress, f"Streaming {csv_path.name}...")
 
-                iterator = (
-                    self._iter_jsonl_rows(csv_path)
-                    if csv_path.suffix.lower() in SUPPORTED_JSONL_SUFFIXES
-                    else self._iter_text_rows(csv_path)
-                )
-                for row in iterator:
-                    if self.config.filters and not self._row_matches_filters(row):
-                        self.stats.rows_filtered += 1
-                        continue
+                    iterator = (
+                        self._iter_jsonl_rows(csv_path)
+                        if csv_path.suffix.lower() in SUPPORTED_JSONL_SUFFIXES
+                        else self._iter_text_rows(csv_path)
+                    )
+                    for row in iterator:
+                        if self.cancelled:
+                            raise ProcessingCancelled()
+                        if self.config.filters and not self._row_matches_filters(row):
+                            self.stats.rows_filtered += 1
+                            continue
 
-                    transformed = self._apply_transformations([row], final_columns)[0]
-                    transformed = self._redact_row(transformed)
-                    if is_jsonl:
-                        json.dump(
-                            {column: transformed.get(column, "") for column in output_columns},
-                            f,
-                            ensure_ascii=False,
-                        )
-                        f.write("\n")
-                    else:
-                        writer.writerow(transformed)
-                    self._record_summary(transformed, output_columns)
-                    self.stats.final_row_count += 1
+                        transformed = self._apply_transformations([row], final_columns)[0]
+                        transformed = self._redact_row(transformed)
+                        if is_jsonl:
+                            json.dump(
+                                {column: transformed.get(column, "") for column in output_columns},
+                                handle,
+                                ensure_ascii=False,
+                            )
+                            handle.write("\n")
+                        else:
+                            writer.writerow(transformed)
+                        self._record_summary(transformed, output_columns)
+                        self.stats.final_row_count += 1
 
-        self._finalize_summary(output_columns)
-        self.update_progress(100, "Complete!")
-        self.log(f"OK Saved: {output_file.name} ({self.stats.final_row_count:,} rows)", "success")
+                self._write_quarantine()
+                if self.stats.fatal_input_errors or self.stats.errors:
+                    raise RuntimeError("input validation failed; output was not replaced")
+                handle.flush()
+                os.fsync(handle.fileno())
+
+            self._fsync_file(temporary)
+            backup_path = self._commit_output(temporary, output_file)
+            temporary = None
+            self._finalize_summary(output_columns)
+            self._write_run_manifest(output_file, output_columns, backup_path)
+            self.update_progress(100, "Complete!")
+            self.log(f"OK Saved: {output_file.name} ({self.stats.final_row_count:,} rows)", "success")
+        except ProcessingCancelled:
+            self.stats.cancelled = True
+            self.log("Processing cancelled; output was not replaced", "warning")
+        except Exception as exc:
+            message = f"Write error: {exc}"
+            self.stats.errors.append(message)
+            self.log(f"XX {message}", "error")
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
         return self.stats
 
     def preview(self, input_files: list[Path], limit: int = 100) -> dict:
@@ -1499,7 +2009,7 @@ class CSVEngine:
                 infer_schema=False,
                 try_parse_dates=False,
                 null_values=[],
-                encoding="utf8-lossy",
+                encoding="utf8",
             )
         except Exception:
             if getattr(self.config, "engine_backend", "auto") == "polars":
@@ -1512,11 +2022,17 @@ class CSVEngine:
             if normalized and normalized not in all_columns:
                 all_columns.add(normalized)
                 column_order.append(normalized)
-        for record in frame.iter_rows(named=True):
+        if not self._check_column_limit(file_path, len(frame.columns)):
+            return []
+        if not self._check_row_limit(file_path, frame.height):
+            return []
+        for row_number, record in enumerate(frame.iter_rows(named=True), 1):
             cleaned = {}
             for raw_column, value in record.items():
                 normalized = self._normalize_header(raw_column, norm_mode)
                 if normalized:
+                    if not self._check_cell_limit(file_path, value, normalized, row_number):
+                        return []
                     text_value = self._cell_to_text(value)
                     cleaned[normalized] = text_value.strip() if self.config.trim_whitespace else text_value
             rows.append(cleaned)
@@ -1533,10 +2049,8 @@ class CSVEngine:
         """Read a single CSV file."""
         rows = []
 
-        if not file_path.exists():
-            self.log(f"✗ File not found: {file_path.name}", "error")
+        if not self._validate_input_file(file_path):
             self.stats.files_skipped += 1
-            self.stats.errors.append(f"Not found: {file_path.name}")
             return rows
 
         self._record_input_diagnostic(file_path)
@@ -1570,7 +2084,11 @@ class CSVEngine:
                                             quotechar=detected_quote)
 
                     if reader.fieldnames:
+                        if not self._check_column_limit(file_path, len(reader.fieldnames)):
+                            return rows
                         for col in reader.fieldnames:
+                            if not self._check_cell_limit(file_path, col, line_number=1):
+                                return rows
                             col = self._normalize_header(col, norm_mode)
                             if col and col not in all_columns:
                                 all_columns.add(col)
@@ -1578,11 +2096,33 @@ class CSVEngine:
 
                     row_count = 0
                     for row in reader:
+                        line_number = reader.line_num
+                        if not self._check_row_limit(file_path, row_count + 1, line_number):
+                            break
+                        if None in row or any(value is None for key, value in row.items() if key is not None):
+                            action = self._record_invalid_row(
+                                file_path,
+                                "ragged row has missing or extra fields",
+                                line_number,
+                                repr(row),
+                            )
+                            if action == "stop":
+                                break
+                            if action == "skip":
+                                continue
                         cleaned_row = {}
+                        valid_row = True
                         for k, v in row.items():
+                            if k is None:
+                                continue
                             key = self._normalize_header(k, norm_mode) if k else ""
                             if key:
+                                if not self._check_cell_limit(file_path, v or "", key, line_number):
+                                    valid_row = False
+                                    break
                                 cleaned_row[key] = v.strip() if v and self.config.trim_whitespace else (v or "")
+                        if not valid_row:
+                            break
                         rows.append(cleaned_row)
                         row_count += 1
 
@@ -1597,9 +2137,12 @@ class CSVEngine:
                 if encoding == encodings_to_try[-1]:
                     self.log(f"✗ Error reading {file_path.name}: {e}", "error")
                     self.stats.files_skipped += 1
-                    self.stats.errors.append(f"{file_path.name}: {e}")
+                    self._record_fatal_input(file_path, str(e))
+                    return rows
                 continue
 
+        self.stats.files_skipped += 1
+        self._record_fatal_input(file_path, "unable to decode input with supported encodings")
         return rows
     
     def _get_final_columns(self, discovered_order: list) -> list[str]:
@@ -2134,14 +2677,42 @@ class CSVEngine:
         return sorted_rows
     
     def _write_output(self, rows: list[dict], columns: list[str], output_file: Path):
-        """Write processed data to output file."""
+        """Write processed data atomically and emit its audit manifest."""
         if not rows:
             self.log("No data to write", "warning")
             return
-        
-        # Map columns to output names
-        output_columns = [self.config.column_mapping.get(c, c) for c in columns]
 
+        output_columns = [self.config.column_mapping.get(c, c) for c in columns]
+        temporary = None
+        error_count = len(self.stats.errors)
+        try:
+            temporary = self._temporary_output_path(output_file)
+            self._write_output_payload(rows, output_columns, temporary)
+            if self.cancelled:
+                raise ProcessingCancelled()
+            if len(self.stats.errors) > error_count:
+                raise RuntimeError("output writer reported an error")
+            self._fsync_file(temporary)
+            backup_path = self._commit_output(temporary, output_file)
+            temporary = None
+            self._write_run_manifest(output_file, output_columns, backup_path)
+            self.log(f"OK Saved: {output_file.name} ({len(rows):,} rows)", "success")
+        except ProcessingCancelled:
+            self.stats.cancelled = True
+            self.log("Processing cancelled; output was not replaced", "warning")
+        except Exception as exc:
+            message = f"Write error: {exc}"
+            if len(self.stats.errors) == error_count:
+                self.stats.errors.append(message)
+            self.log(f"XX {message}", "error")
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+
+    def _write_output_payload(self, rows: list[dict], output_columns: list[str], output_file: Path):
         suffix = output_file.suffix.lower()
         if suffix in SUPPORTED_JSONL_SUFFIXES:
             self._write_jsonl_output(rows, output_columns, output_file)
@@ -2152,7 +2723,7 @@ class CSVEngine:
         if suffix == ".parquet":
             self._write_parquet_output(rows, output_columns, output_file)
             return
-        
+
         quoting_map = {
             "minimal": csv.QUOTE_MINIMAL,
             "all": csv.QUOTE_ALL,
@@ -2169,30 +2740,24 @@ class CSVEngine:
         else:
             newline = ""
         
-        try:
-            output_file.parent.mkdir(parents=True, exist_ok=True)
-            
-            with open(output_file, 'w', encoding=self.config.output_encoding, 
-                      newline=newline if newline else '') as f:
-                writer = csv.DictWriter(
-                    f,
-                    fieldnames=output_columns,
-                    delimiter=self.config.output_delimiter,
-                    quoting=quoting,
-                    extrasaction='ignore'
-                )
-                
-                if self.config.include_header:
-                    writer.writeheader()
-                
-                for row in rows:
-                    writer.writerow(row)
-            
-            self.log(f"✓ Saved: {output_file.name} ({len(rows):,} rows)", "success")
-            
-        except Exception as e:
-            self.log(f"✗ Error writing file: {e}", "error")
-            self.stats.errors.append(f"Write error: {e}")
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_file, 'w', encoding=self.config.output_encoding,
+                  newline=newline if newline else '') as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=output_columns,
+                delimiter=self.config.output_delimiter,
+                quoting=quoting,
+                extrasaction='ignore',
+            )
+
+            if self.config.include_header:
+                writer.writeheader()
+
+            for row in rows:
+                if self.cancelled:
+                    raise ProcessingCancelled()
+                writer.writerow(row)
 
     def _write_xlsx_output(self, rows: list[dict], output_columns: list[str], output_file: Path):
         try:
@@ -2209,6 +2774,8 @@ class CSVEngine:
             if self.config.include_header:
                 sheet.append(output_columns)
             for row in rows:
+                if self.cancelled:
+                    raise ProcessingCancelled()
                 sheet.append([row.get(column, "") for column in output_columns])
             workbook.save(output_file)
             self.log(f"OK Saved: {output_file.name} ({len(rows):,} rows)", "success")
@@ -2221,6 +2788,8 @@ class CSVEngine:
             output_file.parent.mkdir(parents=True, exist_ok=True)
             with open(output_file, "w", encoding=self.config.output_encoding, newline="") as handle:
                 for row in rows:
+                    if self.cancelled:
+                        raise ProcessingCancelled()
                     json.dump(
                         {column: row.get(column, "") for column in output_columns},
                         handle,
@@ -2239,6 +2808,8 @@ class CSVEngine:
                 {column: row.get(column, "") for column in output_columns}
                 for row in rows
             ]
+            if self.cancelled:
+                raise ProcessingCancelled()
             try:
                 import pyarrow as pa
                 import pyarrow.parquet as pq
@@ -4643,6 +5214,11 @@ def cli_main():
     parser.add_argument("--delimiter", "-d", default=None, help="Output delimiter")
     parser.add_argument("--encoding", "-e", default=None, help="Output encoding")
     parser.add_argument("--no-header", action="store_true", help="Exclude header row")
+    parser.add_argument("--collision-policy", choices=["replace", "fail", "backup"],
+                        default="replace", help="Existing output handling policy")
+    parser.add_argument("--manifest", dest="run_manifest_path",
+                        help="Write the audit manifest to this path instead of output.manifest.json")
+    parser.add_argument("--no-manifest", action="store_true", help="Disable the audit manifest")
     parser.add_argument("--no-dedupe", action="store_true", help="Disable deduplication")
     parser.add_argument("--fuzzy-dedupe-threshold", type=int, metavar="50-100",
                         help="Enable fuzzy dedupe at the supplied similarity threshold")
@@ -4659,6 +5235,17 @@ def cli_main():
     parser.add_argument("--exclude-columns", nargs="+", help="Exclude these columns")
     parser.add_argument("--header-normalize", choices=["none", "trim", "lowercase", "snake_case"],
                         default="none", help="Header normalization mode")
+    parser.add_argument("--invalid-row-policy", choices=["fail", "warn", "quarantine"],
+                        default="fail", help="Malformed CSV/JSONL row handling policy")
+    parser.add_argument("--quarantine", dest="quarantine_path",
+                        help="Write quarantined malformed rows as JSON Lines")
+    parser.add_argument("--max-input-bytes", type=int, help="Maximum bytes accepted per input file")
+    parser.add_argument("--max-decompressed-bytes", type=int,
+                        help="Maximum expanded workbook bytes")
+    parser.add_argument("--max-input-rows", type=int, help="Maximum rows accepted per input file")
+    parser.add_argument("--max-input-columns", type=int, help="Maximum columns accepted per input file")
+    parser.add_argument("--max-cell-bytes", type=int, help="Maximum UTF-8 bytes accepted in one cell")
+    parser.add_argument("--max-json-nesting", type=int, help="Maximum JSON nesting depth")
     parser.add_argument("--schema-mode", choices=["union", "intersection", "first_file"],
                         default="union", help="Schema unification mode")
     parser.add_argument("--backend", choices=["auto", "python", "polars"], default="auto",
@@ -4770,6 +5357,10 @@ def cli_main():
 
     if args.no_header:
         config.include_header = False
+    config.output_collision_policy = args.collision_policy
+    config.run_manifest_enabled = not args.no_manifest
+    if args.run_manifest_path:
+        config.run_manifest_path = args.run_manifest_path
 
     if args.no_dedupe:
         config.dedupe_enabled = False
@@ -4796,6 +5387,20 @@ def cli_main():
         config.selected_columns = args.exclude_columns
 
     config.header_normalize = args.header_normalize
+    config.invalid_row_policy = args.invalid_row_policy
+    if args.quarantine_path:
+        config.quarantine_path = args.quarantine_path
+    for name in (
+        "max_input_bytes",
+        "max_decompressed_bytes",
+        "max_input_rows",
+        "max_input_columns",
+        "max_cell_bytes",
+        "max_json_nesting",
+    ):
+        value = getattr(args, name, None)
+        if value is not None:
+            setattr(config, name, value)
     config.schema_mode = args.schema_mode
     config.engine_backend = args.backend
     config.streaming_enabled = not args.no_stream
@@ -4892,6 +5497,7 @@ def cli_main():
             print("Error: --join-on requires at least two input files", file=sys.stderr)
             return 3
         engine = CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg)
+        engine._manifest_input_files = [Path(path) for path in input_files]
         left_rows, left_columns = read_operation_file(engine, input_files[0])
         for path in input_files[1:]:
             right_rows, right_columns = read_operation_file(engine, path)
@@ -4920,6 +5526,7 @@ def cli_main():
             print("Error: --three-way-base, --three-way-ours, and --three-way-theirs are required together", file=sys.stderr)
             return 3
         engine = CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg)
+        engine._manifest_input_files = [Path(path) for path in paths]
         loaded = [read_operation_file(engine, path)[0] for path in paths]
         rows, conflicts, columns = CSVEngine.three_way_merge_rows(
             loaded[0], loaded[1], loaded[2], args.key_columns or [], args.conflict_resolution
@@ -4944,6 +5551,7 @@ def cli_main():
             print("Error: SQL query cannot be empty", file=sys.stderr)
             return 3
         engine = CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg)
+        engine._manifest_input_files = [Path(path) for path in input_files]
         try:
             rows, columns = engine.sql_query(input_files, query)
         except Exception as exc:

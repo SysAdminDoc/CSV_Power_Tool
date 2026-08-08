@@ -127,6 +127,139 @@ class CSVEngineTests(unittest.TestCase):
                 rows = list(csv.DictReader(handle))
             self.assertEqual(rows[0]["name"], "A")
 
+    def test_malformed_csv_fails_without_replacing_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "input.csv"
+            output_path = Path(temp_dir) / "output.csv"
+            input_path.write_text("id,name\n1,A\n2\n", encoding="utf-8")
+            output_path.write_text("previous\nvalue\n", encoding="utf-8")
+
+            stats = CSVEngine(ProcessingConfig(dedupe_enabled=False)).process(
+                [input_path], output_path
+            )
+
+            self.assertTrue(stats.fatal_input_errors)
+            self.assertEqual(output_path.read_text(encoding="utf-8"), "previous\nvalue\n")
+
+    def test_malformed_csv_warn_policy_keeps_repaired_row(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "input.csv"
+            output_path = Path(temp_dir) / "output.csv"
+            input_path.write_text("id,name\n1,A\n2\n", encoding="utf-8")
+            config = ProcessingConfig(dedupe_enabled=False, invalid_row_policy="warn")
+
+            stats = CSVEngine(config).process([input_path], output_path)
+
+            self.assertEqual(stats.errors, [])
+            self.assertEqual(len(stats.warnings), 1)
+            self.assertEqual(output_path.read_text(encoding="utf-8").splitlines(), [
+                "id,name", "1,A", "2,",
+            ])
+
+    def test_malformed_jsonl_quarantine_writes_location_report(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "input.jsonl"
+            output_path = Path(temp_dir) / "output.jsonl"
+            quarantine_path = Path(temp_dir) / "quarantine.jsonl"
+            input_path.write_text(
+                '{"id": 1}\nnot-json\n{"id": 2}\n',
+                encoding="utf-8",
+            )
+            config = ProcessingConfig(
+                dedupe_enabled=False,
+                invalid_row_policy="quarantine",
+                quarantine_path=str(quarantine_path),
+            )
+
+            stats = CSVEngine(config).process([input_path], output_path)
+
+            self.assertEqual(stats.errors, [])
+            self.assertEqual(stats.quarantined_rows, 1)
+            self.assertEqual(len(output_path.read_text(encoding="utf-8").splitlines()), 2)
+            quarantine = json.loads(quarantine_path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(quarantine["line"], 2)
+            self.assertEqual(quarantine["file"], str(input_path))
+
+    def test_input_limits_fail_before_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "input.csv"
+            output_path = Path(temp_dir) / "output.csv"
+            input_path.write_text("id\n1\n2\n", encoding="utf-8")
+            config = ProcessingConfig(dedupe_enabled=False, max_input_rows=1)
+
+            stats = CSVEngine(config).process([input_path], output_path)
+
+            self.assertTrue(any("row count" in error for error in stats.fatal_input_errors))
+            self.assertFalse(output_path.exists())
+
+    def test_invalid_xlsx_container_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "input.xlsx"
+            output_path = Path(temp_dir) / "output.csv"
+            input_path.write_bytes(b"not-an-xlsx-container")
+
+            stats = CSVEngine(ProcessingConfig(dedupe_enabled=False)).process(
+                [input_path], output_path
+            )
+
+            self.assertTrue(any("workbook container" in error for error in stats.fatal_input_errors))
+            self.assertFalse(output_path.exists())
+
+    def test_invalid_parquet_container_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "input.parquet"
+            output_path = Path(temp_dir) / "output.csv"
+            input_path.write_bytes(b"not-a-parquet-container")
+
+            stats = CSVEngine(ProcessingConfig(dedupe_enabled=False)).process(
+                [input_path], output_path
+            )
+
+            self.assertTrue(stats.fatal_input_errors)
+            self.assertFalse(output_path.exists())
+
+    def test_output_backup_and_manifest_are_auditable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "input.csv"
+            output_path = Path(temp_dir) / "output.csv"
+            input_path.write_text("id,name\n1,A\n", encoding="utf-8")
+            output_path.write_text("old\n", encoding="utf-8")
+            config = ProcessingConfig(
+                dedupe_enabled=False,
+                output_collision_policy="backup",
+                streaming_enabled=False,
+            )
+
+            stats = CSVEngine(config).process([input_path], output_path)
+
+            self.assertFalse(stats.errors)
+            self.assertEqual(output_path.read_text(encoding="utf-8").splitlines(), ["id,name", "1,A"])
+            backups = list(Path(temp_dir).glob("output.csv.*.bak"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_text(encoding="utf-8"), "old\n")
+            manifest = json.loads(
+                Path(f"{output_path}.manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["stats"]["rows_written"], 1)
+            self.assertEqual(manifest["output"]["sha256"], CSVEngine._sha256_file(output_path))
+            self.assertEqual(manifest["inputs"][0]["sha256"], CSVEngine._sha256_file(input_path))
+
+    def test_output_fail_collision_leaves_destination_unchanged(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "input.csv"
+            output_path = Path(temp_dir) / "output.csv"
+            input_path.write_text("id\n1\n", encoding="utf-8")
+            output_path.write_text("previous\n", encoding="utf-8")
+            config = ProcessingConfig(
+                dedupe_enabled=False,
+                output_collision_policy="fail",
+            )
+
+            stats = CSVEngine(config).process([input_path], output_path)
+
+            self.assertTrue(any("already exists" in error for error in stats.errors))
+            self.assertEqual(output_path.read_text(encoding="utf-8"), "previous\n")
+
     def test_jsonl_round_trip_adds_source_and_column_summary(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             input_path = Path(temp_dir) / "input.jsonl"
@@ -332,7 +465,7 @@ class CSVEngineTests(unittest.TestCase):
         try:
             request = Request(
                 f"http://127.0.0.1:{server.server_address[1]}/process?filename=input.csv",
-                data=b"id\n1\n",
+                data=b"",
                 method="POST",
                 headers={
                     "Content-Type": "text/csv",

@@ -125,10 +125,14 @@ python CSV_Consolidator.py --inputs exports --source-column "(Source)" --schema-
 python CSV_Consolidator.py --inputs left.csv right.csv --join-on id --join-type outer --output joined.csv
 python CSV_Consolidator.py --three-way-base base.csv --three-way-ours ours.csv --three-way-theirs theirs.csv --key-columns id --output merged.csv
 python CSV_Consolidator.py --inputs data/*.csv --sql "SELECT * FROM input_0 WHERE amount > 100" --output query.csv
+python CSV_Consolidator.py --inputs data/*.csv --invalid-row-policy quarantine --quarantine rejected.jsonl --output cleaned.csv
+python CSV_Consolidator.py --inputs data/*.csv --collision-policy backup --output combined.csv
 python CSV_Consolidator.py --serve --port 8765
 ```
 
 SQL mode exposes each input as `input_0`, `input_1`, and so on through DuckDB. The opt-in upload API accepts raw file POSTs or browser-style multipart uploads at `POST /process` and exposes `GET /health`; it binds to localhost only, requires the per-run token printed at startup in `X-CSV-Power-Token` (or `Authorization: Bearer ...`), validates loopback Host/Origin headers, limits requests to 50 MiB and four active requests, and removes request files after processing. SQL is intentionally unavailable through the upload endpoint.
+
+Input processing defaults to failing safely on malformed rows, oversized cells, excessive rows/columns, invalid containers, and over-deep JSON. Use `--invalid-row-policy warn` to retain repairable ragged rows with warnings, or `--invalid-row-policy quarantine --quarantine rejected.jsonl` to omit malformed rows and record their source locations. Successful outputs are written through a same-directory temporary file and accompanied by `<output>.manifest.json`, containing input/output hashes, schema counts, configuration identity, warnings, and errors. Use `--collision-policy fail` or `backup` to control existing destinations, or `--no-manifest` when an audit sidecar is not wanted.
 
 ### Packaging
 
