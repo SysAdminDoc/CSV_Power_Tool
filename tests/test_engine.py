@@ -537,6 +537,67 @@ class CSVEngineTests(unittest.TestCase):
         self.assertEqual(conflicts, [{"key": ["1"], "columns": ["value"]}])
         self.assertIn("<<<<<<< ours", merged[0]["value"])
 
+    def test_schema_aware_join_reports_cardinality_conflicts_and_policies(self):
+        left = [
+            {"id": " A ", "value": "left-1"},
+            {"id": "a", "value": "left-2"},
+            {"id": "", "value": "missing"},
+        ]
+        right = [
+            {"id": "a", "value": "right"},
+            {"id": "b", "value": "right-b"},
+        ]
+
+        report = CSVEngine.analyze_join(left, right, ["id"], "outer")
+
+        self.assertEqual(report["cardinality"], "one-to-many")
+        self.assertEqual(report["unmatched_left_rows"], 1)
+        self.assertEqual(report["unmatched_right_rows"], 1)
+        self.assertEqual(report["conflict_count"], 2)
+        self.assertEqual(report["sources"]["left"]["rows_missing_key"], 1)
+        self.assertEqual(report["coercions"]["normalization_count"], 1)
+
+        semi, semi_columns = CSVEngine.join_rows(left, right, ["id"], "semi")
+        anti, anti_columns = CSVEngine.join_rows(left, right, ["id"], "anti")
+        self.assertEqual(semi_columns, ["id", "value"])
+        self.assertEqual([row["value"] for row in semi], ["left-1", "left-2"])
+        self.assertEqual(anti_columns, ["id", "value"])
+        self.assertEqual([row["value"] for row in anti], ["missing"])
+
+        with self.assertRaisesRegex(ValueError, "missing key column"):
+            CSVEngine.join_rows([{"id": "1"}], [{"other": "1"}], ["id"])
+
+    def test_three_way_merge_requires_resolution_and_reports_conflict_values(self):
+        base = [{"id": "1", "value": "base"}]
+        ours = [{"id": "1", "value": "ours"}]
+        theirs = [{"id": "1", "value": "theirs"}]
+
+        report = CSVEngine.analyze_three_way(base, ours, theirs, ["id"])
+        self.assertTrue(report["requires_explicit_resolution"])
+        self.assertEqual(report["conflicts"][0]["base"], "base")
+        self.assertEqual(report["conflicts"][0]["ours"], "ours")
+        self.assertEqual(report["conflicts"][0]["theirs"], "theirs")
+
+        with self.assertRaisesRegex(ValueError, "require explicit resolution"):
+            CSVEngine.three_way_merge_rows(base, ours, theirs, ["id"], "fail")
+
+        merged, conflicts, columns = CSVEngine.three_way_merge_rows(
+            base, ours, theirs, ["id"], "theirs"
+        )
+        self.assertEqual(columns, ["id", "value"])
+        self.assertEqual(merged[0]["value"], "theirs")
+        self.assertEqual(conflicts, [{"key": ["1"], "columns": ["value"]}])
+
+    def test_three_way_duplicate_keys_are_rejected_before_merge(self):
+        with self.assertRaisesRegex(ValueError, "duplicate merge keys"):
+            CSVEngine.three_way_merge_rows(
+                [{"id": "1", "value": "base"}],
+                [{"id": "1", "value": "ours"}, {"id": "1", "value": "again"}],
+                [{"id": "1", "value": "theirs"}],
+                ["id"],
+                "ours",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

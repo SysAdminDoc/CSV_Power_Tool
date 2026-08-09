@@ -1,6 +1,7 @@
 import codecs
 import csv
 import importlib.util
+import json
 import os
 import random
 import subprocess
@@ -228,6 +229,8 @@ class CLIContractTests(unittest.TestCase):
         self.assertIn("--no-manifest", result.stdout)
         self.assertIn("--profile", result.stdout)
         self.assertIn("--repair-edits", result.stdout)
+        self.assertIn("--join-report", result.stdout)
+        self.assertIn("--conflict-resolution", result.stdout)
 
     def test_cli_dry_run_and_workflow_replay(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -250,6 +253,78 @@ class CLIContractTests(unittest.TestCase):
             replay = self.run_cli("--replay", str(workflow_path), "--no-manifest")
             self.assertEqual(replay.returncode, 0, replay.stderr)
             self.assertIn("Replay", output_path.read_text(encoding="utf-8"))
+
+    def test_cli_join_report_and_anti_policy(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            left_path = root / "left.csv"
+            right_path = root / "right.csv"
+            output_path = root / "joined.csv"
+            report_path = root / "join-report.json"
+            left_path.write_text("id,name\n1,A\n2,B\n", encoding="utf-8")
+            right_path.write_text("id,value\n1,10\n3,30\n", encoding="utf-8")
+
+            result = self.run_cli(
+                "--inputs", str(left_path), str(right_path), "--join-on", "id",
+                "--join-type", "outer", "--join-report", str(report_path),
+                "--output", str(output_path), "--no-dedupe",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["format"], "csv-power-tool-join-report")
+            self.assertEqual(report["stages"][0]["unmatched_right_rows"], 1)
+            self.assertEqual(report["stages"][0]["cardinality"], "one-to-one")
+            self.assertIn("3,,30", output_path.read_text(encoding="utf-8"))
+            manifest = json.loads(Path(f"{output_path}.manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["stats"]["join_report"]["conflict_count"], 0)
+
+            anti_output = root / "anti.csv"
+            anti = self.run_cli(
+                "--inputs", str(left_path), str(right_path), "--join-on", "id",
+                "--join-type", "anti", "--output", str(anti_output),
+                "--no-manifest", "--no-dedupe",
+            )
+            self.assertEqual(anti.returncode, 0, anti.stderr)
+            self.assertIn("2,B", anti_output.read_text(encoding="utf-8"))
+            self.assertNotIn("1,A", anti_output.read_text(encoding="utf-8"))
+
+    def test_cli_three_way_default_is_safe_and_explicit_mark_writes_report(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            base_path = root / "base.csv"
+            ours_path = root / "ours.csv"
+            theirs_path = root / "theirs.csv"
+            output_path = root / "merged.csv"
+            report_path = root / "merge-report.json"
+            base_path.write_text("id,value\n1,base\n", encoding="utf-8")
+            ours_path.write_text("id,value\n1,ours\n", encoding="utf-8")
+            theirs_path.write_text("id,value\n1,theirs\n", encoding="utf-8")
+            output_path.write_text("previous\n", encoding="utf-8")
+
+            blocked = self.run_cli(
+                "--three-way-base", str(base_path), "--three-way-ours", str(ours_path),
+                "--three-way-theirs", str(theirs_path), "--key-columns", "id",
+                "--merge-report", str(report_path), "--output", str(output_path),
+                "--no-manifest",
+            )
+            self.assertEqual(blocked.returncode, 3, blocked.stderr)
+            self.assertEqual(output_path.read_text(encoding="utf-8"), "previous\n")
+            blocked_report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertTrue(blocked_report["requires_explicit_resolution"])
+
+            marked = self.run_cli(
+                "--three-way-base", str(base_path), "--three-way-ours", str(ours_path),
+                "--three-way-theirs", str(theirs_path), "--key-columns", "id",
+                "--conflict-resolution", "mark", "--merge-report", str(report_path),
+                "--output", str(output_path), "--no-manifest",
+            )
+            self.assertEqual(marked.returncode, 0, marked.stderr)
+            self.assertIn("<<<<<<< ours", output_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                json.loads(report_path.read_text(encoding="utf-8"))["resolution_policy"],
+                "mark",
+            )
 
     def test_bounded_performance_smoke(self):
         row_count = 5_000

@@ -79,6 +79,17 @@ def operations_from_config(config: dict, output_path: str | None, input_patterns
             "edit_count": len(config.get("repair_edits", [])),
             "report_path": config.get("repair_report_path", ""),
         },
+        {
+            "type": "join-merge-audit",
+            "key_normalization": config.get("key_normalization", "trim-casefold"),
+            "join_type": config.get("join_type", "inner"),
+            "join_keys": config.get("join_key_columns", []),
+            "join_conflict_policy": config.get("join_conflict_policy", "keep-both"),
+            "join_report_path": config.get("join_report_path", ""),
+            "merge_keys": config.get("merge_key_columns", []),
+            "merge_conflict_resolution": config.get("merge_conflict_resolution", "fail"),
+            "merge_report_path": config.get("merge_report_path", ""),
+        },
         {"type": "filter", "logic": config.get("filter_logic", "and"), "rules": config.get("filters", [])},
         {"type": "transform", "rules": config.get("column_transforms", [])},
         {

@@ -133,8 +133,10 @@ python CSV_Consolidator.py --inputs data/*.csv --schema-contract contract.json -
 python CSV_Consolidator.py --inputs data/*.csv --profile quality.json --quality-scan-rows 10000
 python CSV_Consolidator.py --inputs data/*.csv --profile status-ok.json --quality-filter-column status --quality-filter-value ok
 python CSV_Consolidator.py --inputs data/*.csv --repair-edits reviewed-edits.json --repair-report repairs.json --output repaired.csv
-python CSV_Consolidator.py --inputs left.csv right.csv --join-on id --join-type outer --output joined.csv
+python CSV_Consolidator.py --inputs left.csv right.csv --join-on id --join-type outer --join-report join-report.json --output joined.csv
+python CSV_Consolidator.py --inputs left.csv right.csv --join-on id --join-type anti --output left-only.csv
 python CSV_Consolidator.py --three-way-base base.csv --three-way-ours ours.csv --three-way-theirs theirs.csv --key-columns id --output merged.csv
+python CSV_Consolidator.py --three-way-base base.csv --three-way-ours ours.csv --three-way-theirs theirs.csv --key-columns id --conflict-resolution mark --merge-report merge-report.json --output marked.csv
 python CSV_Consolidator.py --inputs data/*.csv --sql "SELECT * FROM input_0 WHERE amount > 100" --output query.csv
 python CSV_Consolidator.py --inputs data/*.csv --invalid-row-policy quarantine --quarantine rejected.jsonl --output cleaned.csv
 python CSV_Consolidator.py --inputs data/*.csv --collision-policy backup --output combined.csv
@@ -155,6 +157,10 @@ Schema contracts use a documented first-version subset of the [Frictionless Tabl
 `--profile` writes a `csv-power-tool-quality-profile` JSON artifact from a bounded incremental scan. Each column reports source-row count, non-empty/blank/null counts, exact-or-lower-bound distinctness, duplicate count, raw samples, top facets, inferred type and confidence, plus numeric count/min/max/mean when applicable. Use `--quality-filter-column COLUMN --quality-filter-value VALUE` for an exact raw-value facet drill-down. The GUI Quality tab provides the same profile, a facet filter, bounded row inspection, and a reviewed-edit list.
 
 `--repair-edits` accepts a JSON list (or `{"edits": [...]}`) of 1-based `row`, `column`, and `value` entries. Add optional `expected_old` and `reason` fields to make a correction compare-and-fail against the inspected raw text. Replacements stay text values, so leading zeros and other source spelling remain intact unless the operator explicitly enters a different value. Repairs run before filtering and transforms, use the existing GUI Undo/Redo history, and can be exported with `--repair-report`; the applied edit records are also stored in the output manifest and versioned workflow configuration. SQL, joins, and three-way merge paths reject repair edits because they use separate execution plans.
+
+Join mode normalizes keys with `trim-casefold` by default without numeric coercion, preserving values such as `001`. Choose `--key-normalization exact|trim|casefold|trim-casefold` explicitly when needed. `--join-type` supports inner, left, right, outer/full, anti (left rows without a match), and semi (left rows with a match). Joins preserve left input order followed by right-only rows, report key presence, blank keys, duplicate-key cardinality, type mismatches, normalization coercions, unmatched rows, and shared-cell conflicts. Shared non-key values remain in both columns by default; `--join-conflict-policy fail` blocks a destructive run. `--join-report` exports the staged report, and the same report is embedded in the run manifest.
+
+Three-way merges require unique, present keys. Conflict resolution defaults to `fail`, writes no replacement output when conflicts exist, and requires an explicit `--conflict-resolution ours|theirs|base|mark` after review. `--merge-report` records base/ours/theirs values, conflict columns, duplicate/missing-key validation, type/coercion diagnostics, resolution policy, and deterministic ordering; merge diagnostics are also included in the run manifest.
 
 ### Performance budgets and benchmark methodology
 

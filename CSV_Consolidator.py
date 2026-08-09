@@ -58,6 +58,13 @@ from csv_power_tool.quality import (
     normalize_repairs,
     write_quality_report,
 )
+from csv_power_tool.joins import (
+    JoinError,
+    analyze_join,
+    analyze_three_way,
+    execute_join,
+    execute_three_way,
+)
 
 APP_NAME = "CSV Power Tool"
 APP_VERSION = "3.2.0"
@@ -290,6 +297,16 @@ class ProcessingConfig:
     repair_edits: list = field(default_factory=list)
     repair_report_path: str = ""
 
+    # Join and merge audit policies
+    key_normalization: str = "trim-casefold"
+    join_type: str = "inner"
+    join_key_columns: list = field(default_factory=list)
+    join_conflict_policy: str = "keep-both"
+    join_report_path: str = ""
+    merge_key_columns: list = field(default_factory=list)
+    merge_conflict_resolution: str = "fail"
+    merge_report_path: str = ""
+
     # Dataframe backend
     engine_backend: str = "auto"  # "auto", "python", or "polars"
     polars_threshold_bytes: int = 5_000_000
@@ -327,6 +344,8 @@ class ProcessingStats:
     schema_validation: dict = field(default_factory=dict)
     quality_profile: dict = field(default_factory=dict)
     repair_report: dict = field(default_factory=dict)
+    join_report: dict = field(default_factory=dict)
+    merge_report: dict = field(default_factory=dict)
 
 
 class ConfigHistory:
@@ -1496,6 +1515,8 @@ class CSVEngine:
                 "schema_validation": self.stats.schema_validation,
                 "quality_profile": self.stats.quality_profile,
                 "repair_report": self.stats.repair_report,
+                "join_report": self.stats.join_report,
+                "merge_report": self.stats.merge_report,
             },
         }
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1785,73 +1806,69 @@ class CSVEngine:
             connection.close()
 
     @staticmethod
+    def analyze_join(
+        left_rows: list[dict],
+        right_rows: list[dict],
+        key_columns: list[str],
+        join_type: str = "inner",
+        key_normalization: str = "trim-casefold",
+        conflict_policy: str = "keep-both",
+        max_details: int = 1_000,
+    ) -> dict:
+        return analyze_join(
+            left_rows,
+            right_rows,
+            key_columns,
+            join_type,
+            key_normalization,
+            conflict_policy,
+            max_details,
+        )
+
+    @staticmethod
+    def analyze_three_way(
+        base_rows: list[dict],
+        ours_rows: list[dict],
+        theirs_rows: list[dict],
+        key_columns: list[str],
+        key_normalization: str = "trim-casefold",
+        resolution: str = "fail",
+        max_details: int = 1_000,
+    ) -> dict:
+        return analyze_three_way(
+            base_rows,
+            ours_rows,
+            theirs_rows,
+            key_columns,
+            key_normalization,
+            resolution,
+            max_details,
+        )
+
+    @staticmethod
     def join_rows(
         left_rows: list[dict],
         right_rows: list[dict],
         key_columns: list[str],
         join_type: str = "inner",
         right_suffix: str = "_right",
+        key_normalization: str = "trim-casefold",
+        conflict_policy: str = "keep-both",
+        return_diagnostics: bool = False,
+        max_details: int = 1_000,
     ) -> tuple[list[dict], list[str]]:
-        """Join two row collections while preserving left/right input order."""
-        join_type = "outer" if join_type == "full" else join_type
-        if join_type not in {"inner", "left", "right", "outer"}:
-            raise ValueError(f"Unsupported join type: {join_type}")
-        key_columns = list(key_columns)
-
-        def key_for(row):
-            return tuple(str(row.get(column, "")).casefold() for column in key_columns)
-
-        left_columns = list(dict.fromkeys(column for row in left_rows for column in row))
-        right_columns = list(dict.fromkeys(column for row in right_rows for column in row))
-        right_output_names = {}
-        output_columns = list(left_columns)
-        for column in right_columns:
-            if column in key_columns:
-                continue
-            candidate = column
-            if candidate in output_columns:
-                candidate = f"{column}{right_suffix}"
-                counter = 2
-                while candidate in output_columns:
-                    candidate = f"{column}{right_suffix}{counter}"
-                    counter += 1
-            right_output_names[column] = candidate
-            output_columns.append(candidate)
-
-        right_index = defaultdict(list)
-        for row in right_rows:
-            right_index[key_for(row)].append(row)
-
-        result = []
-        matched_right = set()
-
-        def merge(left, right):
-            merged = {column: left.get(column, "") for column in left_columns}
-            if right:
-                for column in right_columns:
-                    target = column if column in key_columns else right_output_names[column]
-                    if column in key_columns and not merged.get(column):
-                        merged[target] = right.get(column, "")
-                    elif column not in key_columns:
-                        merged[target] = right.get(column, "")
-            return merged
-
-        for left in left_rows:
-            matches = right_index.get(key_for(left), [])
-            if matches:
-                for right in matches:
-                    matched_right.add(id(right))
-                    result.append(merge(left, right))
-            elif join_type in {"left", "outer"}:
-                result.append(merge(left, None))
-
-        if join_type in {"right", "outer"}:
-            for right in right_rows:
-                if id(right) in matched_right:
-                    continue
-                result.append(merge({}, right))
-
-        return result, output_columns
+        """Join rows while preserving input order and optionally returning diagnostics."""
+        return execute_join(
+            left_rows,
+            right_rows,
+            list(key_columns),
+            join_type,
+            right_suffix,
+            key_normalization,
+            conflict_policy,
+            return_diagnostics,
+            max_details,
+        )
 
     @staticmethod
     def three_way_merge_rows(
@@ -1860,66 +1877,21 @@ class CSVEngine:
         theirs_rows: list[dict],
         key_columns: list[str],
         conflict_resolution: str = "ours",
+        key_normalization: str = "trim-casefold",
+        return_diagnostics: bool = False,
+        max_details: int = 1_000,
     ) -> tuple[list[dict], list[dict], list[str]]:
-        """Merge three keyed row sets and return rows, conflict details, and columns."""
-        if not key_columns:
-            sample = next(iter(ours_rows or theirs_rows or base_rows), None)
-            if not sample:
-                return [], [], []
-            key_columns = [next(iter(sample))]
-        if conflict_resolution not in {"ours", "theirs", "base", "mark"}:
-            raise ValueError(f"Unsupported conflict resolution: {conflict_resolution}")
-
-        def key_for(row):
-            return tuple(str(row.get(column, "")).casefold() for column in key_columns)
-
-        def index(rows):
-            return {key_for(row): row for row in rows}
-
-        base = index(base_rows)
-        ours = index(ours_rows)
-        theirs = index(theirs_rows)
-        order = list(dict.fromkeys([*base, *ours, *theirs]))
-        columns = list(dict.fromkeys(
-            column for row in [*base_rows, *ours_rows, *theirs_rows] for column in row
-        ))
-        merged_rows = []
-        conflicts = []
-
-        for key in order:
-            base_row = base.get(key)
-            ours_row = ours.get(key)
-            theirs_row = theirs.get(key)
-            if ours_row == theirs_row:
-                selected = ours_row or theirs_row
-            elif ours_row == base_row:
-                selected = theirs_row
-            elif theirs_row == base_row:
-                selected = ours_row
-            else:
-                selected = copy.deepcopy(ours_row or theirs_row or base_row or {})
-                changed_columns = []
-                for column in columns:
-                    base_value = (base_row or {}).get(column, "")
-                    ours_value = (ours_row or {}).get(column, "")
-                    theirs_value = (theirs_row or {}).get(column, "")
-                    if ours_value != theirs_value and ours_value != base_value and theirs_value != base_value:
-                        changed_columns.append(column)
-                        if conflict_resolution == "theirs":
-                            selected[column] = theirs_value
-                        elif conflict_resolution == "base":
-                            selected[column] = base_value
-                        elif conflict_resolution == "mark":
-                            selected[column] = f"<<<<<<< ours\n{ours_value}\n=======\n{theirs_value}\n>>>>>>> theirs"
-                        else:
-                            selected[column] = ours_value
-                if changed_columns:
-                    conflicts.append({"key": list(key), "columns": changed_columns})
-
-            if selected is not None:
-                merged_rows.append({column: selected.get(column, "") for column in columns})
-
-        return merged_rows, conflicts, columns
+        """Merge keyed row sets with deterministic, auditable conflict handling."""
+        return execute_three_way(
+            base_rows,
+            ours_rows,
+            theirs_rows,
+            list(key_columns),
+            conflict_resolution,
+            key_normalization,
+            return_diagnostics,
+            max_details,
+        )
     
     def process(self, input_files: list[Path], output_file: Path) -> ProcessingStats:
         """Process CSV files according to configuration."""
@@ -6444,12 +6416,22 @@ def cli_main(argv=None):
     parser.add_argument("--pivot-aggregate", choices=["first", "sum", "min", "max", "concat"], default="first")
     parser.add_argument("--pivot-separator", default="; ", help="Separator for pivot concat aggregation")
     parser.add_argument("--join-on", nargs="+", metavar="COLUMN", help="Join two or more inputs on these columns")
-    parser.add_argument("--join-type", choices=["inner", "left", "right", "outer"], default="inner")
+    parser.add_argument(
+        "--join-type", choices=["inner", "left", "right", "outer", "full", "anti", "semi"],
+        default=None, help="Join policy; anti/semi return unmatched/matched left rows",
+    )
+    parser.add_argument("--join-report", help="Write a machine-readable join validation/conflict report")
+    parser.add_argument("--join-conflict-policy", choices=["keep-both", "fail"], default=None,
+                        help="Shared non-key cells: retain both values or fail safely")
+    parser.add_argument("--key-normalization", choices=["exact", "trim", "casefold", "trim-casefold"],
+                        default=None, help="Key normalization used by joins and three-way merges")
     parser.add_argument("--three-way-base", help="Base input for a three-way keyed merge")
     parser.add_argument("--three-way-ours", help="Ours input for a three-way keyed merge")
     parser.add_argument("--three-way-theirs", help="Theirs input for a three-way keyed merge")
     parser.add_argument("--key-columns", nargs="+", metavar="COLUMN", help="Key columns for a three-way merge")
-    parser.add_argument("--conflict-resolution", choices=["ours", "theirs", "base", "mark"], default="ours")
+    parser.add_argument("--merge-report", help="Write a machine-readable three-way merge report")
+    parser.add_argument("--conflict-resolution", choices=["fail", "ours", "theirs", "base", "mark"], default=None,
+                        help="Three-way conflict policy; fail requires explicit review before destructive resolution")
     parser.add_argument("--register-git-driver", action="store_true", help="Register the local csvpower merge driver")
     parser.add_argument("--serve", action="store_true", help="Start the loopback-only upload API")
     parser.add_argument("--host", default="127.0.0.1", help="Upload API host; only localhost is accepted")
@@ -6489,7 +6471,9 @@ def cli_main(argv=None):
         except WorkflowError as exc:
             parser.error(str(exc))
 
-    if not args.serve and not args.inputs and not args.dry_run and not args.validate_only and not args.export_schema:
+    if (not args.serve and not args.inputs and not args.dry_run and not args.validate_only
+            and not args.export_schema
+            and not (args.three_way_base or args.three_way_ours or args.three_way_theirs)):
         parser.error("--inputs, --config, or --replay is required unless --register-git-driver is used")
     if not args.serve and not args.dry_run and not args.output and not args.dedupe_preview \
             and not args.preview and not args.profile and not args.validate_only and not args.export_schema:
@@ -6498,6 +6482,10 @@ def cli_main(argv=None):
         parser.error("--output is required for join and three-way merge operations")
     if args.sql and args.sql_file:
         parser.error("--sql and --sql-file are mutually exclusive")
+    if args.join_report and not args.join_on:
+        parser.error("--join-report requires --join-on")
+    if args.merge_report and not (args.three_way_base or args.three_way_ours or args.three_way_theirs):
+        parser.error("--merge-report requires three-way merge inputs")
 
     def expand_inputs(patterns):
         input_files = []
@@ -6574,6 +6562,22 @@ def cli_main(argv=None):
     if config.repair_edits and (args.sql or args.sql_file or args.join_on
                                 or args.three_way_base or args.three_way_ours or args.three_way_theirs):
         parser.error("Reviewed repairs are supported by the normal processing path only")
+    if args.key_normalization is not None:
+        config.key_normalization = args.key_normalization
+    if args.join_type is not None:
+        config.join_type = args.join_type
+    if args.join_on:
+        config.join_key_columns = list(args.join_on)
+    if args.join_conflict_policy is not None:
+        config.join_conflict_policy = args.join_conflict_policy
+    if args.join_report:
+        config.join_report_path = args.join_report
+    if args.key_columns:
+        config.merge_key_columns = list(args.key_columns)
+    if args.conflict_resolution is not None:
+        config.merge_conflict_resolution = args.conflict_resolution
+    if args.merge_report:
+        config.merge_report_path = args.merge_report
 
     # Apply CLI overrides
     if args.delimiter:
@@ -6759,32 +6763,136 @@ def cli_main(argv=None):
             "preview": engine.preview_duplicates(all_rows, final_columns),
         }
 
+    def write_operation_report(path, report):
+        if not path:
+            return True
+        try:
+            _write_json_atomic(path, report)
+            return True
+        except (OSError, TypeError, ValueError) as exc:
+            print(f"Error writing operation report: {exc}", file=sys.stderr)
+            return False
+
     def run_join(input_files):
         if len(input_files) < 2:
             print("Error: --join-on requires at least two input files", file=sys.stderr)
             return 3
+        key_columns = list(args.join_on or config.join_key_columns)
+        if not key_columns:
+            print("Error: --join-on requires at least one key column", file=sys.stderr)
+            return 3
+        join_type = args.join_type or config.join_type
         engine = CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg)
         engine._manifest_input_files = [Path(path) for path in input_files]
         left_rows, left_columns = read_operation_file(engine, input_files[0])
+        stages = []
+        aggregate_report = {
+            "format": "csv-power-tool-join-report",
+            "version": 1,
+            "operation": "join",
+            "join_type": join_type,
+            "key_columns": key_columns,
+            "key_normalization": config.key_normalization,
+            "conflict_policy": config.join_conflict_policy,
+            "stages": stages,
+            "conflict_count": 0,
+            "conflicts": [],
+            "conflicts_truncated": False,
+            "validation": {"valid": True, "errors": [], "warnings": []},
+            "deterministic_order": "left input order, then right unmatched input order per stage",
+        }
         for path in input_files[1:]:
             right_rows, right_columns = read_operation_file(engine, path)
-            left_rows, joined_columns = CSVEngine.join_rows(
-                left_rows,
-                right_rows,
-                args.join_on,
-                args.join_type,
+            try:
+                stage = analyze_join(
+                    left_rows,
+                    right_rows,
+                    key_columns,
+                    join_type,
+                    config.key_normalization,
+                    config.join_conflict_policy,
+                )
+            except JoinError as exc:
+                print(f"Error validating join keys: {exc}", file=sys.stderr)
+                return 3
+            stage["left_source"] = stages[-1].get("right_source", input_files[0]) if stages else str(input_files[0])
+            stage["right_source"] = str(path)
+            stages.append(stage)
+            aggregate_report["conflict_count"] += stage.get("conflict_count", 0)
+            for conflict in stage.get("conflicts", []):
+                if len(aggregate_report["conflicts"]) >= 1_000:
+                    aggregate_report["conflicts_truncated"] = True
+                    break
+                aggregate_report["conflicts"].append({
+                    **conflict,
+                    "stage": len(stages),
+                    "left_source": stage["left_source"],
+                    "right_source": stage["right_source"],
+                })
+            aggregate_report["conflicts_truncated"] = (
+                aggregate_report["conflicts_truncated"] or stage.get("conflicts_truncated", False)
             )
-            left_columns = joined_columns
+            aggregate_report["validation"]["errors"].extend(stage["validation"].get("errors", []))
+            aggregate_report["validation"]["warnings"].extend(stage["validation"].get("warnings", []))
+            if not stage["validation"]["valid"]:
+                aggregate_report["validation"]["valid"] = False
+                if not args.quiet:
+                    print("XX Join key validation failed; no output was written", file=sys.stderr)
+                engine.stats.join_report = aggregate_report
+                write_operation_report(config.join_report_path, aggregate_report)
+                return 3
+            if config.join_conflict_policy == "fail" and stage.get("conflict_count"):
+                aggregate_report["validation"]["valid"] = False
+                aggregate_report["validation"]["errors"].append(
+                    f"stage has {stage['conflict_count']:,} conflicting shared cell(s)"
+                )
+                engine.stats.join_report = aggregate_report
+                write_operation_report(config.join_report_path, aggregate_report)
+                print("Error: join conflict policy fail blocked output", file=sys.stderr)
+                return 3
+            try:
+                left_rows, left_columns = CSVEngine.join_rows(
+                    left_rows,
+                    right_rows,
+                    key_columns,
+                    join_type,
+                    key_normalization=config.key_normalization,
+                    conflict_policy=config.join_conflict_policy,
+                )
+            except JoinError as exc:
+                print(f"Error executing join: {exc}", file=sys.stderr)
+                return 3
+
+        if engine.stats.errors:
+            aggregate_report["validation"]["valid"] = False
+            aggregate_report["validation"]["errors"].extend(engine.stats.errors)
+            engine.stats.join_report = aggregate_report
+            write_operation_report(config.join_report_path, aggregate_report)
+            return 3
         if config.filters:
             left_rows = engine._apply_filters(left_rows)
         left_rows = engine._apply_transformations(left_rows, left_columns)
         left_rows = [engine._redact_row(row) for row in left_rows]
+        aggregate_report["output_columns"] = list(left_columns)
+        aggregate_report["output_row_count"] = len(left_rows)
+        aggregate_report["stage_count"] = len(stages)
+        aggregate_report["conflicts_truncated"] = aggregate_report["conflicts_truncated"] or any(
+            stage.get("conflicts_truncated", False) for stage in stages
+        )
+        engine.stats.join_report = aggregate_report
+        if not write_operation_report(config.join_report_path, aggregate_report):
+            return 3
         engine.stats.unique_columns = len(left_columns)
         engine.stats.final_row_count = len(left_rows)
         engine._compute_column_summary(left_rows, [config.column_mapping.get(c, c) for c in left_columns])
         engine._write_output(left_rows, left_columns, output_path)
         if not args.quiet:
-            print(f"  Joined rows: {engine.stats.final_row_count:,}", file=sys.stderr)
+            print(
+                f"  Joined rows: {engine.stats.final_row_count:,}; "
+                f"cardinality: {stages[-1].get('cardinality', 'n/a') if stages else 'n/a'}; "
+                f"conflicts: {aggregate_report['conflict_count']:,}",
+                file=sys.stderr,
+            )
         return 3 if engine.stats.errors else 0
 
     def run_three_way_merge():
@@ -6792,18 +6900,67 @@ def cli_main(argv=None):
         if not all(paths):
             print("Error: --three-way-base, --three-way-ours, and --three-way-theirs are required together", file=sys.stderr)
             return 3
+        key_columns = list(args.key_columns or config.merge_key_columns)
+        resolution = config.merge_conflict_resolution
         engine = CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg)
         engine._manifest_input_files = [Path(path) for path in paths]
         loaded = [read_operation_file(engine, path)[0] for path in paths]
-        rows, conflicts, columns = CSVEngine.three_way_merge_rows(
-            loaded[0], loaded[1], loaded[2], args.key_columns or [], args.conflict_resolution
-        )
+        try:
+            report = analyze_three_way(
+                loaded[0], loaded[1], loaded[2], key_columns,
+                config.key_normalization, resolution,
+            )
+        except JoinError as exc:
+            print(f"Error validating merge keys: {exc}", file=sys.stderr)
+            return 3
+        report.setdefault("sources", {})
+        for side, path in zip(("base", "ours", "theirs"), paths):
+            report["sources"].setdefault(side, {"side": side})["source"] = str(path)
+        engine.stats.merge_report = report
+        if not report["validation"]["valid"]:
+            if not write_operation_report(config.merge_report_path, report):
+                return 3
+            print("Error: merge key validation failed; no output was written", file=sys.stderr)
+            return 3
+        if resolution == "fail" and report.get("conflict_count"):
+            if not write_operation_report(config.merge_report_path, report):
+                return 3
+            print(
+                f"Error: {report['conflict_count']:,} merge conflict(s) require explicit resolution; "
+                "use --conflict-resolution ours|theirs|base|mark",
+                file=sys.stderr,
+            )
+            return 3
+        try:
+            rows, conflicts, columns, report = CSVEngine.three_way_merge_rows(
+                loaded[0],
+                loaded[1],
+                loaded[2],
+                key_columns,
+                resolution,
+                key_normalization=config.key_normalization,
+                return_diagnostics=True,
+            )
+        except JoinError as exc:
+            print(f"Error executing three-way merge: {exc}", file=sys.stderr)
+            return 3
+        report.setdefault("sources", {})
+        for side, path in zip(("base", "ours", "theirs"), paths):
+            report["sources"].setdefault(side, {"side": side})["source"] = str(path)
+        report["output_columns"] = list(columns)
+        report["output_row_count"] = len(rows)
+        engine.stats.merge_report = report
+        if not write_operation_report(config.merge_report_path, report):
+            return 3
         engine.stats.unique_columns = len(columns)
         engine.stats.final_row_count = len(rows)
         engine._compute_column_summary(rows, columns)
         engine._write_output(rows, columns, output_path)
         if conflicts and not args.quiet:
-            print(f"!! Three-way merge produced {len(conflicts)} conflict(s) using {args.conflict_resolution}", file=sys.stderr)
+            print(
+                f"!! Three-way merge produced {len(conflicts):,} conflict group(s) using {resolution}",
+                file=sys.stderr,
+            )
         return 3 if engine.stats.errors else 0
 
     def run_sql(input_files):
@@ -6948,7 +7105,7 @@ def cli_main(argv=None):
             if not args.output:
                 return 3 if engine.stats.errors else 0
 
-        if args.join_on:
+        if args.join_on or config.join_key_columns:
             return run_join(input_files)
 
         if not args.quiet:
