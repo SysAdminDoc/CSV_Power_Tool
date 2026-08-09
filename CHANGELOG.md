@@ -14,6 +14,7 @@ All notable changes to CSV_Power_Tool will be documented in this file.
 - Performance: Replaced full-pipeline preview work with bounded read-only scans, cancellable GUI previews, a bounded JSON preview artifact, Arrow-batched Parquet input/output, and golden-equivalence/budget tests.
 - Quality: Added bounded faceted data-quality profiles, exact raw-row inspection, facet filtering, reviewed text repairs with expected-old guards, undo/redo GUI integration, repair reports, and workflow/manifest provenance.
 - Joins: Added schema-aware key normalization and validation, duplicate/cardinality and coercion diagnostics, deterministic anti/semi/full policies, machine-readable join reports, and safe three-way conflict resolution with fail-by-default reports.
+- CLI: Added format-explicit CSV/TSV/JSONL stdin/stdout pipes, versioned stats/error JSON artifacts, stderr-only human logs, and documented exit codes including cancellation 130.
 
 ## [v3.2.0] - 2026-08-03
 

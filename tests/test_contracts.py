@@ -177,13 +177,14 @@ class ParserContractTests(unittest.TestCase):
 
 class CLIContractTests(unittest.TestCase):
     @staticmethod
-    def run_cli(*arguments, timeout=30):
+    def run_cli(*arguments, timeout=30, input_text=None):
         return subprocess.run(
             [sys.executable, str(MODULE_PATH), *arguments],
             cwd=MODULE_PATH.parent,
             capture_output=True,
             text=True,
             timeout=timeout,
+            input=input_text,
         )
 
     def test_cli_success_logs_to_stderr_and_returns_zero(self):
@@ -221,9 +222,11 @@ class CLIContractTests(unittest.TestCase):
 
     def test_cli_help_contract_includes_safety_options(self):
         result = self.run_cli("--help")
+        repeat = self.run_cli("--help")
 
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout, repeat.stdout)
         self.assertIn("--invalid-row-policy", result.stdout)
         self.assertIn("--collision-policy", result.stdout)
         self.assertIn("--no-manifest", result.stdout)
@@ -325,6 +328,87 @@ class CLIContractTests(unittest.TestCase):
                 json.loads(report_path.read_text(encoding="utf-8"))["resolution_policy"],
                 "mark",
             )
+
+    def test_cli_stdin_stdout_and_machine_readable_contracts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_path = root / "output.csv"
+            stats_path = root / "stats.json"
+            errors_path = root / "errors.json"
+            streamed = self.run_cli(
+                "--inputs", "-", "--stdin-format", "csv", "--output", str(output_path),
+                "--no-dedupe", "--no-manifest", "--stats-json", str(stats_path),
+                "--errors-json", str(errors_path), input_text="id,name\n001,Pipe\n",
+            )
+            self.assertEqual(streamed.returncode, 0, streamed.stderr)
+            self.assertEqual(streamed.stdout, "")
+            self.assertIn("001,Pipe", output_path.read_text(encoding="utf-8"))
+            stats = json.loads(stats_path.read_text(encoding="utf-8"))
+            errors = json.loads(errors_path.read_text(encoding="utf-8"))
+            self.assertEqual(stats["format"], "csv-power-tool-cli-stats")
+            self.assertEqual(stats["stats"]["final_row_count"], 1)
+            self.assertEqual(errors["format"], "csv-power-tool-cli-errors")
+            self.assertEqual(errors["errors"], [])
+            self.assertEqual(errors["warnings"], [])
+
+            stdout_stats = root / "stdout-stats.json"
+            stdout_errors = root / "stdout-errors.json"
+            piped = self.run_cli(
+                "--inputs", str(output_path), "--output", "-", "--stdout-format", "csv",
+                "--no-dedupe", "--no-manifest", "--stats-json", str(stdout_stats),
+                "--errors-json", str(stdout_errors),
+            )
+            self.assertEqual(piped.returncode, 0, piped.stderr)
+            self.assertIn("id,name", piped.stdout)
+            self.assertIn("001,Pipe", piped.stdout)
+            self.assertIn("Results:", piped.stderr)
+            self.assertEqual(json.loads(stdout_stats.read_text())["exit_code"], 0)
+
+            empty_input = root / "empty.csv"
+            empty_output = root / "empty-output.csv"
+            empty_input.write_text("id,name\n", encoding="utf-8")
+            empty = self.run_cli(
+                "--inputs", str(empty_input), "--output", str(empty_output),
+                "--no-dedupe", "--no-manifest",
+            )
+            self.assertEqual(empty.returncode, 0, empty.stderr)
+            self.assertEqual(empty_output.read_text(encoding="utf-8"), "id,name\n")
+
+            jsonl_pipe = self.run_cli(
+                "--inputs", "-", "--stdin-format", "jsonl", "--output", "-",
+                "--stdout-format", "jsonl", "--no-dedupe", "--no-manifest",
+                input_text='{"id":"001","name":"Json pipe"}\n',
+            )
+            self.assertEqual(jsonl_pipe.returncode, 0, jsonl_pipe.stderr)
+            self.assertEqual(json.loads(jsonl_pipe.stdout), {"id": "001", "name": "Json pipe"})
+
+    def test_cli_warning_and_failure_artifacts_are_stable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "malformed.csv"
+            output_path = root / "output.csv"
+            warning_errors = root / "warning-errors.json"
+            failure_errors = root / "failure-errors.json"
+            input_path.write_text("id,name\n1,A\n2\n", encoding="utf-8")
+
+            warning = self.run_cli(
+                "--inputs", str(input_path), "--output", str(output_path),
+                "--invalid-row-policy", "warn", "--no-dedupe", "--no-manifest",
+                "--errors-json", str(warning_errors),
+            )
+            self.assertEqual(warning.returncode, 0, warning.stderr)
+            self.assertTrue(json.loads(warning_errors.read_text())["warnings"])
+
+            output_path.write_text("previous\n", encoding="utf-8")
+            failure = self.run_cli(
+                "--inputs", str(input_path), "--output", str(output_path),
+                "--no-dedupe", "--no-manifest", "--errors-json", str(failure_errors),
+            )
+            self.assertEqual(failure.returncode, 3, failure.stderr)
+            self.assertEqual(output_path.read_text(encoding="utf-8"), "previous\n")
+            failure_payload = json.loads(failure_errors.read_text())
+            self.assertEqual(failure_payload["exit_code"], 3)
+            self.assertTrue(failure_payload["errors"])
 
     def test_bounded_performance_smoke(self):
         row_count = 5_000

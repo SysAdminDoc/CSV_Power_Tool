@@ -6,6 +6,7 @@ Merge, filter, transform, deduplicate, and export CSV data with full control.
 """
 
 import sys
+import atexit
 import csv
 import re
 import json
@@ -6325,6 +6326,10 @@ def cli_main(argv=None):
     parser.add_argument("--inputs", "-i", nargs="+",
                         help="Input files, folders, or glob patterns (e.g. *.csv)")
     parser.add_argument("--output", "-o", help="Output file path")
+    parser.add_argument("--stdin-format", choices=["csv", "tsv", "jsonl"], default="csv",
+                        help="Format for --inputs - (default: csv)")
+    parser.add_argument("--stdout-format", choices=["csv", "tsv", "jsonl"], default="csv",
+                        help="Format for --output - (default: csv)")
     parser.add_argument("--delimiter", "-d", default=None, help="Output delimiter")
     parser.add_argument("--encoding", "-e", default=None, help="Output encoding")
     parser.add_argument("--no-header", action="store_true", help="Exclude header row")
@@ -6444,6 +6449,8 @@ def cli_main(argv=None):
                         help="Polling interval for --watch, in seconds")
     parser.add_argument("--quiet", "-q", action="store_true", help="Suppress log output")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    parser.add_argument("--stats-json", help="Write stable machine-readable run statistics JSON")
+    parser.add_argument("--errors-json", help="Write stable machine-readable warnings/errors JSON")
     parser.add_argument("--version", action="version", version=f"{APP_NAME} v{APP_VERSION}")
 
     args = parser.parse_args(argv)
@@ -6482,15 +6489,83 @@ def cli_main(argv=None):
         parser.error("--output is required for join and three-way merge operations")
     if args.sql and args.sql_file:
         parser.error("--sql and --sql-file are mutually exclusive")
+    if args.inputs and "-" in args.inputs and len(args.inputs) != 1:
+        parser.error("--inputs - must be used alone so stdin ordering is unambiguous")
+    if args.output == "-" and args.run_manifest_path:
+        parser.error("--manifest cannot target an output streamed to stdout")
+    if args.output == "-" and (args.stats_json == "-" or args.errors_json == "-"):
+        parser.error("--stats-json/--errors-json need file paths when --output - is used")
     if args.join_report and not args.join_on:
         parser.error("--join-report requires --join-on")
     if args.merge_report and not (args.three_way_base or args.three_way_ours or args.three_way_theirs):
         parser.error("--merge-report requires three-way merge inputs")
 
+    stream_temp_paths = []
+    stdin_temp_path = None
+
+    def cleanup_stream_temps():
+        for path in stream_temp_paths:
+            try:
+                Path(path).unlink()
+            except FileNotFoundError:
+                pass
+
+    atexit.register(cleanup_stream_temps)
+
+    def stage_stdin():
+        suffix = {"csv": ".csv", "tsv": ".tsv", "jsonl": ".jsonl"}[args.stdin_format]
+        handle = tempfile.NamedTemporaryFile(
+            mode="wb", prefix=".csv-power-tool-stdin-", suffix=suffix, delete=False,
+        )
+        path = Path(handle.name)
+        stream_temp_paths.append(path)
+        total = 0
+        limit = max(1, int(getattr(config, "max_input_bytes", 512 * 1024 * 1024)))
+        try:
+            with handle:
+                while True:
+                    chunk = sys.stdin.buffer.read(min(1024 * 1024, limit - total + 1))
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > limit:
+                        raise ValueError(
+                            f"stdin exceeds the configured input limit of {limit:,} bytes"
+                        )
+                    handle.write(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except Exception:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        return path
+
+    def stage_stdout():
+        suffix = {"csv": ".csv", "tsv": ".tsv", "jsonl": ".jsonl"}[args.stdout_format]
+        handle = tempfile.NamedTemporaryFile(
+            mode="wb", prefix=".csv-power-tool-stdout-", suffix=suffix, delete=False,
+        )
+        path = Path(handle.name)
+        handle.close()
+        stream_temp_paths.append(path)
+        return path
+
     def expand_inputs(patterns):
+        nonlocal stdin_temp_path
         input_files = []
         seen = set()
         for pattern in patterns:
+            if pattern == "-":
+                if stdin_temp_path is None:
+                    try:
+                        stdin_temp_path = stage_stdin()
+                    except (OSError, ValueError) as exc:
+                        parser.error(str(exc))
+                input_files.append(stdin_temp_path)
+                continue
             p = Path(pattern)
             candidates = []
             if p.is_dir():
@@ -6724,19 +6799,99 @@ def cli_main(argv=None):
         if args.verbose and not args.quiet:
             print(f"  ... {status} ({value:.0f}%)", file=sys.stderr)
 
-    output_path = Path(args.output) if args.output else None
+    stdout_output = args.output == "-"
+    stdout_temp_path = stage_stdout() if stdout_output else None
+    output_path = stdout_temp_path if stdout_output else Path(args.output) if args.output else None
+    workflow_output_path = Path("-") if stdout_output else output_path
+    if stdout_output:
+        config.run_manifest_enabled = False
+        config.run_manifest_path = ""
+        if args.stdout_format == "tsv" and not args.delimiter:
+            config.output_delimiter = "\t"
+
+    contract_state = {"engine": None}
+
+    def track_engine(engine):
+        contract_state["engine"] = engine
+        return engine
+
+    def operation_exit(stats):
+        if getattr(stats, "cancelled", False):
+            return 130
+        return 3 if getattr(stats, "errors", []) else 0
+
+    def emit_stdout_output():
+        if not stdout_output or not output_path or not output_path.exists():
+            return True
+        try:
+            output_stream = getattr(sys.stdout, "buffer", sys.stdout)
+            with output_path.open("rb") as handle:
+                shutil.copyfileobj(handle, output_stream)
+            output_stream.flush()
+            return True
+        except (OSError, AttributeError, ValueError) as exc:
+            print(f"Error writing stdout output: {exc}", file=sys.stderr)
+            return False
+
+    def emit_cli_contract(exit_code: int) -> int:
+        engine = contract_state.get("engine")
+        stats = engine.stats if engine is not None else None
+        stats_data = asdict(stats) if stats is not None else {}
+        errors = list(getattr(stats, "errors", [])) if stats is not None else []
+        warnings = list(getattr(stats, "warnings", [])) if stats is not None else []
+        if exit_code and not errors:
+            errors = [f"CLI exited with status {exit_code}"]
+        common = {
+            "version": 1,
+            "exit_code": int(exit_code),
+            "success": exit_code == 0,
+            "cancelled": bool(getattr(stats, "cancelled", False)),
+        }
+        contract_exit = exit_code
+        if args.stats_json:
+            try:
+                _write_json_atomic(
+                    args.stats_json,
+                    {
+                        "format": "csv-power-tool-cli-stats",
+                        **common,
+                        "stats": stats_data,
+                    },
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                print(f"Error writing --stats-json: {exc}", file=sys.stderr)
+                contract_exit = 3
+        if args.errors_json:
+            try:
+                _write_json_atomic(
+                    args.errors_json,
+                    {
+                        "format": "csv-power-tool-cli-errors",
+                        **common,
+                        "errors": errors,
+                        "warnings": warnings,
+                        "fatal_input_errors": list(getattr(stats, "fatal_input_errors", [])),
+                    },
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                print(f"Error writing --errors-json: {exc}", file=sys.stderr)
+                contract_exit = 3
+        return contract_exit
 
     def current_workflow(input_files):
         patterns = args.inputs or [str(path) for path in input_files]
         metadata = {}
         if workflow_source:
             metadata["replay_source"] = str(workflow_source)
+        if "-" in patterns:
+            metadata["stdin_stream"] = True
+        metadata_input_files = [] if "-" in patterns else input_files
         return build_workflow(
             asdict(config),
             patterns,
-            output_path,
+            workflow_output_path,
             APP_VERSION,
-            input_files=input_files,
+            input_files=metadata_input_files,
             metadata=metadata,
         )
 
@@ -6782,7 +6937,7 @@ def cli_main(argv=None):
             print("Error: --join-on requires at least one key column", file=sys.stderr)
             return 3
         join_type = args.join_type or config.join_type
-        engine = CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg)
+        engine = track_engine(CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg))
         engine._manifest_input_files = [Path(path) for path in input_files]
         left_rows, left_columns = read_operation_file(engine, input_files[0])
         stages = []
@@ -6886,6 +7041,8 @@ def cli_main(argv=None):
         engine.stats.final_row_count = len(left_rows)
         engine._compute_column_summary(left_rows, [config.column_mapping.get(c, c) for c in left_columns])
         engine._write_output(left_rows, left_columns, output_path)
+        if not engine.stats.errors and not emit_stdout_output():
+            engine.stats.errors.append("stdout output failed")
         if not args.quiet:
             print(
                 f"  Joined rows: {engine.stats.final_row_count:,}; "
@@ -6893,7 +7050,9 @@ def cli_main(argv=None):
                 f"conflicts: {aggregate_report['conflict_count']:,}",
                 file=sys.stderr,
             )
-        return 3 if engine.stats.errors else 0
+        if engine.stats.cancelled:
+            return 130
+        return operation_exit(engine.stats)
 
     def run_three_way_merge():
         paths = [args.three_way_base, args.three_way_ours, args.three_way_theirs]
@@ -6902,7 +7061,7 @@ def cli_main(argv=None):
             return 3
         key_columns = list(args.key_columns or config.merge_key_columns)
         resolution = config.merge_conflict_resolution
-        engine = CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg)
+        engine = track_engine(CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg))
         engine._manifest_input_files = [Path(path) for path in paths]
         loaded = [read_operation_file(engine, path)[0] for path in paths]
         try:
@@ -6956,12 +7115,16 @@ def cli_main(argv=None):
         engine.stats.final_row_count = len(rows)
         engine._compute_column_summary(rows, columns)
         engine._write_output(rows, columns, output_path)
+        if not engine.stats.errors and not emit_stdout_output():
+            engine.stats.errors.append("stdout output failed")
         if conflicts and not args.quiet:
             print(
                 f"!! Three-way merge produced {len(conflicts):,} conflict group(s) using {resolution}",
                 file=sys.stderr,
             )
-        return 3 if engine.stats.errors else 0
+        if engine.stats.cancelled:
+            return 130
+        return operation_exit(engine.stats)
 
     def run_sql(input_files):
         query = args.sql
@@ -6974,7 +7137,7 @@ def cli_main(argv=None):
         if not query or not query.strip():
             print("Error: SQL query cannot be empty", file=sys.stderr)
             return 3
-        engine = CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg)
+        engine = track_engine(CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg))
         engine._manifest_input_files = [Path(path) for path in input_files]
         try:
             rows, columns = engine.sql_query(input_files, query)
@@ -6987,16 +7150,20 @@ def cli_main(argv=None):
         engine.stats.final_row_count = len(rows)
         engine._compute_column_summary(rows, columns)
         engine._write_output(rows, columns, output_path)
+        if not engine.stats.errors and not emit_stdout_output():
+            engine.stats.errors.append("stdout output failed")
         if not args.quiet:
             print(f"  SQL rows: {len(rows):,}", file=sys.stderr)
-        return 3 if engine.stats.errors else 0
+        if engine.stats.cancelled:
+            return 130
+        return operation_exit(engine.stats)
 
     def run_once(input_files):
         if not input_files:
             print("Error: No input files found", file=sys.stderr)
             return 1
 
-        engine = CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg)
+        engine = track_engine(CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg))
 
         if args.export_schema:
             all_rows = []
@@ -7012,7 +7179,7 @@ def cli_main(argv=None):
             if not args.quiet:
                 print(f"  Schema contract: {args.export_schema}", file=sys.stderr)
             if not args.output:
-                return 3 if engine.stats.errors else 0
+                return operation_exit(engine.stats)
 
         if config.schema_validate_only:
             stats = engine.validate_schema(input_files)
@@ -7023,7 +7190,7 @@ def cli_main(argv=None):
                     f"{report.get('valid_row_count', 0):,} valid row(s)",
                     file=sys.stderr,
                 )
-            return 3 if stats.errors else 0
+            return operation_exit(stats)
 
         if args.sql or args.sql_file:
             return run_sql(input_files)
@@ -7054,7 +7221,7 @@ def cli_main(argv=None):
                     file=sys.stderr,
                 )
             if not args.output:
-                return 3 if engine.stats.errors else 0
+                return operation_exit(engine.stats)
 
         if args.preview:
             preview = engine.preview(
@@ -7088,7 +7255,7 @@ def cli_main(argv=None):
                     file=sys.stderr,
                 )
             if not args.output:
-                return 3 if engine.stats.errors else 0
+                return operation_exit(engine.stats)
 
         if args.dedupe_preview:
             preview_report = build_dedupe_preview(engine, input_files)
@@ -7103,7 +7270,7 @@ def cli_main(argv=None):
                     file=sys.stderr,
                 )
             if not args.output:
-                return 3 if engine.stats.errors else 0
+                return operation_exit(engine.stats)
 
         if args.join_on or config.join_key_columns:
             return run_join(input_files)
@@ -7112,6 +7279,8 @@ def cli_main(argv=None):
             print(f"CSV Power Tool - Processing {len(input_files)} file(s)...", file=sys.stderr)
 
         stats = engine.process(input_files, output_path)
+        if not stats.errors and not emit_stdout_output():
+            stats.errors.append("stdout output failed")
 
         if not args.quiet:
             print("\nResults:", file=sys.stderr)
@@ -7121,13 +7290,15 @@ def cli_main(argv=None):
             print(f"  Rows filtered:      {stats.rows_filtered:,}", file=sys.stderr)
             print(f"  Duplicates removed: {stats.duplicates_removed:,}", file=sys.stderr)
             print(f"  Final row count:    {stats.final_row_count:,}", file=sys.stderr)
-            print(f"  Output: {output_path}", file=sys.stderr)
+            print(f"  Output: {'-' if stdout_output else output_path}", file=sys.stderr)
             if stats.schema_validation:
                 print(
                     f"  Schema errors:      {stats.schema_validation.get('error_count', 0):,}",
                     file=sys.stderr,
                 )
 
+        if stats.cancelled:
+            return 130
         if stats.files_processed == 0:
             return 1
         if stats.errors:
@@ -7135,8 +7306,10 @@ def cli_main(argv=None):
         return 0
 
     def execute_once(input_files, runner=None):
+        contract_state["engine"] = None
         if not input_files:
-            return run_once(input_files) if runner is None else runner(input_files)
+            exit_code = run_once(input_files) if runner is None else runner(input_files)
+            return emit_cli_contract(exit_code)
         workflow = current_workflow(input_files)
         try:
             if args.save_workflow:
@@ -7145,7 +7318,7 @@ def cli_main(argv=None):
                 print(f"  Workflow operations: {', '.join(operation_types(workflow))}", file=sys.stderr)
         except WorkflowError as exc:
             print(f"Error writing workflow: {exc}", file=sys.stderr)
-            return 3
+            return emit_cli_contract(3)
 
         exit_code = (runner or run_once)(input_files)
         if exit_code == 0 and args.workflow_history:
@@ -7158,8 +7331,8 @@ def cli_main(argv=None):
                     )
             except WorkflowError as exc:
                 print(f"Error writing workflow history: {exc}", file=sys.stderr)
-                return 3
-        return exit_code
+                exit_code = 3
+        return emit_cli_contract(exit_code)
 
     if args.three_way_base or args.three_way_ours or args.three_way_theirs:
         sys.exit(execute_once(
@@ -7198,16 +7371,16 @@ def cli_main(argv=None):
     if args.dry_run:
         if not input_files:
             print("Error: No input files found for dry-run", file=sys.stderr)
-            sys.exit(1)
+            sys.exit(emit_cli_contract(1))
         workflow = current_workflow(input_files)
         try:
             if args.save_workflow:
                 write_workflow(args.save_workflow, workflow)
         except WorkflowError as exc:
             print(f"Error writing workflow: {exc}", file=sys.stderr)
-            sys.exit(3)
+            sys.exit(emit_cli_contract(3))
         print(canonical_json(workflow), end="")
-        sys.exit(0)
+        sys.exit(emit_cli_contract(0))
     sys.exit(execute_once(input_files))
 
 

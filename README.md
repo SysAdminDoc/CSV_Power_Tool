@@ -86,6 +86,7 @@
 - Save and load configuration presets (JSON)
 - CLI mode with recursive inputs, filters, fuzzy dedupe, and watch mode
 - CLI pivot/unpivot reshaping and machine-readable schema reports
+- Stable CLI contracts with CSV/TSV/JSONL stdin/stdout pipes, JSON stats/error artifacts, and documented exit codes
 - DuckDB SQL mode over named input views and a loopback-only upload API
 - Optional Polars text backend for large in-memory jobs (`--backend polars`)
 - Bounded-memory streaming for text inputs when sort and dedupe are disabled
@@ -143,6 +144,8 @@ python CSV_Consolidator.py --inputs data/*.csv --collision-policy backup --outpu
 python CSV_Consolidator.py --inputs data/*.csv --output combined.csv --dry-run --save-workflow workflow.json
 python CSV_Consolidator.py --replay workflow.json
 python CSV_Consolidator.py --inputs data/*.csv --output combined.csv --workflow-history workflow-history.json
+type data.csv | python CSV_Consolidator.py --inputs - --stdin-format csv --output - --stdout-format csv --no-manifest
+python CSV_Consolidator.py --inputs data.csv --output combined.csv --stats-json stats.json --errors-json errors.json
 python CSV_Consolidator.py --serve --port 8765
 ```
 
@@ -161,6 +164,8 @@ Schema contracts use a documented first-version subset of the [Frictionless Tabl
 Join mode normalizes keys with `trim-casefold` by default without numeric coercion, preserving values such as `001`. Choose `--key-normalization exact|trim|casefold|trim-casefold` explicitly when needed. `--join-type` supports inner, left, right, outer/full, anti (left rows without a match), and semi (left rows with a match). Joins preserve left input order followed by right-only rows, report key presence, blank keys, duplicate-key cardinality, type mismatches, normalization coercions, unmatched rows, and shared-cell conflicts. Shared non-key values remain in both columns by default; `--join-conflict-policy fail` blocks a destructive run. `--join-report` exports the staged report, and the same report is embedded in the run manifest.
 
 Three-way merges require unique, present keys. Conflict resolution defaults to `fail`, writes no replacement output when conflicts exist, and requires an explicit `--conflict-resolution ours|theirs|base|mark` after review. `--merge-report` records base/ours/theirs values, conflict columns, duplicate/missing-key validation, type/coercion diagnostics, resolution policy, and deterministic ordering; merge diagnostics are also included in the run manifest.
+
+The CLI contract keeps human logs on stderr. `--inputs -` reads one CSV, TSV, or JSONL stream (`--stdin-format` selects the format), and `--output -` writes CSV, TSV, or JSONL bytes (`--stdout-format` selects the format); stream mode does not create a manifest. `--stats-json` writes a versioned `csv-power-tool-cli-stats` document and `--errors-json` writes a versioned `csv-power-tool-cli-errors` document with errors, warnings, fatal input diagnostics, cancellation, and exit status. Exit codes are stable: `0` success, `1` no matching input files, `2` argument/configuration error, `3` validation, processing, or artifact-write failure, and `130` explicit cancellation or Ctrl+C.
 
 ### Performance budgets and benchmark methodology
 
