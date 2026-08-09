@@ -10,6 +10,7 @@ All notable changes to CSV_Power_Tool will be documented in this file.
 - Testing: Added parser property fixtures, format/encoding coverage, cancellation checks, CLI contract tests, bounded performance coverage, and clean-package regression smoke tests.
 - Architecture: Added dependency-injected core, CLI, GUI, and loopback API seams while preserving the single-file launcher and existing command-line flags.
 - Workflow: Added versioned deterministic workflow documents, legacy-config migration, replay/dry-run CLI support, atomic bounded history, and GUI workflow metadata logging.
+- Schema: Added first-version Frictionless Table Schema contracts with strict/advisory/quarantine validation, inferred-schema export, machine-readable diagnostics, validation-only CLI execution, and manifest/report integration.
 
 ## [v3.2.0] - 2026-08-03
 

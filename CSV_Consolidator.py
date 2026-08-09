@@ -39,6 +39,16 @@ from csv_power_tool.workflow import (
     workflow_output,
     write_workflow,
 )
+from csv_power_tool.schema import (
+    SchemaError,
+    infer_schema,
+    load_schema,
+    normalize_schema,
+    validate_rows,
+    validation_report,
+    write_schema,
+    write_validation_report,
+)
 
 APP_NAME = "CSV Power Tool"
 APP_VERSION = "3.2.0"
@@ -201,6 +211,10 @@ class ProcessingConfig:
 
     # Schema unification
     schema_mode: str = "union"  # "union", "intersection", "first_file"
+    schema_contract: dict = field(default_factory=dict)
+    schema_validation_mode: str = "strict"  # "strict", "advisory", or "quarantine"
+    schema_validation_report_path: str = ""
+    schema_validate_only: bool = False
     column_template: str = ""  # Optional input file whose header defines output order
     source_column: str = ""  # Optional provenance column, e.g. "(Source)"
     source_value: str = "name"  # "name" or "path"
@@ -252,6 +266,7 @@ class ProcessingStats:
     cancelled: bool = False
     column_summary: dict = field(default_factory=dict)
     input_diagnostics: dict = field(default_factory=dict)
+    schema_validation: dict = field(default_factory=dict)
 
 
 class ConfigHistory:
@@ -877,6 +892,7 @@ class CSVEngine:
         self._reported_input_issues = {}
         self._quarantine_records = []
         self._manifest_input_files = []
+        self._schema_reports = []
 
     INPUT_POLICIES = {"fail", "warn", "quarantine"}
     MAX_QUARANTINE_RECORDS = 10_000
@@ -1065,6 +1081,94 @@ class CSVEngine:
             self.stats.errors.append(message)
             self.log(f"XX {message}", "error")
 
+    def _schema_validation_mode(self) -> str:
+        mode = str(getattr(self.config, "schema_validation_mode", "strict")).lower().strip()
+        return mode if mode in {"strict", "advisory", "quarantine"} else "strict"
+
+    def _schema_error_message(self, error: dict) -> str:
+        return (
+            f"{Path(error['file']).name}:{error['row']} {error['column']} "
+            f"violates {error['rule']} (observed {error['observed_value']!r})"
+        )
+
+    def _apply_schema_contract(self, file_path: Path, rows: list[dict]) -> list[dict]:
+        contract = getattr(self.config, "schema_contract", {})
+        if not contract:
+            return rows
+        try:
+            valid_rows, report = validate_rows(rows, contract, file_path)
+        except SchemaError as exc:
+            self._record_fatal_input(file_path, f"invalid schema contract: {exc}")
+            return rows
+
+        self._schema_reports.append(report)
+        if not report["errors"]:
+            return rows
+        mode = self._schema_validation_mode()
+        messages = [self._schema_error_message(error) for error in report["errors"]]
+        if mode == "strict":
+            for error, message in zip(report["errors"], messages):
+                self._record_fatal_input(file_path, message, error.get("row"))
+            return rows
+        if mode == "advisory":
+            self.stats.warnings.extend(messages)
+            return rows
+
+        invalid_indexes = set(report.get("_invalid_indexes", []))
+        self.stats.quarantined_rows += len(invalid_indexes)
+        for index in sorted(invalid_indexes):
+            raw = rows[index] if index < len(rows) else {}
+            self._quarantine_records.append({
+                "file": str(file_path),
+                "line": index + 2,
+                "reason": "schema validation",
+                "raw": json.dumps(raw, ensure_ascii=False, default=str)[:4096],
+            })
+        self.stats.warnings.extend(messages)
+        return valid_rows
+
+    def _write_schema_validation_report(self) -> None:
+        if not self._schema_reports:
+            return
+        report_path = str(getattr(self.config, "schema_validation_report_path", "") or "").strip()
+        if not report_path:
+            self.stats.schema_validation = validation_report(
+                self._schema_reports,
+                self._schema_validation_mode(),
+                self.config.schema_contract,
+            )
+            return
+        try:
+            report = validation_report(
+                self._schema_reports,
+                self._schema_validation_mode(),
+                self.config.schema_contract,
+            )
+            write_validation_report(report_path, report)
+            self.stats.schema_validation = report
+        except (OSError, SchemaError, TypeError, ValueError) as exc:
+            message = f"Schema validation report error: {exc}"
+            self.stats.errors.append(message)
+            self.log(f"XX {message}", "error")
+
+    def validate_schema(self, input_files: list[Path]) -> ProcessingStats:
+        """Validate inputs without writing output, for CLI validation-only mode."""
+        self.stats = ProcessingStats()
+        self._validated_inputs = {}
+        self._reported_input_issues = {}
+        self._quarantine_records = []
+        self._input_diagnostics = {}
+        self._manifest_input_files = [Path(path) for path in input_files]
+        self._schema_reports = []
+        for file_path in input_files:
+            all_columns = set()
+            column_order = []
+            rows = self._read_file(file_path, all_columns, column_order)
+            self._apply_schema_contract(Path(file_path), rows)
+        self._write_schema_validation_report()
+        self._write_quarantine()
+        return self.stats
+
     @staticmethod
     def _sha256_file(path: Path) -> str:
         digest = hashlib.sha256()
@@ -1177,6 +1281,7 @@ class CSVEngine:
                 "warnings": self.stats.warnings,
                 "errors": self.stats.errors,
                 "quarantined_rows": self.stats.quarantined_rows,
+                "schema_validation": self.stats.schema_validation,
             },
         }
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1611,6 +1716,7 @@ class CSVEngine:
         self._quarantine_records = []
         self._input_diagnostics = {}
         self._manifest_input_files = [Path(path) for path in input_files]
+        self._schema_reports = []
 
         if self._can_stream(input_files, output_file):
             return self._process_streaming(input_files, output_file)
@@ -1635,6 +1741,7 @@ class CSVEngine:
             self.update_progress(progress, f"Reading {csv_path.name}...")
 
             rows_from_file = self._read_file(csv_path, all_columns, column_order)
+            rows_from_file = self._apply_schema_contract(Path(csv_path), rows_from_file)
             # Track which columns this file contributed
             # We need all columns that appeared in this file's headers
             file_cols = set()
@@ -1643,6 +1750,7 @@ class CSVEngine:
             per_file_columns.append(file_cols)
             all_rows.extend(rows_from_file)
 
+        self._write_schema_validation_report()
         self._write_quarantine()
         if self.stats.fatal_input_errors:
             self.log("Input validation failed; no output was written", "error")
@@ -1728,6 +1836,8 @@ class CSVEngine:
         if self.config.dedupe_enabled or self.config.sort_enabled:
             return False
         if getattr(self.config, "unpivot_columns", None) or getattr(self.config, "pivot_column", ""):
+            return False
+        if getattr(self.config, "schema_contract", None):
             return False
         if output_file.suffix.lower() not in SUPPORTED_STREAM_SUFFIXES:
             return False
@@ -5126,6 +5236,13 @@ def cli_main(argv=None):
     parser.add_argument("--source-column", help="Add a provenance column containing each source file")
     parser.add_argument("--source-path", action="store_true", help="Store the full source path instead of the file name")
     parser.add_argument("--schema-report", help="Write a JSON schema-drift, sample, and type report")
+    parser.add_argument("--schema-contract", help="Validate inputs against a Frictionless Table Schema JSON file")
+    parser.add_argument("--export-schema", help="Infer and write a first-version Frictionless Table Schema JSON file")
+    parser.add_argument("--validation-mode", choices=["strict", "advisory", "quarantine"], default=None,
+                        help="Schema contract handling: fail, warn, or omit invalid rows")
+    parser.add_argument("--validation-report", help="Write a machine-readable schema validation report")
+    parser.add_argument("--validate-only", action="store_true",
+                        help="Validate against --schema-contract without writing processed output")
     parser.add_argument("--sql", help="Run DuckDB SQL against input_0, input_1, ...")
     parser.add_argument("--sql-file", help="Read the DuckDB SQL query from a UTF-8 file")
     parser.add_argument("--redact-sensitive", action="store_true", help="Redact likely email, phone, SSN, card, and secret fields")
@@ -5184,9 +5301,10 @@ def cli_main(argv=None):
         except WorkflowError as exc:
             parser.error(str(exc))
 
-    if not args.serve and not args.inputs and not args.dry_run:
+    if not args.serve and not args.inputs and not args.dry_run and not args.validate_only and not args.export_schema:
         parser.error("--inputs, --config, or --replay is required unless --register-git-driver is used")
-    if not args.serve and not args.dry_run and not args.output and not args.dedupe_preview:
+    if not args.serve and not args.dry_run and not args.output and not args.dedupe_preview \
+            and not args.validate_only and not args.export_schema:
         parser.error("--output is required unless --dry-run or --dedupe-preview is used")
     if (args.join_on or args.three_way_base or args.three_way_ours or args.three_way_theirs) and not args.output:
         parser.error("--output is required for join and three-way merge operations")
@@ -5232,6 +5350,26 @@ def cli_main(argv=None):
         except WorkflowError as e:
             print(f"Error loading config: {e}", file=sys.stderr)
             sys.exit(3)
+
+    if args.schema_contract:
+        try:
+            config.schema_contract = load_schema(args.schema_contract)
+        except SchemaError as exc:
+            parser.error(str(exc))
+    elif config.schema_contract:
+        try:
+            config.schema_contract = normalize_schema(config.schema_contract)
+        except SchemaError as exc:
+            parser.error(str(exc))
+    if args.validation_mode is not None:
+        config.schema_validation_mode = args.validation_mode
+    if args.validation_report:
+        config.schema_validation_report_path = args.validation_report
+    if args.validate_only:
+        config.schema_validate_only = True
+    if (args.validation_mode is not None or args.validation_report or config.schema_validate_only) \
+            and not config.schema_contract:
+        parser.error("--schema-contract or a workflow schema_contract is required for schema validation")
 
     # Apply CLI overrides
     if args.delimiter:
@@ -5485,6 +5623,33 @@ def cli_main(argv=None):
 
         engine = CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg)
 
+        if args.export_schema:
+            all_rows = []
+            all_columns = set()
+            column_order = []
+            for path in input_files:
+                all_rows.extend(engine._read_file(path, all_columns, column_order))
+            try:
+                write_schema(args.export_schema, infer_schema(all_rows, column_order))
+            except (OSError, SchemaError, ValueError) as exc:
+                print(f"Error exporting schema: {exc}", file=sys.stderr)
+                return 3
+            if not args.quiet:
+                print(f"  Schema contract: {args.export_schema}", file=sys.stderr)
+            if not args.output:
+                return 3 if engine.stats.errors else 0
+
+        if config.schema_validate_only:
+            stats = engine.validate_schema(input_files)
+            if not args.quiet:
+                report = stats.schema_validation
+                print(
+                    f"  Schema validation: {report.get('error_count', 0):,} error(s), "
+                    f"{report.get('valid_row_count', 0):,} valid row(s)",
+                    file=sys.stderr,
+                )
+            return 3 if stats.errors else 0
+
         if args.sql or args.sql_file:
             return run_sql(input_files)
 
@@ -5525,6 +5690,11 @@ def cli_main(argv=None):
             print(f"  Duplicates removed: {stats.duplicates_removed:,}", file=sys.stderr)
             print(f"  Final row count:    {stats.final_row_count:,}", file=sys.stderr)
             print(f"  Output: {output_path}", file=sys.stderr)
+            if stats.schema_validation:
+                print(
+                    f"  Schema errors:      {stats.schema_validation.get('error_count', 0):,}",
+                    file=sys.stderr,
+                )
 
         if stats.files_processed == 0:
             return 1
