@@ -226,6 +226,8 @@ class CLIContractTests(unittest.TestCase):
         self.assertIn("--invalid-row-policy", result.stdout)
         self.assertIn("--collision-policy", result.stdout)
         self.assertIn("--no-manifest", result.stdout)
+        self.assertIn("--profile", result.stdout)
+        self.assertIn("--repair-edits", result.stdout)
 
     def test_cli_dry_run_and_workflow_replay(self):
         with tempfile.TemporaryDirectory() as temp_dir:

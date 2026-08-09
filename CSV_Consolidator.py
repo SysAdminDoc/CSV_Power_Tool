@@ -49,6 +49,15 @@ from csv_power_tool.schema import (
     write_schema,
     write_validation_report,
 )
+from csv_power_tool.quality import (
+    QualityError,
+    QualityProfiler,
+    apply_repairs,
+    infer_value_type,
+    load_repairs,
+    normalize_repairs,
+    write_quality_report,
+)
 
 APP_NAME = "CSV Power Tool"
 APP_VERSION = "3.2.0"
@@ -274,6 +283,12 @@ class ProcessingConfig:
     # Data-quality and privacy helpers
     redact_sensitive: bool = False
     redaction_token: str = "[REDACTED]"
+    quality_scan_rows: int = 100_000
+    quality_facet_limit: int = 20
+    quality_max_distinct_values: int = 100_000
+    quality_sample_limit: int = 5
+    repair_edits: list = field(default_factory=list)
+    repair_report_path: str = ""
 
     # Dataframe backend
     engine_backend: str = "auto"  # "auto", "python", or "polars"
@@ -310,6 +325,8 @@ class ProcessingStats:
     column_summary: dict = field(default_factory=dict)
     input_diagnostics: dict = field(default_factory=dict)
     schema_validation: dict = field(default_factory=dict)
+    quality_profile: dict = field(default_factory=dict)
+    repair_report: dict = field(default_factory=dict)
 
 
 class ConfigHistory:
@@ -936,6 +953,7 @@ class CSVEngine:
         self._quarantine_records = []
         self._manifest_input_files = []
         self._schema_reports = []
+        self._repair_report = {}
 
     INPUT_POLICIES = {"fail", "warn", "quarantine"}
     MAX_QUARANTINE_RECORDS = 10_000
@@ -1194,6 +1212,35 @@ class CSVEngine:
             self.stats.errors.append(message)
             self.log(f"XX {message}", "error")
 
+    def _apply_reviewed_repairs(self, rows: list[dict]) -> list[dict]:
+        edits = getattr(self.config, "repair_edits", []) or []
+        if not edits:
+            return rows
+        try:
+            repaired, report = apply_repairs(rows, edits)
+        except QualityError as exc:
+            message = f"Repair validation failed: {exc}"
+            self.stats.errors.append(message)
+            self.log(f"XX {message}", "error")
+            return rows
+        report["input_rows"] = len(rows)
+        self._repair_report = report
+        self.stats.repair_report = report
+        return repaired
+
+    def _write_repair_report(self) -> None:
+        if not self._repair_report:
+            return
+        report_path = str(getattr(self.config, "repair_report_path", "") or "").strip()
+        if not report_path:
+            return
+        try:
+            write_quality_report(report_path, self._repair_report)
+        except (OSError, TypeError, ValueError) as exc:
+            message = f"Repair report error: {exc}"
+            self.stats.errors.append(message)
+            self.log(f"XX {message}", "error")
+
     def validate_schema(self, input_files: list[Path]) -> ProcessingStats:
         """Validate inputs without writing output, for CLI validation-only mode."""
         self.stats = ProcessingStats()
@@ -1203,6 +1250,7 @@ class CSVEngine:
         self._input_diagnostics = {}
         self._manifest_input_files = [Path(path) for path in input_files]
         self._schema_reports = []
+        self._repair_report = {}
         for file_path in input_files:
             all_columns = set()
             column_order = []
@@ -1211,6 +1259,127 @@ class CSVEngine:
         self._write_schema_validation_report()
         self._write_quarantine()
         return self.stats
+
+    def profile(
+        self,
+        input_files: list[Path],
+        scan_limit: int | None = None,
+        facet_limit: int | None = None,
+        max_distinct_values: int | None = None,
+        sample_limit: int | None = None,
+        filter_column: str | None = None,
+        filter_value: str | None = None,
+    ) -> dict:
+        """Build an incremental quality profile without materializing all rows."""
+        self.stats = ProcessingStats()
+        self.cancelled = False
+        maximum = max(1, int(scan_limit or getattr(self.config, "quality_scan_rows", 100_000)))
+        profiler = QualityProfiler(
+            facet_limit=facet_limit or getattr(self.config, "quality_facet_limit", 20),
+            max_distinct_values=max_distinct_values or getattr(
+                self.config, "quality_max_distinct_values", 100_000
+            ),
+            sample_limit=sample_limit or getattr(self.config, "quality_sample_limit", 5),
+        )
+        if filter_column is not None:
+            filter_column = str(filter_column).strip()
+            if not filter_column:
+                filter_column = None
+        filter_text = "" if filter_value is None else str(filter_value)
+        scanned = 0
+        truncated = False
+        files_scanned = 0
+        for file_index, raw_path in enumerate(input_files):
+            if self.cancelled:
+                break
+            path = Path(raw_path)
+            try:
+                iterator = self._preview_row_iterator(
+                    path,
+                    batch_size=min(maximum - scanned, int(getattr(self.config, "stream_batch_rows", 2_048))),
+                )
+                for row in iterator:
+                    if self.cancelled:
+                        break
+                    if scanned >= maximum:
+                        truncated = True
+                        break
+                    if filter_column is None or self._cell_to_text(row.get(filter_column, "")) == filter_text:
+                        profiler.add_row(row)
+                    scanned += 1
+                    if scanned % 256 == 0:
+                        self.update_progress(
+                            ((file_index + 0.5) / max(1, len(input_files))) * 100,
+                            f"Profiling {path.name} ({scanned:,} row(s))",
+                        )
+                else:
+                    files_scanned += 1
+            except (OSError, RuntimeError, ValueError, UnicodeDecodeError) as exc:
+                self._record_fatal_input(path, f"quality profile failed: {exc}")
+            if scanned >= maximum:
+                truncated = True
+                break
+            self.update_progress(
+                ((file_index + 1) / max(1, len(input_files))) * 100,
+                f"Profiled {path.name} ({scanned:,} row(s))",
+            )
+
+        report = profiler.report(
+            bounded=True,
+            scan_limit=maximum,
+            scan_truncated=truncated,
+        )
+        report["source_rows_scanned"] = scanned
+        if filter_column is not None:
+            report["facet_filter"] = {
+                "column": str(filter_column),
+                "value": "" if filter_value is None else str(filter_value),
+            }
+        report["files_scanned"] = files_scanned
+        report["files_remaining"] = max(0, len(input_files) - files_scanned)
+        report["cancelled"] = self.cancelled
+        self.stats.files_processed = files_scanned
+        self.stats.total_rows_read = scanned
+        self.stats.quality_profile = report
+        self.update_progress(100, "Quality profile ready")
+        return report
+
+    def inspect_row(self, input_files: list[Path], row_number: int) -> dict | None:
+        """Read one global row with raw text and advisory type interpretations."""
+        try:
+            requested = int(row_number)
+        except (TypeError, ValueError) as exc:
+            raise QualityError("Inspected row must be a positive integer") from exc
+        if requested < 1:
+            raise QualityError("Inspected row must be a positive integer")
+
+        raw_config = copy.deepcopy(self.config)
+        raw_config.trim_whitespace = False
+        raw_config.repair_edits = []
+        inspector = CSVEngine(raw_config)
+        current = 0
+        for raw_path in input_files:
+            path = Path(raw_path)
+            iterator = inspector._preview_row_iterator(path, batch_size=1)
+            for row in iterator:
+                current += 1
+                if current != requested:
+                    continue
+                values = []
+                for column, value in row.items():
+                    text_value = inspector._cell_to_text(value)
+                    values.append({
+                        "column": str(column),
+                        "raw": text_value,
+                        "inferred_type": infer_value_type(text_value),
+                    })
+                return {
+                    "row_number": requested,
+                    "source_file": str(path),
+                    "values": values,
+                    "raw_text_preserved": True,
+                }
+        return None
 
     @staticmethod
     def _sha256_file(path: Path) -> str:
@@ -1325,6 +1494,8 @@ class CSVEngine:
                 "errors": self.stats.errors,
                 "quarantined_rows": self.stats.quarantined_rows,
                 "schema_validation": self.stats.schema_validation,
+                "quality_profile": self.stats.quality_profile,
+                "repair_report": self.stats.repair_report,
             },
         }
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1760,6 +1931,7 @@ class CSVEngine:
         self._input_diagnostics = {}
         self._manifest_input_files = [Path(path) for path in input_files]
         self._schema_reports = []
+        self._repair_report = {}
 
         if self._can_stream(input_files, output_file):
             return self._process_streaming(input_files, output_file)
@@ -1797,6 +1969,12 @@ class CSVEngine:
         self._write_quarantine()
         if self.stats.fatal_input_errors:
             self.log("Input validation failed; no output was written", "error")
+            return self.stats
+
+        all_rows = self._apply_reviewed_repairs(all_rows)
+        self._write_repair_report()
+        if self.stats.errors:
+            self.log("Quality repair failed; no output was written", "error")
             return self.stats
 
         if not all_rows:
@@ -1881,6 +2059,8 @@ class CSVEngine:
         if getattr(self.config, "unpivot_columns", None) or getattr(self.config, "pivot_column", ""):
             return False
         if getattr(self.config, "schema_contract", None):
+            return False
+        if getattr(self.config, "repair_edits", None):
             return False
         if output_file.suffix.lower() not in SUPPORTED_STREAM_OUTPUT_SUFFIXES:
             return False
@@ -4895,6 +5075,347 @@ class PreviewPanel(ctk.CTkFrame):
         self.status_label.configure(text=message)
 
 
+class QualityPanel(ctk.CTkFrame):
+    """Faceted quality profile, raw-row inspector, and reviewed repairs."""
+
+    @staticmethod
+    def format_profile(report: dict | None, query: str = "") -> str:
+        if not report:
+            return "No quality profile yet. Select files and choose Profile."
+        query = str(query or "").strip().lower()
+        source_rows = report.get("source_rows_scanned", report.get("rows_scanned", 0))
+        rows = report.get("rows_scanned", 0)
+        header = [
+            f"Rows profiled: {rows:,} | source rows scanned: {source_rows:,}",
+            f"Bounded scan: {'yes' if report.get('bounded') else 'no'} | "
+            f"truncated: {'yes' if report.get('scan_truncated') else 'no'}",
+        ]
+        facet_filter = report.get("facet_filter")
+        if facet_filter:
+            header.append(
+                f"Facet filter: {facet_filter.get('column', '')}={facet_filter.get('value', '')!r}"
+            )
+        lines = header + ["", "Column quality signals (raw text is preserved; types are advisory):"]
+        visible = 0
+        for column in report.get("columns", []):
+            facets = column.get("facets", [])
+            searchable = " ".join([
+                str(column.get("name", "")),
+                *(str(item.get("value", "")) for item in facets),
+            ]).lower()
+            if query and query not in searchable:
+                continue
+            visible += 1
+            numeric = column.get("numeric")
+            numeric_text = ""
+            if numeric:
+                numeric_text = (
+                    f" numeric=count:{numeric.get('count', 0):,}"
+                    f" min:{numeric.get('min')} max:{numeric.get('max')}"
+                    f" mean:{numeric.get('mean')}"
+                )
+            lines.append(
+                f"{column.get('name', '')} | rows={column.get('row_count', 0):,}"
+                f" non-empty={column.get('non_empty_count', 0):,}"
+                f" blank={column.get('blank_count', 0):,}"
+                f" null={column.get('null_count', 0):,}"
+                f" unique={column.get('unique_count', 0):,}"
+                f"{' (lower bound)' if not column.get('unique_count_exact', True) else ''}"
+                f" type={column.get('inferred_type', 'empty')}"
+                f" confidence={column.get('type_confidence', 0):.1%}{numeric_text}"
+            )
+            samples = column.get("raw_samples", column.get("samples", []))
+            lines.append(f"  samples: {', '.join(repr(value) for value in samples) or '(none)'}")
+            facet_text = ", ".join(
+                f"{item.get('value', '')!r} ({item.get('count', 0):,})" for item in facets
+            ) or "(none)"
+            if column.get("facets_truncated"):
+                facet_text += ", ..."
+            lines.append(f"  facets: {facet_text}")
+        if not visible:
+            lines.append("(no columns match the current filter)")
+        return "\n".join(lines)
+
+    def __init__(
+        self,
+        master,
+        on_profile: Callable = None,
+        on_inspect: Callable = None,
+        on_edit: Callable = None,
+        **kwargs,
+    ):
+        if "fg_color" not in kwargs:
+            kwargs["fg_color"] = COLORS["bg_secondary"]
+        if "corner_radius" not in kwargs:
+            kwargs["corner_radius"] = 8
+        super().__init__(master, **kwargs)
+        self.on_profile = on_profile
+        self.on_inspect = on_inspect
+        self.on_edit = on_edit
+        self.profile_report = None
+        self.repair_edits = []
+
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=12, pady=(10, 4))
+        ctk.CTkLabel(
+            header, text="Data Quality",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=COLORS["text_primary"],
+        ).pack(side="left")
+        ctk.CTkButton(
+            header, text="Profile", width=72, height=25,
+            font=ctk.CTkFont(size=10), fg_color=COLORS["accent_blue"],
+            hover_color=COLORS["accent_blue_hover"], corner_radius=5,
+            command=lambda: self.on_profile() if self.on_profile else None,
+        ).pack(side="right")
+
+        ctk.CTkLabel(
+            self,
+            text="Inspect distributions, drill into a facet, and record exact reviewed text edits."
+                 " The global Undo/Redo controls include these edits.",
+            font=ctk.CTkFont(size=10), text_color=COLORS["text_muted"],
+            anchor="w", justify="left", wraplength=500,
+        ).pack(fill="x", padx=12, pady=(0, 6))
+
+        filter_row = ctk.CTkFrame(self, fg_color="transparent")
+        filter_row.pack(fill="x", padx=12, pady=(0, 5))
+        self.profile_filter = ctk.CTkEntry(
+            filter_row, width=170, height=28,
+            placeholder_text="Find column or facet",
+            font=ctk.CTkFont(size=10), fg_color=COLORS["bg_dark"],
+            border_color=COLORS["border"], text_color=COLORS["text_primary"],
+        )
+        self.profile_filter.pack(side="left", padx=(0, 5))
+        self.facet_filter = ctk.CTkEntry(
+            filter_row, width=190, height=28,
+            placeholder_text="Facet filter: column=value",
+            font=ctk.CTkFont(size=10), fg_color=COLORS["bg_dark"],
+            border_color=COLORS["border"], text_color=COLORS["text_primary"],
+        )
+        self.facet_filter.pack(side="left")
+        self.profile_filter.bind("<KeyRelease>", lambda _event: self._render_profile())
+
+        self.profile_status = ctk.CTkLabel(
+            self, text="No profile loaded", font=ctk.CTkFont(size=10),
+            text_color=COLORS["text_muted"], anchor="w",
+        )
+        self.profile_status.pack(fill="x", padx=12, pady=(0, 3))
+        self.profile_text = ctk.CTkTextbox(
+            self, height=220, fg_color=COLORS["bg_dark"],
+            text_color=COLORS["text_primary"],
+            font=ctk.CTkFont(family="Consolas", size=9), corner_radius=6,
+        )
+        self.profile_text.pack(fill="both", expand=True, padx=12, pady=(0, 7))
+        self.profile_text.configure(state="disabled")
+
+        inspect_header = ctk.CTkFrame(self, fg_color="transparent")
+        inspect_header.pack(fill="x", padx=12, pady=(0, 3))
+        ctk.CTkLabel(
+            inspect_header, text="Row inspection (global 1-based row)",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=COLORS["text_secondary"], anchor="w",
+        ).pack(side="left")
+        self.inspect_row_entry = ctk.CTkEntry(
+            inspect_header, width=70, height=25, placeholder_text="Row",
+            font=ctk.CTkFont(size=10), fg_color=COLORS["bg_dark"],
+            border_color=COLORS["border"], text_color=COLORS["text_primary"],
+        )
+        self.inspect_row_entry.insert(0, "1")
+        self.inspect_row_entry.pack(side="right", padx=(5, 0))
+        ctk.CTkButton(
+            inspect_header, text="Inspect", width=65, height=25,
+            font=ctk.CTkFont(size=10), fg_color=COLORS["bg_tertiary"],
+            hover_color=COLORS["bg_hover"], text_color=COLORS["text_secondary"],
+            corner_radius=5,
+            command=lambda: self.on_inspect(self.inspect_row_entry.get()) if self.on_inspect else None,
+        ).pack(side="right")
+        self.inspection_text = ctk.CTkTextbox(
+            self, height=72, fg_color=COLORS["bg_dark"],
+            text_color=COLORS["text_secondary"],
+            font=ctk.CTkFont(family="Consolas", size=9), corner_radius=6,
+        )
+        self.inspection_text.pack(fill="x", padx=12, pady=(0, 7))
+        self.inspection_text.configure(state="disabled")
+
+        repair_header = ctk.CTkFrame(self, fg_color="transparent")
+        repair_header.pack(fill="x", padx=12, pady=(0, 3))
+        ctk.CTkLabel(
+            repair_header, text="Reviewed repairs (text replacements)",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=COLORS["text_secondary"], anchor="w",
+        ).pack(side="left")
+        ctk.CTkLabel(
+            repair_header, text="Raw text is compared when Expected is set",
+            font=ctk.CTkFont(size=9), text_color=COLORS["text_muted"], anchor="e",
+        ).pack(side="right")
+
+        repair_form = ctk.CTkFrame(self, fg_color="transparent")
+        repair_form.pack(fill="x", padx=12, pady=(0, 4))
+        fields = (
+            ("Row", 48), ("Column", 100), ("Expected old", 120),
+            ("Replacement", 120), ("Reason", 120),
+        )
+        self.repair_entries = []
+        for placeholder, width in fields:
+            entry = ctk.CTkEntry(
+                repair_form, width=width, height=27, placeholder_text=placeholder,
+                font=ctk.CTkFont(size=9), fg_color=COLORS["bg_dark"],
+                border_color=COLORS["border"], text_color=COLORS["text_primary"],
+            )
+            entry.pack(side="left", padx=(0, 3))
+            self.repair_entries.append(entry)
+        ctk.CTkButton(
+            repair_form, text="Add", width=50, height=27,
+            font=ctk.CTkFont(size=9), fg_color=COLORS["accent_green"],
+            hover_color=COLORS["accent_green_hover"], corner_radius=5,
+            command=self._add_repair,
+        ).pack(side="left")
+
+        repair_actions = ctk.CTkFrame(self, fg_color="transparent")
+        repair_actions.pack(fill="x", padx=12, pady=(0, 3))
+        self.remove_index = ctk.CTkEntry(
+            repair_actions, width=55, height=25, placeholder_text="#",
+            font=ctk.CTkFont(size=9), fg_color=COLORS["bg_dark"],
+            border_color=COLORS["border"], text_color=COLORS["text_primary"],
+        )
+        self.remove_index.pack(side="right", padx=(4, 0))
+        ctk.CTkButton(
+            repair_actions, text="Remove #", width=72, height=25,
+            font=ctk.CTkFont(size=9), fg_color=COLORS["bg_tertiary"],
+            hover_color=COLORS["accent_red"], text_color=COLORS["text_secondary"],
+            corner_radius=5, command=self._remove_repair,
+        ).pack(side="right")
+        self.repair_text = ctk.CTkTextbox(
+            self, height=68, fg_color=COLORS["bg_dark"],
+            text_color=COLORS["text_secondary"],
+            font=ctk.CTkFont(family="Consolas", size=9), corner_radius=6,
+        )
+        self.repair_text.pack(fill="x", padx=12, pady=(0, 4))
+        self.repair_text.configure(state="disabled")
+        self.status_label = ctk.CTkLabel(
+            self, text="Reviewed edits are applied before filters/transforms and written to the manifest.",
+            font=ctk.CTkFont(size=9), text_color=COLORS["text_muted"], anchor="w",
+        )
+        self.status_label.pack(fill="x", padx=12, pady=(0, 8))
+
+    def _set_text(self, widget, value: str):
+        widget.configure(state="normal")
+        widget.delete("1.0", END)
+        widget.insert("1.0", value)
+        widget.configure(state="disabled")
+
+    def _render_profile(self):
+        query = self.profile_filter.get() if hasattr(self, "profile_filter") else ""
+        self._set_text(self.profile_text, self.format_profile(self.profile_report, query))
+
+    def _render_repairs(self):
+        if not self.repair_edits:
+            text = "(no reviewed edits)"
+        else:
+            text = "\n".join(
+                f"{index}. row={edit['row']} column={edit['column']!r} "
+                f"expected={edit.get('expected_old')!r} replacement={edit['value']!r} "
+                f"reason={edit.get('reason', '')!r}"
+                for index, edit in enumerate(self.repair_edits, 1)
+            )
+        self._set_text(self.repair_text, text)
+
+    def _add_repair(self):
+        row_entry, column_entry, expected_entry, replacement_entry, reason_entry = self.repair_entries
+        try:
+            row = int(row_entry.get().strip())
+        except ValueError:
+            self.status_label.configure(text="Repair row must be a positive integer")
+            return
+        edit = {
+            "row": row,
+            "column": column_entry.get(),
+            "value": replacement_entry.get(),
+            "reason": reason_entry.get() or "reviewed correction",
+        }
+        if expected_entry.get() != "":
+            edit["expected_old"] = expected_entry.get()
+        try:
+            self.repair_edits = normalize_repairs(self.repair_edits + [edit])
+        except QualityError as exc:
+            self.status_label.configure(text=f"Repair not added: {exc}")
+            return
+        self._render_repairs()
+        for entry in self.repair_entries:
+            entry.delete(0, END)
+        if self.on_edit:
+            self.on_edit(self.get_edits())
+        self.status_label.configure(text=f"Recorded {len(self.repair_edits):,} reviewed edit(s)")
+
+    def _remove_repair(self):
+        try:
+            index = int(self.remove_index.get().strip())
+        except ValueError:
+            self.status_label.configure(text="Remove # must be a positive edit number")
+            return
+        if index < 1 or index > len(self.repair_edits):
+            self.status_label.configure(text="That reviewed edit number does not exist")
+            return
+        del self.repair_edits[index - 1]
+        self.remove_index.delete(0, END)
+        self._render_repairs()
+        if self.on_edit:
+            self.on_edit(self.get_edits())
+        self.status_label.configure(text=f"Recorded {len(self.repair_edits):,} reviewed edit(s)")
+
+    def get_edits(self) -> list[dict]:
+        return copy.deepcopy(self.repair_edits)
+
+    def set_edits(self, edits) -> None:
+        try:
+            self.repair_edits = normalize_repairs(edits or [])
+        except QualityError as exc:
+            self.repair_edits = []
+            self.status_label.configure(text=f"Invalid saved repairs: {exc}")
+        self._render_repairs()
+
+    def get_facet_filter(self) -> tuple[str | None, str | None]:
+        value = self.facet_filter.get().strip()
+        if not value:
+            return None, None
+        if "=" not in value:
+            raise QualityError("Facet filter must use column=value")
+        column, facet = value.split("=", 1)
+        if not column.strip():
+            raise QualityError("Facet filter column cannot be empty")
+        return column.strip(), facet
+
+    def update_profile(self, report: dict):
+        self.profile_report = copy.deepcopy(report)
+        self._render_profile()
+        source_rows = report.get("source_rows_scanned", report.get("rows_scanned", 0))
+        self.profile_status.configure(
+            text=f"Profile ready: {report.get('rows_scanned', 0):,} matching row(s), "
+                 f"{source_rows:,} source row(s) scanned"
+        )
+
+    def update_inspection(self, inspection: dict | None):
+        if not inspection:
+            self._set_text(self.inspection_text, "No matching row was found.")
+            return
+        lines = [
+            f"row {inspection['row_number']:,} | source: {inspection['source_file']}",
+            "column                  raw text                              inferred type",
+        ]
+        for value in inspection.get("values", []):
+            raw = str(value.get("raw", "")).replace("\r", "\\r").replace("\n", "\\n")
+            lines.append(
+                f"{value.get('column', '')[:22]:22} {raw[:36]!r:38} {value.get('inferred_type', 'empty')}"
+            )
+        self._set_text(self.inspection_text, "\n".join(lines))
+
+    def reset_profile(self):
+        self.profile_report = None
+        self._render_profile()
+        self._set_text(self.inspection_text, "Select a row to inspect source text.")
+        self.profile_status.configure(text="No profile loaded")
+
+
 class StatsPanel(ctk.CTkFrame):
     """Processing statistics display."""
     
@@ -4996,6 +5517,8 @@ class CSVPowerToolApp:
         self._preview_job = None
         self._preview_generation = 0
         self._preview_engine = None
+        self._quality_generation = 0
+        self._quality_engine = None
         self.history = None
         self.workflow_history_path = Path.home() / ".csv-power-tool" / "workflow-history.json"
         
@@ -5086,6 +5609,7 @@ class CSVPowerToolApp:
         tab_dedupe = self.tabview.add("Dedupe")
         tab_filter = self.tabview.add("Filter")
         tab_transform = self.tabview.add("Transform")
+        tab_quality = self.tabview.add("Quality")
         tab_output = self.tabview.add("Output")
         
         # Tab contents
@@ -5105,6 +5629,15 @@ class CSVPowerToolApp:
         
         self.transform_panel = TransformPanel(tab_transform, fg_color="transparent")
         self.transform_panel.pack(fill="both", expand=True)
+
+        self.quality_panel = QualityPanel(
+            tab_quality,
+            on_profile=self._profile_quality,
+            on_inspect=self._inspect_quality_row,
+            on_edit=self._quality_edits_changed,
+            fg_color="transparent",
+        )
+        self.quality_panel.pack(fill="both", expand=True)
         
         self.output_panel = OutputPanel(tab_output, fg_color="transparent")
         self.output_panel.pack(fill="both", expand=True)
@@ -5235,9 +5768,13 @@ class CSVPowerToolApp:
             self.dedupe_panel.set_columns(columns)
             self.filter_panel.set_columns(columns)
             self.transform_panel.set_columns(columns)
+            if hasattr(self, "quality_panel"):
+                self.quality_panel.reset_profile()
             self._schedule_preview()
         else:
             self.preview_panel.reset()
+            if hasattr(self, "quality_panel"):
+                self.quality_panel.reset_profile()
 
     def _set_appearance_mode(self, value: str):
         mode = value.lower()
@@ -5323,7 +5860,124 @@ class CSVPowerToolApp:
                     self._preview_engine = None
 
         threading.Thread(target=run, daemon=True).start()
-    
+
+    def _profile_quality(self):
+        if self.processing:
+            self.quality_panel.profile_status.configure(text="Finish or cancel processing before profiling")
+            return
+        if not self.file_panel.files:
+            self.quality_panel.profile_status.configure(text="Add files before profiling")
+            return
+        try:
+            filter_column, filter_value = self.quality_panel.get_facet_filter()
+        except QualityError as exc:
+            self.quality_panel.profile_status.configure(text=str(exc))
+            return
+        if self._quality_engine is not None:
+            self._quality_engine.cancel()
+        self._quality_generation += 1
+        generation = self._quality_generation
+        files = list(self.file_panel.files)
+        config = self._build_config()
+        self.quality_panel.profile_status.configure(text="Profiling bounded raw rows…")
+
+        def progress(value, status):
+            self.root.after(
+                0,
+                lambda: self.quality_panel.profile_status.configure(
+                    text=f"{status} ({value:.0f}%)"
+                ) if generation == self._quality_generation else None,
+            )
+
+        def run():
+            quality_engine = CSVEngine(config, progress_callback=progress)
+            self._quality_engine = quality_engine
+            try:
+                report = quality_engine.profile(
+                    files,
+                    scan_limit=config.quality_scan_rows,
+                    facet_limit=config.quality_facet_limit,
+                    max_distinct_values=config.quality_max_distinct_values,
+                    sample_limit=config.quality_sample_limit,
+                    filter_column=filter_column,
+                    filter_value=filter_value,
+                )
+                self.root.after(
+                    0,
+                    lambda: self.quality_panel.update_profile(report)
+                    if generation == self._quality_generation else None,
+                )
+                if quality_engine.stats.errors:
+                    message = quality_engine.stats.errors[0]
+                    self.root.after(
+                        0,
+                        lambda: self.quality_panel.profile_status.configure(
+                            text=f"Profile completed with an input error: {message}"
+                        ) if generation == self._quality_generation else None,
+                    )
+            except Exception as exc:
+                message = str(exc)
+                self.root.after(
+                    0,
+                    lambda: self.quality_panel.profile_status.configure(
+                        text=f"Profile error: {message}"
+                    ) if generation == self._quality_generation else None,
+                )
+            finally:
+                if self._quality_engine is quality_engine:
+                    self._quality_engine = None
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _inspect_quality_row(self, row_number):
+        if self.processing:
+            self.quality_panel.profile_status.configure(text="Finish or cancel processing before inspecting")
+            return
+        if not self.file_panel.files:
+            self.quality_panel.profile_status.configure(text="Add files before inspecting a row")
+            return
+        if self._quality_engine is not None:
+            self._quality_engine.cancel()
+        self._quality_generation += 1
+        generation = self._quality_generation
+        files = list(self.file_panel.files)
+        config = self._build_config()
+        self.quality_panel.profile_status.configure(text=f"Inspecting raw row {row_number}…")
+
+        def run():
+            quality_engine = CSVEngine(config)
+            self._quality_engine = quality_engine
+            try:
+                inspection = quality_engine.inspect_row(files, row_number)
+                self.root.after(
+                    0,
+                    lambda: self.quality_panel.update_inspection(inspection)
+                    if generation == self._quality_generation else None,
+                )
+                self.root.after(
+                    0,
+                    lambda: self.quality_panel.profile_status.configure(
+                        text=(f"Inspected raw row {inspection['row_number']:,}"
+                              if inspection else "Row not found")
+                    ) if generation == self._quality_generation else None,
+                )
+            except Exception as exc:
+                message = str(exc)
+                self.root.after(
+                    0,
+                    lambda: self.quality_panel.profile_status.configure(
+                        text=f"Inspection error: {message}"
+                    ) if generation == self._quality_generation else None,
+                )
+            finally:
+                if self._quality_engine is quality_engine:
+                    self._quality_engine = None
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _quality_edits_changed(self, _edits):
+        self._on_ui_edit()
+
     def _update_progress(self, value: float, status: str):
         self.progress_bar.set(value / 100)
         self.progress_label.configure(text=status)
@@ -5376,6 +6030,8 @@ class CSVPowerToolApp:
         config.header_normalize = self.transform_panel.get_header_normalize()
         config.column_transforms = self.transform_panel.get_column_transforms()
 
+        config.repair_edits = self.quality_panel.get_edits()
+
         # Output
         output_config = self.output_panel.get_config()
         config.output_delimiter = output_config["delimiter"]
@@ -5404,7 +6060,7 @@ class CSVPowerToolApp:
                 "dedupe_fuzzy_threshold", "dedupe_aggregate_mode", "dedupe_aggregate_separator",
                 "filters", "filter_logic", "trim_whitespace", "case_transform", "empty_value",
                 "header_normalize", "column_transforms", "output_delimiter", "output_encoding",
-                "output_quoting", "include_header", "line_ending",
+                "output_quoting", "include_header", "line_ending", "repair_edits",
             }
         }
 
@@ -5455,6 +6111,7 @@ class CSVPowerToolApp:
             "unix (LF)" if line_ending == "unix" else
             "windows (CRLF)" if line_ending == "windows" else "auto"
         )
+        self.quality_panel.set_edits(data.get("repair_edits", []))
 
     def _on_ui_edit(self, _event=None):
         if self.history is None or self.processing:
@@ -5522,6 +6179,10 @@ class CSVPowerToolApp:
         if self.engine:
             self.engine.cancel()
             self.log_panel.log("Cancelling...", "warning")
+        if self._quality_engine:
+            self._quality_generation += 1
+            self._quality_engine.cancel()
+            self.quality_panel.profile_status.configure(text="Cancelling quality operation…")
     
     def _complete(self, stats: ProcessingStats):
         self.processing = False
@@ -5537,6 +6198,10 @@ class CSVPowerToolApp:
         state = "disabled" if processing else "normal"
         self.process_btn.configure(state=state)
         self.cancel_btn.configure(state="normal" if processing else "disabled")
+        if hasattr(self, "quality_panel"):
+            self.quality_panel.profile_status.configure(
+                text="Processing in progress" if processing else self.quality_panel.profile_status.cget("text")
+            )
     
     def _save_config(self):
         file = filedialog.asksaveasfilename(
@@ -5751,6 +6416,21 @@ def cli_main(argv=None):
     parser.add_argument("--validation-report", help="Write a machine-readable schema validation report")
     parser.add_argument("--validate-only", action="store_true",
                         help="Validate against --schema-contract without writing processed output")
+    parser.add_argument("--profile", help="Write a bounded faceted data-quality profile JSON artifact")
+    parser.add_argument("--quality-scan-rows", type=int, default=None,
+                        help="Maximum rows scanned for a quality profile")
+    parser.add_argument("--quality-facet-limit", type=int, default=None,
+                        help="Top values retained per quality-profile facet")
+    parser.add_argument("--quality-distinct-limit", type=int, default=None,
+                        help="Maximum distinct values tracked per quality-profile column")
+    parser.add_argument("--quality-sample-limit", type=int, default=None,
+                        help="Sample values retained per quality-profile column")
+    parser.add_argument("--quality-filter-column",
+                        help="Profile only rows whose raw value matches --quality-filter-value")
+    parser.add_argument("--quality-filter-value",
+                        help="Exact raw value used with --quality-filter-column")
+    parser.add_argument("--repair-edits", help="JSON file containing reviewed 1-based row/cell repairs")
+    parser.add_argument("--repair-report", help="Write the applied repair report to this JSON path")
     parser.add_argument("--sql", help="Run DuckDB SQL against input_0, input_1, ...")
     parser.add_argument("--sql-file", help="Read the DuckDB SQL query from a UTF-8 file")
     parser.add_argument("--redact-sensitive", action="store_true", help="Redact likely email, phone, SSN, card, and secret fields")
@@ -5812,7 +6492,7 @@ def cli_main(argv=None):
     if not args.serve and not args.inputs and not args.dry_run and not args.validate_only and not args.export_schema:
         parser.error("--inputs, --config, or --replay is required unless --register-git-driver is used")
     if not args.serve and not args.dry_run and not args.output and not args.dedupe_preview \
-            and not args.preview and not args.validate_only and not args.export_schema:
+            and not args.preview and not args.profile and not args.validate_only and not args.export_schema:
         parser.error("--output is required unless --dry-run or --dedupe-preview is used")
     if (args.join_on or args.three_way_base or args.three_way_ours or args.three_way_theirs) and not args.output:
         parser.error("--output is required for join and three-way merge operations")
@@ -5878,6 +6558,22 @@ def cli_main(argv=None):
     if (args.validation_mode is not None or args.validation_report or config.schema_validate_only) \
             and not config.schema_contract:
         parser.error("--schema-contract or a workflow schema_contract is required for schema validation")
+    if args.repair_edits:
+        try:
+            config.repair_edits = load_repairs(args.repair_edits)
+        except QualityError as exc:
+            parser.error(str(exc))
+    if args.repair_report:
+        config.repair_report_path = args.repair_report
+    if args.repair_report and not config.repair_edits:
+        parser.error("--repair-report requires --repair-edits or workflow repair_edits")
+    if config.repair_edits and not args.output:
+        parser.error("Reviewed repairs require --output")
+    if bool(args.quality_filter_column) != bool(args.quality_filter_value):
+        parser.error("--quality-filter-column and --quality-filter-value must be provided together")
+    if config.repair_edits and (args.sql or args.sql_file or args.join_on
+                                or args.three_way_base or args.three_way_ours or args.three_way_theirs):
+        parser.error("Reviewed repairs are supported by the normal processing path only")
 
     # Apply CLI overrides
     if args.delimiter:
@@ -5947,6 +6643,16 @@ def cli_main(argv=None):
         if args.stream_batch_rows < 1:
             parser.error("--stream-batch-rows must be at least 1")
         config.stream_batch_rows = args.stream_batch_rows
+    for name, argument in (
+        ("quality_scan_rows", args.quality_scan_rows),
+        ("quality_facet_limit", args.quality_facet_limit),
+        ("quality_max_distinct_values", args.quality_distinct_limit),
+        ("quality_sample_limit", args.quality_sample_limit),
+    ):
+        if argument is not None:
+            if argument < 1:
+                parser.error(f"--{name.replace('_', '-')} must be at least 1")
+            setattr(config, name, argument)
     if args.no_stream:
         config.streaming_enabled = False
     if args.column_template:
@@ -6169,6 +6875,29 @@ def cli_main(argv=None):
             engine.write_schema_report(input_files, Path(args.schema_report))
             if not args.quiet:
                 print(f"  Schema report: {args.schema_report}", file=sys.stderr)
+
+        if args.profile:
+            quality_profile = engine.profile(
+                input_files,
+                scan_limit=config.quality_scan_rows,
+                facet_limit=config.quality_facet_limit,
+                max_distinct_values=config.quality_max_distinct_values,
+                sample_limit=config.quality_sample_limit,
+                filter_column=args.quality_filter_column,
+                filter_value=args.quality_filter_value,
+            )
+            try:
+                write_quality_report(args.profile, quality_profile)
+            except (OSError, TypeError, ValueError) as exc:
+                print(f"Error writing quality profile: {exc}", file=sys.stderr)
+                return 3
+            if not args.quiet:
+                print(
+                    f"  Quality profile: {args.profile} ({quality_profile['rows_scanned']:,} row(s))",
+                    file=sys.stderr,
+                )
+            if not args.output:
+                return 3 if engine.stats.errors else 0
 
         if args.preview:
             preview = engine.preview(

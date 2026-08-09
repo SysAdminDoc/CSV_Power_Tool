@@ -74,6 +74,11 @@ def operations_from_config(config: dict, output_path: str | None, input_patterns
             "header_normalize": config.get("header_normalize", "none"),
             "column_template": config.get("column_template", ""),
         },
+        {
+            "type": "quality-repair",
+            "edit_count": len(config.get("repair_edits", [])),
+            "report_path": config.get("repair_report_path", ""),
+        },
         {"type": "filter", "logic": config.get("filter_logic", "and"), "rules": config.get("filters", [])},
         {"type": "transform", "rules": config.get("column_transforms", [])},
         {
@@ -276,4 +281,3 @@ def _atomic_json_write(path: Path, payload: dict) -> None:
             temporary.unlink()
         except FileNotFoundError:
             pass
-

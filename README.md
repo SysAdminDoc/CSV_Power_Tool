@@ -29,6 +29,8 @@
 - Auto-detection of file delimiters and encodings
 - Schema-drift reports with samples, inferred types, and detection confidence
 - Frictionless-compatible Table Schema contracts with strict, advisory, and quarantine validation
+- Faceted data-quality profiles with blank/null, uniqueness, type-confidence, samples, facets, and numeric summaries
+- Reviewed raw-text cell repairs with exact-old-value guards, undo/redo history, repair reports, and manifest/workflow provenance
 - Bounded read-only previews for large inputs, with scan budgets, cancellation, and JSON export
 - Recursive folder import
 - Process unlimited files at once
@@ -128,6 +130,9 @@ python CSV_Consolidator.py --inputs exports --source-column "(Source)" --schema-
 python CSV_Consolidator.py --inputs data/*.csv --export-schema contract.json
 python CSV_Consolidator.py --inputs data/*.csv --schema-contract contract.json --validate-only --validation-report validation.json
 python CSV_Consolidator.py --inputs data/*.csv --schema-contract contract.json --validation-mode quarantine --quarantine rejected.jsonl --output validated.csv
+python CSV_Consolidator.py --inputs data/*.csv --profile quality.json --quality-scan-rows 10000
+python CSV_Consolidator.py --inputs data/*.csv --profile status-ok.json --quality-filter-column status --quality-filter-value ok
+python CSV_Consolidator.py --inputs data/*.csv --repair-edits reviewed-edits.json --repair-report repairs.json --output repaired.csv
 python CSV_Consolidator.py --inputs left.csv right.csv --join-on id --join-type outer --output joined.csv
 python CSV_Consolidator.py --three-way-base base.csv --three-way-ours ours.csv --three-way-theirs theirs.csv --key-columns id --output merged.csv
 python CSV_Consolidator.py --inputs data/*.csv --sql "SELECT * FROM input_0 WHERE amount > 100" --output query.csv
@@ -146,6 +151,10 @@ Input processing defaults to failing safely on malformed rows, oversized cells, 
 Schema contracts use a documented first-version subset of the [Frictionless Table Schema](https://specs.frictionlessdata.io/table-schema/) format. `--export-schema` infers reusable field types and required/unique hints. `--schema-contract` accepts JSON contracts with string, integer, number, boolean, date, and datetime fields plus required, nullable, unique, missing-value, and primary-key constraints. `--validation-mode strict` preserves the existing output on any contract failure, `advisory` keeps rows and records warnings, and `quarantine` omits invalid rows into the JSONL quarantine file. `--validation-report` writes file/row/column/rule/observed-value diagnostics; `--validate-only` performs the same input validation without writing processed output. Unsupported Table Schema features are rejected explicitly.
 
 `--preview` writes a `csv-power-tool-preview` JSON artifact instead of running a full processing job. The default read-only budget is 100 returned rows, 5,000 scanned rows, 8 MiB of retained sample-cell text, 256 columns, and 16 KiB per cell; use the `--preview-*` options to tighten it. Preview metadata reports whether the scan was capped, how much work was sampled, truncation, cancellation, and the remaining-work state. Parquet input is read through bounded Arrow batches, JSONL is read line-by-line, and CSV/XLSX use read-only iterators. Full processing keeps the editable/output path separate.
+
+`--profile` writes a `csv-power-tool-quality-profile` JSON artifact from a bounded incremental scan. Each column reports source-row count, non-empty/blank/null counts, exact-or-lower-bound distinctness, duplicate count, raw samples, top facets, inferred type and confidence, plus numeric count/min/max/mean when applicable. Use `--quality-filter-column COLUMN --quality-filter-value VALUE` for an exact raw-value facet drill-down. The GUI Quality tab provides the same profile, a facet filter, bounded row inspection, and a reviewed-edit list.
+
+`--repair-edits` accepts a JSON list (or `{"edits": [...]}`) of 1-based `row`, `column`, and `value` entries. Add optional `expected_old` and `reason` fields to make a correction compare-and-fail against the inspected raw text. Replacements stay text values, so leading zeros and other source spelling remain intact unless the operator explicitly enters a different value. Repairs run before filtering and transforms, use the existing GUI Undo/Redo history, and can be exported with `--repair-report`; the applied edit records are also stored in the output manifest and versioned workflow configuration. SQL, joins, and three-way merge paths reject repair edits because they use separate execution plans.
 
 ### Performance budgets and benchmark methodology
 
@@ -184,6 +193,7 @@ Use `python packaging/build.py --reuse` only when intentionally reusing an alrea
    - **Dedupe:** Configure duplicate removal
    - **Filter:** Add filter rules to include/exclude rows
    - **Transform:** Apply text transformations
+   - **Quality:** Profile facets, inspect raw rows, and record reviewed repairs
    - **Output:** Set delimiter, encoding, and output file path
 
 3. **Process**

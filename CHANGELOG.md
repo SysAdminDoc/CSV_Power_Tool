@@ -12,6 +12,7 @@ All notable changes to CSV_Power_Tool will be documented in this file.
 - Workflow: Added versioned deterministic workflow documents, legacy-config migration, replay/dry-run CLI support, atomic bounded history, and GUI workflow metadata logging.
 - Schema: Added first-version Frictionless Table Schema contracts with strict/advisory/quarantine validation, inferred-schema export, machine-readable diagnostics, validation-only CLI execution, and manifest/report integration.
 - Performance: Replaced full-pipeline preview work with bounded read-only scans, cancellable GUI previews, a bounded JSON preview artifact, Arrow-batched Parquet input/output, and golden-equivalence/budget tests.
+- Quality: Added bounded faceted data-quality profiles, exact raw-row inspection, facet filtering, reviewed text repairs with expected-old guards, undo/redo GUI integration, repair reports, and workflow/manifest provenance.
 
 ## [v3.2.0] - 2026-08-03
 
