@@ -66,6 +66,7 @@ from csv_power_tool.joins import (
     execute_join,
     execute_three_way,
 )
+from csv_power_tool.sql import SQLQueryError, execute_sql_query
 
 APP_NAME = "CSV Power Tool"
 APP_VERSION = "3.2.0"
@@ -308,6 +309,13 @@ class ProcessingConfig:
     merge_conflict_resolution: str = "fail"
     merge_report_path: str = ""
 
+    # Bounded local SQL execution
+    sql_max_rows: int = 100_000
+    sql_max_cell_bytes: int = 1 * 1024 * 1024
+    sql_timeout_seconds: float = 30.0
+    sql_memory_limit_mb: int = 512
+    sql_report_path: str = ""
+
     # Dataframe backend
     engine_backend: str = "auto"  # "auto", "python", or "polars"
     polars_threshold_bytes: int = 5_000_000
@@ -347,6 +355,7 @@ class ProcessingStats:
     repair_report: dict = field(default_factory=dict)
     join_report: dict = field(default_factory=dict)
     merge_report: dict = field(default_factory=dict)
+    sql_report: dict = field(default_factory=dict)
 
 
 class ConfigHistory:
@@ -1518,6 +1527,7 @@ class CSVEngine:
                 "repair_report": self.stats.repair_report,
                 "join_report": self.stats.join_report,
                 "merge_report": self.stats.merge_report,
+                "sql_report": self.stats.sql_report,
             },
         }
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1774,37 +1784,15 @@ class CSVEngine:
             json.dump(report, handle, indent=2, ensure_ascii=False)
         return report
 
-    def sql_query(self, files: list[Path], query: str) -> tuple[list[dict], list[str]]:
-        """Run SQL against input files exposed as input_0, input_1, and so on."""
-        try:
-            duckdb = _optional_module("duckdb")
-        except ImportError as exc:
-            raise RuntimeError("duckdb is required for SQL queries") from exc
-
-        connection = duckdb.connect(database=":memory:")
-        try:
-            for index, file_path in enumerate(files):
-                escaped_path = str(file_path.resolve()).replace("'", "''")
-                suffix = file_path.suffix.lower()
-                if suffix == ".parquet":
-                    source = f"read_parquet('{escaped_path}')"
-                elif suffix in SUPPORTED_JSONL_SUFFIXES:
-                    source = f"read_json_auto('{escaped_path}', format='newline_delimited')"
-                else:
-                    source = f"read_csv_auto('{escaped_path}')"
-                connection.execute(
-                    f"CREATE OR REPLACE VIEW input_{index} AS SELECT * FROM {source}"
-                )
-
-            result = connection.execute(query)
-            columns = [description[0] for description in (result.description or [])]
-            rows = [
-                {column: self._cell_to_text(value) for column, value in zip(columns, values)}
-                for values in result.fetchall()
-            ]
-            return rows, columns
-        finally:
-            connection.close()
+    def sql_query(
+        self,
+        files: list[Path],
+        query: str,
+        return_report: bool = False,
+    ):
+        """Run bounded local SQL against input_0, input_1, and subsequent views."""
+        result = execute_sql_query(self, files, query)
+        return result if return_report else result[:2]
 
     @staticmethod
     def analyze_join(
@@ -3396,7 +3384,7 @@ class CSVEngine:
     
     def _write_output(self, rows: list[dict], columns: list[str], output_file: Path):
         """Write processed data atomically and emit its audit manifest."""
-        if not rows:
+        if not rows and not columns:
             self.log("No data to write", "warning")
             return
 
@@ -6410,6 +6398,15 @@ def cli_main(argv=None):
     parser.add_argument("--repair-report", help="Write the applied repair report to this JSON path")
     parser.add_argument("--sql", help="Run DuckDB SQL against input_0, input_1, ...")
     parser.add_argument("--sql-file", help="Read the DuckDB SQL query from a UTF-8 file")
+    parser.add_argument("--sql-max-rows", type=int,
+                        help="Maximum SQL result rows retained (default: 100000)")
+    parser.add_argument("--sql-max-cell-bytes", type=int,
+                        help="Maximum UTF-8 bytes in one SQL result cell (default: 1048576)")
+    parser.add_argument("--sql-timeout-seconds", type=float,
+                        help="Interrupt SQL setup or execution after this many seconds (default: 30)")
+    parser.add_argument("--sql-memory-limit-mb", type=int,
+                        help="DuckDB per-query memory limit in MiB (default: 512)")
+    parser.add_argument("--sql-report", help="Write the machine-readable SQL execution report")
     parser.add_argument("--redact-sensitive", action="store_true", help="Redact likely email, phone, SSN, card, and secret fields")
     parser.add_argument("--redaction-token", default=None, help="Replacement text used by --redact-sensitive")
     parser.add_argument("--unpivot", nargs="+", metavar="COLUMN", help="Unpivot these columns into name/value rows")
@@ -6499,6 +6496,12 @@ def cli_main(argv=None):
         parser.error("--join-report requires --join-on")
     if args.merge_report and not (args.three_way_base or args.three_way_ours or args.three_way_theirs):
         parser.error("--merge-report requires three-way merge inputs")
+    if args.sql_report and args.output and args.sql_report != "-":
+        try:
+            if Path(args.sql_report).resolve() == Path(args.output).resolve():
+                parser.error("--sql-report must differ from --output")
+        except OSError:
+            pass
 
     stream_temp_paths = []
     stdin_temp_path = None
@@ -6653,6 +6656,21 @@ def cli_main(argv=None):
         config.merge_conflict_resolution = args.conflict_resolution
     if args.merge_report:
         config.merge_report_path = args.merge_report
+    for name, argument in (
+        ("sql_max_rows", args.sql_max_rows),
+        ("sql_max_cell_bytes", args.sql_max_cell_bytes),
+        ("sql_memory_limit_mb", args.sql_memory_limit_mb),
+    ):
+        if argument is not None:
+            if argument < 1:
+                parser.error(f"--{name.replace('_', '-')} must be at least 1")
+            setattr(config, name, argument)
+    if args.sql_timeout_seconds is not None:
+        if args.sql_timeout_seconds <= 0:
+            parser.error("--sql-timeout-seconds must be greater than 0")
+        config.sql_timeout_seconds = args.sql_timeout_seconds
+    if args.sql_report:
+        config.sql_report_path = args.sql_report
 
     # Apply CLI overrides
     if args.delimiter:
@@ -7140,12 +7158,27 @@ def cli_main(argv=None):
         engine = track_engine(CSVEngine(config, progress_callback=progress_msg, log_callback=log_msg))
         engine._manifest_input_files = [Path(path) for path in input_files]
         try:
-            rows, columns = engine.sql_query(input_files, query)
+            rows, columns, report = engine.sql_query(input_files, query, return_report=True)
+        except SQLQueryError as exc:
+            engine.stats.sql_report = exc.report
+            engine.stats.errors.append(str(exc))
+            if not write_operation_report(config.sql_report_path, exc.report):
+                return 3
+            code = exc.report.get("error", {}).get("code", "sql_error")
+            print(f"Error executing SQL [{code}]: {exc}", file=sys.stderr)
+            return 130 if code == "query_cancelled" else 3
         except Exception as exc:
+            engine.stats.errors.append(f"SQL execution failed: {exc}")
             print(f"Error executing SQL: {exc}", file=sys.stderr)
             return 3
+        engine.stats.sql_report = report
+        if not write_operation_report(config.sql_report_path, report):
+            engine.stats.errors.append("SQL report could not be written")
+            return 3
         engine.stats.files_processed = len(input_files)
-        engine.stats.total_rows_read = len(rows)
+        engine.stats.total_rows_read = sum(
+            int(view.get("row_count", 0)) for view in report.get("views", [])
+        )
         engine.stats.unique_columns = len(columns)
         engine.stats.final_row_count = len(rows)
         engine._compute_column_summary(rows, columns)
