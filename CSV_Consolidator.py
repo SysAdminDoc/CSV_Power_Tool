@@ -27,6 +27,18 @@ from typing import Callable
 from tkinter import filedialog, StringVar, BooleanVar, IntVar, END
 from csv_power_tool import api as upload_api
 from csv_power_tool.core import EngineService
+from csv_power_tool.workflow import (
+    WorkflowError,
+    append_history,
+    build_workflow,
+    canonical_json,
+    extract_config,
+    load_workflow,
+    operation_types,
+    workflow_inputs,
+    workflow_output,
+    write_workflow,
+)
 
 APP_NAME = "CSV Power Tool"
 APP_VERSION = "3.2.0"
@@ -4414,6 +4426,7 @@ class CSVPowerToolApp:
         self._preview_job = None
         self._preview_generation = 0
         self.history = None
+        self.workflow_history_path = Path.home() / ".csv-power-tool" / "workflow-history.json"
         
         self._build_ui()
         self.history = ConfigHistory(self._config_to_data())
@@ -4928,12 +4941,27 @@ class CSVPowerToolApp:
         )
         if file:
             data = self._config_to_data()
-            with open(file, 'w') as f:
-                json.dump(data, f, indent=2)
+            workflow = build_workflow(
+                data,
+                [str(path) for path in self.file_panel.files],
+                self.output_panel.output_path.get(),
+                APP_VERSION,
+                input_files=self.file_panel.files,
+            )
+            try:
+                write_workflow(file, workflow)
+                record = append_history(self.workflow_history_path, workflow)
+            except WorkflowError as exc:
+                self.log_panel.log(f"Workflow save error: {exc}", "error")
+                return
             if self.history:
                 self.history.record(data)
                 self._update_history_buttons()
-            self.log_panel.log(f"Configuration saved: {Path(file).name}", "success")
+            changed = ", ".join(record["changed_fields"]) if record["changed_fields"] else "initial workflow"
+            self.log_panel.log(
+                f"Workflow saved: {Path(file).name} ({len(workflow['operations'])} operations; {changed})",
+                "success",
+            )
     
     def _load_config(self):
         file = filedialog.askopenfilename(
@@ -4942,18 +4970,29 @@ class CSVPowerToolApp:
         )
         if file:
             try:
-                with open(file, 'r') as f:
-                    data = json.load(f)
+                workflow = load_workflow(file)
+                data = extract_config(workflow)
                 self._apply_config_data(data)
+                replay_output = workflow_output(workflow)
+                if replay_output:
+                    self.output_panel.output_path.set(replay_output)
+                replay_files = [Path(path) for path in workflow_inputs(workflow) if Path(path).is_file()]
+                if replay_files:
+                    self.file_panel.files = replay_files
+                    self.file_panel._refresh()
+                    self._on_files_changed()
                 if self.history:
                     self.history.record(self._config_to_data())
                     self._update_history_buttons()
                 
-                self.log_panel.log(f"Configuration loaded: {Path(file).name}", "success")
+                self.log_panel.log(
+                    f"Workflow loaded: {Path(file).name} ({len(operation_types(workflow))} operations)",
+                    "success",
+                )
                 self._schedule_preview()
                 
-            except Exception as e:
-                self.log_panel.log(f"Error loading config: {e}", "error")
+            except WorkflowError as e:
+                self.log_panel.log(f"Error loading workflow: {e}", "error")
     
     def run(self):
         self.root.mainloop()
@@ -5037,6 +5076,10 @@ def cli_main(argv=None):
         description="CSV Power Tool - Professional-grade CSV combiner and processor (CLI mode)",
     )
     parser.add_argument("--config", "-c", help="JSON preset configuration file")
+    parser.add_argument("--replay", help="Replay a versioned workflow document")
+    parser.add_argument("--save-workflow", help="Write the current run as a versioned workflow document")
+    parser.add_argument("--workflow-history", help="Append successful runs to bounded workflow history")
+    parser.add_argument("--dry-run", action="store_true", help="Validate and print the replayable workflow without writing output")
     parser.add_argument("--inputs", "-i", nargs="+",
                         help="Input files, folders, or glob patterns (e.g. *.csv)")
     parser.add_argument("--output", "-o", help="Output file path")
@@ -5044,7 +5087,7 @@ def cli_main(argv=None):
     parser.add_argument("--encoding", "-e", default=None, help="Output encoding")
     parser.add_argument("--no-header", action="store_true", help="Exclude header row")
     parser.add_argument("--collision-policy", choices=["replace", "fail", "backup"],
-                        default="replace", help="Existing output handling policy")
+                        default=None, help="Existing output handling policy")
     parser.add_argument("--manifest", dest="run_manifest_path",
                         help="Write the audit manifest to this path instead of output.manifest.json")
     parser.add_argument("--no-manifest", action="store_true", help="Disable the audit manifest")
@@ -5063,9 +5106,9 @@ def cli_main(argv=None):
     parser.add_argument("--columns", nargs="+", help="Include only these columns")
     parser.add_argument("--exclude-columns", nargs="+", help="Exclude these columns")
     parser.add_argument("--header-normalize", choices=["none", "trim", "lowercase", "snake_case"],
-                        default="none", help="Header normalization mode")
+                        default=None, help="Header normalization mode")
     parser.add_argument("--invalid-row-policy", choices=["fail", "warn", "quarantine"],
-                        default="fail", help="Malformed CSV/JSONL row handling policy")
+                        default=None, help="Malformed CSV/JSONL row handling policy")
     parser.add_argument("--quarantine", dest="quarantine_path",
                         help="Write quarantined malformed rows as JSON Lines")
     parser.add_argument("--max-input-bytes", type=int, help="Maximum bytes accepted per input file")
@@ -5076,8 +5119,8 @@ def cli_main(argv=None):
     parser.add_argument("--max-cell-bytes", type=int, help="Maximum UTF-8 bytes accepted in one cell")
     parser.add_argument("--max-json-nesting", type=int, help="Maximum JSON nesting depth")
     parser.add_argument("--schema-mode", choices=["union", "intersection", "first_file"],
-                        default="union", help="Schema unification mode")
-    parser.add_argument("--backend", choices=["auto", "python", "polars"], default="auto",
+                        default=None, help="Schema unification mode")
+    parser.add_argument("--backend", choices=["auto", "python", "polars"], default=None,
                         help="Text parsing backend; polars is recommended for large in-memory jobs")
     parser.add_argument("--column-template", help="Use this input's column order as the output template")
     parser.add_argument("--source-column", help="Add a provenance column containing each source file")
@@ -5086,7 +5129,7 @@ def cli_main(argv=None):
     parser.add_argument("--sql", help="Run DuckDB SQL against input_0, input_1, ...")
     parser.add_argument("--sql-file", help="Read the DuckDB SQL query from a UTF-8 file")
     parser.add_argument("--redact-sensitive", action="store_true", help="Redact likely email, phone, SSN, card, and secret fields")
-    parser.add_argument("--redaction-token", default="[REDACTED]", help="Replacement text used by --redact-sensitive")
+    parser.add_argument("--redaction-token", default=None, help="Replacement text used by --redact-sensitive")
     parser.add_argument("--unpivot", nargs="+", metavar="COLUMN", help="Unpivot these columns into name/value rows")
     parser.add_argument("--unpivot-name", default="variable", help="Unpivoted column containing source column names")
     parser.add_argument("--unpivot-value", default="value", help="Unpivoted column containing source values")
@@ -5126,8 +5169,25 @@ def cli_main(argv=None):
             sys.exit(3)
         return
 
-    if not args.serve and (not args.inputs or (not args.output and not args.dedupe_preview)):
-        parser.error("--inputs and --output are required unless --register-git-driver or --dedupe-preview is used")
+    if args.config and args.replay:
+        parser.error("--config and --replay are mutually exclusive")
+
+    workflow_source = args.replay or args.config
+    workflow_document = None
+    if workflow_source:
+        try:
+            workflow_document = load_workflow(workflow_source)
+            if not args.inputs:
+                args.inputs = workflow_inputs(workflow_document)
+            if not args.output:
+                args.output = workflow_output(workflow_document)
+        except WorkflowError as exc:
+            parser.error(str(exc))
+
+    if not args.serve and not args.inputs and not args.dry_run:
+        parser.error("--inputs, --config, or --replay is required unless --register-git-driver is used")
+    if not args.serve and not args.dry_run and not args.output and not args.dedupe_preview:
+        parser.error("--output is required unless --dry-run or --dedupe-preview is used")
     if (args.join_on or args.three_way_base or args.three_way_ours or args.three_way_theirs) and not args.output:
         parser.error("--output is required for join and three-way merge operations")
     if args.sql and args.sql_file:
@@ -5163,14 +5223,13 @@ def cli_main(argv=None):
     config = ProcessingConfig()
 
     # Load preset if provided
-    if args.config:
+    if workflow_document is not None:
         try:
-            with open(args.config, 'r') as f:
-                data = json.load(f)
+            data = extract_config(workflow_document)
             for key, value in data.items():
                 if hasattr(config, key):
                     setattr(config, key, value)
-        except Exception as e:
+        except WorkflowError as e:
             print(f"Error loading config: {e}", file=sys.stderr)
             sys.exit(3)
 
@@ -5186,8 +5245,10 @@ def cli_main(argv=None):
 
     if args.no_header:
         config.include_header = False
-    config.output_collision_policy = args.collision_policy
-    config.run_manifest_enabled = not args.no_manifest
+    if args.collision_policy is not None:
+        config.output_collision_policy = args.collision_policy
+    if args.no_manifest:
+        config.run_manifest_enabled = False
     if args.run_manifest_path:
         config.run_manifest_path = args.run_manifest_path
 
@@ -5215,8 +5276,10 @@ def cli_main(argv=None):
         config.columns_mode = "exclude"
         config.selected_columns = args.exclude_columns
 
-    config.header_normalize = args.header_normalize
-    config.invalid_row_policy = args.invalid_row_policy
+    if args.header_normalize is not None:
+        config.header_normalize = args.header_normalize
+    if args.invalid_row_policy is not None:
+        config.invalid_row_policy = args.invalid_row_policy
     if args.quarantine_path:
         config.quarantine_path = args.quarantine_path
     for name in (
@@ -5230,16 +5293,21 @@ def cli_main(argv=None):
         value = getattr(args, name, None)
         if value is not None:
             setattr(config, name, value)
-    config.schema_mode = args.schema_mode
-    config.engine_backend = args.backend
-    config.streaming_enabled = not args.no_stream
+    if args.schema_mode is not None:
+        config.schema_mode = args.schema_mode
+    if args.backend is not None:
+        config.engine_backend = args.backend
+    if args.no_stream:
+        config.streaming_enabled = False
     if args.column_template:
         config.column_template = args.column_template
     if args.source_column:
         config.source_column = args.source_column
         config.source_value = "path" if args.source_path else "name"
-    config.redact_sensitive = args.redact_sensitive
-    config.redaction_token = args.redaction_token
+    if args.redact_sensitive:
+        config.redact_sensitive = True
+    if args.redaction_token is not None:
+        config.redaction_token = args.redaction_token
     if args.unpivot:
         config.unpivot_columns = args.unpivot
         config.unpivot_name_column = args.unpivot_name
@@ -5297,6 +5365,20 @@ def cli_main(argv=None):
             print(f"  ... {status} ({value:.0f}%)", file=sys.stderr)
 
     output_path = Path(args.output) if args.output else None
+
+    def current_workflow(input_files):
+        patterns = args.inputs or [str(path) for path in input_files]
+        metadata = {}
+        if workflow_source:
+            metadata["replay_source"] = str(workflow_source)
+        return build_workflow(
+            asdict(config),
+            patterns,
+            output_path,
+            APP_VERSION,
+            input_files=input_files,
+            metadata=metadata,
+        )
 
     def read_operation_file(engine, path):
         all_columns = set()
@@ -5450,8 +5532,38 @@ def cli_main(argv=None):
             return 3
         return 0
 
+    def execute_once(input_files, runner=None):
+        if not input_files:
+            return run_once(input_files) if runner is None else runner(input_files)
+        workflow = current_workflow(input_files)
+        try:
+            if args.save_workflow:
+                write_workflow(args.save_workflow, workflow)
+            if not args.quiet:
+                print(f"  Workflow operations: {', '.join(operation_types(workflow))}", file=sys.stderr)
+        except WorkflowError as exc:
+            print(f"Error writing workflow: {exc}", file=sys.stderr)
+            return 3
+
+        exit_code = (runner or run_once)(input_files)
+        if exit_code == 0 and args.workflow_history:
+            try:
+                record = append_history(args.workflow_history, workflow)
+                if not args.quiet and record["changed_fields"]:
+                    print(
+                        f"  Workflow changed fields: {', '.join(record['changed_fields'])}",
+                        file=sys.stderr,
+                    )
+            except WorkflowError as exc:
+                print(f"Error writing workflow history: {exc}", file=sys.stderr)
+                return 3
+        return exit_code
+
     if args.three_way_base or args.three_way_ours or args.three_way_theirs:
-        sys.exit(run_three_way_merge())
+        sys.exit(execute_once(
+            [Path(path) for path in (args.three_way_base, args.three_way_ours, args.three_way_theirs) if path],
+            lambda _input_files: run_three_way_merge(),
+        ))
 
     def input_signature(input_files):
         signature = []
@@ -5472,7 +5584,7 @@ def cli_main(argv=None):
                 signature = input_signature(watched_files)
                 if signature != last_signature:
                     if watched_files:
-                        last_exit = run_once(watched_files)
+                        last_exit = execute_once(watched_files)
                     elif not args.quiet:
                         print("CSV Power Tool - waiting for input files...", file=sys.stderr)
                     last_signature = signature
@@ -5480,8 +5592,21 @@ def cli_main(argv=None):
         except KeyboardInterrupt:
             sys.exit(last_exit)
 
-    input_files = expand_inputs(args.inputs)
-    sys.exit(run_once(input_files))
+    input_files = expand_inputs(args.inputs or [])
+    if args.dry_run:
+        if not input_files:
+            print("Error: No input files found for dry-run", file=sys.stderr)
+            sys.exit(1)
+        workflow = current_workflow(input_files)
+        try:
+            if args.save_workflow:
+                write_workflow(args.save_workflow, workflow)
+        except WorkflowError as exc:
+            print(f"Error writing workflow: {exc}", file=sys.stderr)
+            sys.exit(3)
+        print(canonical_json(workflow), end="")
+        sys.exit(0)
+    sys.exit(execute_once(input_files))
 
 
 # ══════════════════════════════════════════════════════════════════════════════

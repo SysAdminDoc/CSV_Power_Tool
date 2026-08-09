@@ -227,6 +227,28 @@ class CLIContractTests(unittest.TestCase):
         self.assertIn("--collision-policy", result.stdout)
         self.assertIn("--no-manifest", result.stdout)
 
+    def test_cli_dry_run_and_workflow_replay(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "input.csv"
+            output_path = root / "output.csv"
+            workflow_path = root / "workflow.json"
+            input_path.write_text("id,name\n1,Replay\n", encoding="utf-8")
+
+            dry_run = self.run_cli(
+                "--inputs", str(input_path), "--output", str(output_path), "--dry-run",
+                "--save-workflow", str(workflow_path), "--no-manifest",
+            )
+            self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
+            self.assertEqual(dry_run.stderr, "")
+            self.assertIn('"format": "csv-power-tool-workflow"', dry_run.stdout)
+            self.assertFalse(output_path.exists())
+            self.assertTrue(workflow_path.exists())
+
+            replay = self.run_cli("--replay", str(workflow_path), "--no-manifest")
+            self.assertEqual(replay.returncode, 0, replay.stderr)
+            self.assertIn("Replay", output_path.read_text(encoding="utf-8"))
+
     def test_bounded_performance_smoke(self):
         row_count = 5_000
         with tempfile.TemporaryDirectory() as temp_dir:

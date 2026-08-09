@@ -127,12 +127,17 @@ python CSV_Consolidator.py --three-way-base base.csv --three-way-ours ours.csv -
 python CSV_Consolidator.py --inputs data/*.csv --sql "SELECT * FROM input_0 WHERE amount > 100" --output query.csv
 python CSV_Consolidator.py --inputs data/*.csv --invalid-row-policy quarantine --quarantine rejected.jsonl --output cleaned.csv
 python CSV_Consolidator.py --inputs data/*.csv --collision-policy backup --output combined.csv
+python CSV_Consolidator.py --inputs data/*.csv --output combined.csv --dry-run --save-workflow workflow.json
+python CSV_Consolidator.py --replay workflow.json
+python CSV_Consolidator.py --inputs data/*.csv --output combined.csv --workflow-history workflow-history.json
 python CSV_Consolidator.py --serve --port 8765
 ```
 
 SQL mode exposes each input as `input_0`, `input_1`, and so on through DuckDB. The opt-in upload API accepts raw file POSTs or browser-style multipart uploads at `POST /process` and exposes `GET /health`; it binds to localhost only, requires the per-run token printed at startup in `X-CSV-Power-Token` (or `Authorization: Bearer ...`), validates loopback Host/Origin headers, limits requests to 50 MiB and four active requests, and removes request files after processing. SQL is intentionally unavailable through the upload endpoint.
 
 Input processing defaults to failing safely on malformed rows, oversized cells, excessive rows/columns, invalid containers, and over-deep JSON. Use `--invalid-row-policy warn` to retain repairable ragged rows with warnings, or `--invalid-row-policy quarantine --quarantine rejected.jsonl` to omit malformed rows and record their source locations. Successful outputs are written through a same-directory temporary file and accompanied by `<output>.manifest.json`, containing input/output hashes, schema counts, configuration identity, warnings, and errors. Use `--collision-policy fail` or `backup` to control existing destinations, or `--no-manifest` when an audit sidecar is not wanted.
+
+Workflow files are versioned JSON documents with ordered operations, input patterns, output policy, configuration identity, and captured input metadata. `--dry-run` validates and prints the deterministic document without writing output; `--replay` can recover its inputs and output path; `--workflow-history` appends successful runs to bounded atomic history with changed-field metadata. Legacy plain configuration JSON is migrated when loaded.
 
 ### Packaging
 
