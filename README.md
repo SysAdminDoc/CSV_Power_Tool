@@ -29,6 +29,7 @@
 - Auto-detection of file delimiters and encodings
 - Schema-drift reports with samples, inferred types, and detection confidence
 - Frictionless-compatible Table Schema contracts with strict, advisory, and quarantine validation
+- Bounded read-only previews for large inputs, with scan budgets, cancellation, and JSON export
 - Recursive folder import
 - Process unlimited files at once
 
@@ -121,6 +122,7 @@ python CSV_Consolidator.py --inputs data/*.csv --output combined.csv
 python CSV_Consolidator.py --inputs exports --filter "date:between:2024-01-01..2024-12-31" --output filtered.xlsx
 python CSV_Consolidator.py --inputs exports --fuzzy-dedupe-threshold 88 --output deduped.parquet
 python CSV_Consolidator.py --inputs exports --dedupe-preview duplicate-preview.json
+python CSV_Consolidator.py --inputs exports --preview projected-preview.json --preview-scan-rows 5000
 python CSV_Consolidator.py --watch --inputs exports --output combined.csv
 python CSV_Consolidator.py --inputs exports --source-column "(Source)" --schema-report schema.json --output combined.csv
 python CSV_Consolidator.py --inputs data/*.csv --export-schema contract.json
@@ -142,6 +144,12 @@ SQL mode exposes each input as `input_0`, `input_1`, and so on through DuckDB. T
 Input processing defaults to failing safely on malformed rows, oversized cells, excessive rows/columns, invalid containers, and over-deep JSON. Use `--invalid-row-policy warn` to retain repairable ragged rows with warnings, or `--invalid-row-policy quarantine --quarantine rejected.jsonl` to omit malformed rows and record their source locations. Successful outputs are written through a same-directory temporary file and accompanied by `<output>.manifest.json`, containing input/output hashes, schema counts, configuration identity, warnings, and errors. Use `--collision-policy fail` or `backup` to control existing destinations, or `--no-manifest` when an audit sidecar is not wanted.
 
 Schema contracts use a documented first-version subset of the [Frictionless Table Schema](https://specs.frictionlessdata.io/table-schema/) format. `--export-schema` infers reusable field types and required/unique hints. `--schema-contract` accepts JSON contracts with string, integer, number, boolean, date, and datetime fields plus required, nullable, unique, missing-value, and primary-key constraints. `--validation-mode strict` preserves the existing output on any contract failure, `advisory` keeps rows and records warnings, and `quarantine` omits invalid rows into the JSONL quarantine file. `--validation-report` writes file/row/column/rule/observed-value diagnostics; `--validate-only` performs the same input validation without writing processed output. Unsupported Table Schema features are rejected explicitly.
+
+`--preview` writes a `csv-power-tool-preview` JSON artifact instead of running a full processing job. The default read-only budget is 100 returned rows, 5,000 scanned rows, 8 MiB of retained sample-cell text, 256 columns, and 16 KiB per cell; use the `--preview-*` options to tighten it. Preview metadata reports whether the scan was capped, how much work was sampled, truncation, cancellation, and the remaining-work state. Parquet input is read through bounded Arrow batches, JSONL is read line-by-line, and CSV/XLSX use read-only iterators. Full processing keeps the editable/output path separate.
+
+### Performance budgets and benchmark methodology
+
+The bounded-preview contract is measured with deterministic fixtures in `tests/test_bounded.py`. Run `python -m unittest discover -s tests -p test_bounded.py -v` to verify row/byte caps, cancellation, Parquet batch input, batched Parquet output, and CSV golden-output equivalence against the materialized path. The benchmark records correctness and budget adherence rather than claiming a universal wall-clock time; repeat it on the target machine when comparing parser/backend changes. `stream_batch_rows` (default 2,048) is the only large-table batch-size knob, and atomic output/cancellation tests must continue to prove that partial files never replace the destination.
 
 Workflow files are versioned JSON documents with ordered operations, input patterns, output policy, configuration identity, and captured input metadata. `--dry-run` validates and prints the deterministic document without writing output; `--replay` can recover its inputs and output path; `--workflow-history` appends successful runs to bounded atomic history with changed-field metadata. Legacy plain configuration JSON is migrated when loaded.
 

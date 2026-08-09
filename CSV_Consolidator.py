@@ -56,12 +56,43 @@ SUPPORTED_INPUT_SUFFIXES = {".csv", ".tsv", ".txt", ".xlsx", ".parquet", ".jsonl
 SUPPORTED_TEXT_SUFFIXES = {".csv", ".tsv", ".txt"}
 SUPPORTED_JSONL_SUFFIXES = {".jsonl", ".ndjson"}
 SUPPORTED_STREAM_SUFFIXES = SUPPORTED_TEXT_SUFFIXES | SUPPORTED_JSONL_SUFFIXES
+SUPPORTED_STREAM_INPUT_SUFFIXES = SUPPORTED_STREAM_SUFFIXES | {".parquet"}
+SUPPORTED_STREAM_OUTPUT_SUFFIXES = SUPPORTED_STREAM_SUFFIXES | {".parquet"}
 SUPPORTED_OUTPUT_SUFFIXES = {".csv", ".tsv", ".txt", ".xlsx", ".parquet", ".jsonl", ".ndjson"}
 
 
 def _optional_module(name: str):
     """Load a feature dependency lazily so headless/package startup stays small."""
     return importlib.import_module(name)
+
+
+def _write_json_atomic(path: str | Path, payload: dict) -> Path:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="\n",
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=target.parent,
+        delete=False,
+    )
+    temporary_path = Path(temporary.name)
+    try:
+        with temporary:
+            json.dump(payload, temporary, indent=2, ensure_ascii=False, default=str)
+            temporary.write("\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, target)
+    finally:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+    return target
+
 
 try:
     locale.setlocale(locale.LC_COLLATE, "")
@@ -154,6 +185,17 @@ FONTS = {
 # DATA MODELS
 # ══════════════════════════════════════════════════════════════════════════════
 
+@dataclass(frozen=True)
+class PreviewBudget:
+    """Hard limits for read-only preview scans."""
+
+    row_limit: int = 100
+    scan_row_limit: int = 5_000
+    scan_byte_limit: int = 8 * 1024 * 1024
+    column_limit: int = 256
+    cell_byte_limit: int = 16 * 1024
+
+
 @dataclass
 class ProcessingConfig:
     """Configuration for CSV processing."""
@@ -236,6 +278,7 @@ class ProcessingConfig:
     # Dataframe backend
     engine_backend: str = "auto"  # "auto", "python", or "polars"
     polars_threshold_bytes: int = 5_000_000
+    stream_batch_rows: int = 2_048
 
     # Output
     output_delimiter: str = ","
@@ -1839,7 +1882,7 @@ class CSVEngine:
             return False
         if getattr(self.config, "schema_contract", None):
             return False
-        if output_file.suffix.lower() not in SUPPORTED_STREAM_SUFFIXES:
+        if output_file.suffix.lower() not in SUPPORTED_STREAM_OUTPUT_SUFFIXES:
             return False
         try:
             output_resolved = output_file.resolve()
@@ -1847,7 +1890,120 @@ class CSVEngine:
                 return False
         except OSError:
             return False
-        return all(path.suffix.lower() in SUPPORTED_STREAM_SUFFIXES for path in input_files)
+        return all(path.suffix.lower() in SUPPORTED_STREAM_INPUT_SUFFIXES for path in input_files)
+
+    def _iter_parquet_rows(self, file_path: Path, batch_size: int | None = None):
+        """Yield Parquet rows in bounded Arrow batches.
+
+        The normal structured reader is intentionally retained for transforms
+        that require a full in-memory table.  The streaming lane uses Arrow's
+        batch iterator so large Parquet inputs never become one Python list.
+        """
+        if not self._validate_input_file(file_path):
+            self.stats.files_skipped += 1
+            return
+
+        norm_mode = getattr(self.config, "header_normalize", "none")
+        row_count = 0
+        try:
+            pq = _optional_module("pyarrow.parquet")
+            parquet_file = pq.ParquetFile(file_path)
+            metadata = parquet_file.metadata
+            if not self._check_column_limit(file_path, metadata.num_columns):
+                return
+            if not self._check_row_limit(file_path, metadata.num_rows):
+                return
+            batch_size = max(
+                1,
+                int(batch_size or getattr(self.config, "stream_batch_rows", 2_048)),
+            )
+            for batch in parquet_file.iter_batches(batch_size=batch_size):
+                for record in batch.to_pylist():
+                    row_number = row_count + 1
+                    cleaned = {}
+                    for key, value in record.items():
+                        normalized = self._normalize_header(str(key), norm_mode)
+                        if not normalized:
+                            continue
+                        if not self._check_cell_limit(file_path, value, normalized, row_number):
+                            return
+                        text_value = self._cell_to_text(value)
+                        cleaned[normalized] = (
+                            text_value.strip() if self.config.trim_whitespace else text_value
+                        )
+                    if self.config.source_column:
+                        cleaned[self.config.source_column] = self._source_for_file(file_path)
+                    row_count += 1
+                    yield cleaned
+        except ImportError as exc:
+            self.stats.files_skipped += 1
+            self._record_fatal_input(
+                file_path,
+                "pyarrow is required for bounded Parquet streaming",
+            )
+            self.log(f"XX Error reading {file_path.name}: {exc}", "error")
+            return
+        except Exception as exc:
+            self.stats.files_skipped += 1
+            self._record_fatal_input(file_path, f"error reading Parquet: {exc}")
+            self.log(f"XX Error reading {file_path.name}: {exc}", "error")
+            return
+
+        self.stats.files_processed += 1
+        self.stats.total_rows_read += row_count
+        self.log(f"OK {file_path.name} ({row_count:,} Parquet rows, batched)", "success")
+
+    def _iter_xlsx_rows(self, file_path: Path):
+        """Yield read-only workbook rows for bounded preview scans."""
+        if not self._validate_input_file(file_path):
+            self.stats.files_skipped += 1
+            return
+
+        norm_mode = getattr(self.config, "header_normalize", "none")
+        row_count = 0
+        workbook = None
+        try:
+            load_workbook = _optional_module("openpyxl").load_workbook
+            workbook = load_workbook(file_path, read_only=True, data_only=True)
+            sheet = workbook.active
+            row_iter = sheet.iter_rows(values_only=True)
+            raw_headers = next(row_iter, [])
+            if not self._check_column_limit(file_path, len(raw_headers)):
+                return
+            headers = [
+                self._normalize_header(self._cell_to_text(header), norm_mode)
+                for header in raw_headers
+            ]
+            for row_number, values in enumerate(row_iter, 2):
+                if not self._check_row_limit(file_path, row_count + 1, row_number):
+                    return
+                cleaned = {}
+                for index, header in enumerate(headers):
+                    if not header:
+                        continue
+                    value = values[index] if index < len(values) else ""
+                    if not self._check_cell_limit(file_path, value, header, row_number):
+                        return
+                    text_value = self._cell_to_text(value)
+                    cleaned[header] = (
+                        text_value.strip() if self.config.trim_whitespace else text_value
+                    )
+                if self.config.source_column:
+                    cleaned[self.config.source_column] = self._source_for_file(file_path)
+                row_count += 1
+                yield cleaned
+        except Exception as exc:
+            self.stats.files_skipped += 1
+            self._record_fatal_input(file_path, f"error reading workbook: {exc}")
+            self.log(f"XX Error reading {file_path.name}: {exc}", "error")
+            return
+        finally:
+            if workbook is not None:
+                workbook.close()
+
+        self.stats.files_processed += 1
+        self.stats.total_rows_read += row_count
+        self.log(f"OK {file_path.name} ({row_count:,} workbook rows, read-only)", "success")
 
     def _iter_jsonl_rows(self, file_path: Path):
         if not self._validate_input_file(file_path):
@@ -1981,6 +2137,7 @@ class CSVEngine:
         self.stats.unique_columns = len(discovered_order)
 
         is_jsonl = output_file.suffix.lower() in SUPPORTED_JSONL_SUFFIXES
+        is_parquet = output_file.suffix.lower() == ".parquet"
         quoting_map = {
             "minimal": csv.QUOTE_MINIMAL,
             "all": csv.QUOTE_ALL,
@@ -1991,10 +2148,41 @@ class CSVEngine:
         newline = "\n" if self.config.line_ending == "unix" else "\r\n" if self.config.line_ending == "windows" else ""
 
         temporary = None
+        handle = None
+        parquet_writer = None
+        parquet_rows = []
+        parquet_batch_size = max(1, int(getattr(self.config, "stream_batch_rows", 2_048)))
+
+        def flush_parquet_rows():
+            nonlocal parquet_rows
+            if not parquet_rows:
+                return
+            pa = _optional_module("pyarrow")
+            table = pa.table({
+                column: pa.array(
+                    [row.get(column, "") for row in parquet_rows],
+                    type=pa.string(),
+                )
+                for column in output_columns
+            })
+            parquet_writer.write_table(table)
+            parquet_rows = []
+
         try:
             temporary = self._temporary_output_path(output_file)
-            with open(temporary, 'w', encoding=self.config.output_encoding, newline=newline if newline else '') as handle:
-                writer = None
+            writer = None
+            if is_parquet:
+                pa = _optional_module("pyarrow")
+                pq = _optional_module("pyarrow.parquet")
+                schema = pa.schema([pa.field(column, pa.string()) for column in output_columns])
+                parquet_writer = pq.ParquetWriter(str(temporary), schema)
+            else:
+                handle = open(
+                    temporary,
+                    "w",
+                    encoding=self.config.output_encoding,
+                    newline=newline if newline else "",
+                )
                 if not is_jsonl:
                     writer = csv.DictWriter(
                         handle,
@@ -2006,45 +2194,61 @@ class CSVEngine:
                     if self.config.include_header:
                         writer.writeheader()
 
-                total_files = len(input_files)
-                for idx, csv_path in enumerate(input_files):
+            total_files = len(input_files)
+            for idx, csv_path in enumerate(input_files):
+                if self.cancelled:
+                    raise ProcessingCancelled()
+
+                progress = (idx / total_files) * 90
+                self.update_progress(progress, f"Streaming {csv_path.name}...")
+
+                suffix = csv_path.suffix.lower()
+                if suffix in SUPPORTED_JSONL_SUFFIXES:
+                    iterator = self._iter_jsonl_rows(csv_path)
+                elif suffix == ".parquet":
+                    iterator = self._iter_parquet_rows(csv_path)
+                else:
+                    iterator = self._iter_text_rows(csv_path)
+                for row in iterator:
                     if self.cancelled:
                         raise ProcessingCancelled()
+                    if self.config.filters and not self._row_matches_filters(row):
+                        self.stats.rows_filtered += 1
+                        continue
 
-                    progress = (idx / total_files) * 90
-                    self.update_progress(progress, f"Streaming {csv_path.name}...")
+                    transformed = self._apply_transformations([row], final_columns)[0]
+                    transformed = self._redact_row(transformed)
+                    if is_parquet:
+                        parquet_rows.append({
+                            column: transformed.get(column, "")
+                            for column in output_columns
+                        })
+                        if len(parquet_rows) >= parquet_batch_size:
+                            flush_parquet_rows()
+                    elif is_jsonl:
+                        json.dump(
+                            {column: transformed.get(column, "") for column in output_columns},
+                            handle,
+                            ensure_ascii=False,
+                        )
+                        handle.write("\n")
+                    else:
+                        writer.writerow(transformed)
+                    self._record_summary(transformed, output_columns)
+                    self.stats.final_row_count += 1
 
-                    iterator = (
-                        self._iter_jsonl_rows(csv_path)
-                        if csv_path.suffix.lower() in SUPPORTED_JSONL_SUFFIXES
-                        else self._iter_text_rows(csv_path)
-                    )
-                    for row in iterator:
-                        if self.cancelled:
-                            raise ProcessingCancelled()
-                        if self.config.filters and not self._row_matches_filters(row):
-                            self.stats.rows_filtered += 1
-                            continue
-
-                        transformed = self._apply_transformations([row], final_columns)[0]
-                        transformed = self._redact_row(transformed)
-                        if is_jsonl:
-                            json.dump(
-                                {column: transformed.get(column, "") for column in output_columns},
-                                handle,
-                                ensure_ascii=False,
-                            )
-                            handle.write("\n")
-                        else:
-                            writer.writerow(transformed)
-                        self._record_summary(transformed, output_columns)
-                        self.stats.final_row_count += 1
-
-                self._write_quarantine()
-                if self.stats.fatal_input_errors or self.stats.errors:
-                    raise RuntimeError("input validation failed; output was not replaced")
+            self._write_quarantine()
+            if self.stats.fatal_input_errors or self.stats.errors:
+                raise RuntimeError("input validation failed; output was not replaced")
+            if is_parquet:
+                flush_parquet_rows()
+                parquet_writer.close()
+                parquet_writer = None
+            else:
                 handle.flush()
                 os.fsync(handle.fileno())
+                handle.close()
+                handle = None
 
             self._fsync_file(temporary)
             backup_path = self._commit_output(temporary, output_file)
@@ -2061,6 +2265,10 @@ class CSVEngine:
             self.stats.errors.append(message)
             self.log(f"XX {message}", "error")
         finally:
+            if handle is not None:
+                handle.close()
+            if parquet_writer is not None:
+                parquet_writer.close()
             if temporary is not None:
                 try:
                     temporary.unlink()
@@ -2068,35 +2276,269 @@ class CSVEngine:
                     pass
         return self.stats
 
-    def preview(self, input_files: list[Path], limit: int = 100) -> dict:
-        """Process into a private temporary CSV and return the projected first rows."""
-        limit = max(1, int(limit))
-        preview_config = copy.deepcopy(self.config)
-        preview_config.streaming_enabled = False
-        preview_config.include_header = True
-        preview_config.output_encoding = "utf-8"
-        preview_config.output_delimiter = ","
-        preview_config.output_quoting = "minimal"
-        preview_config.line_ending = "unix"
+    def _preview_columns_for_file(self, file_path: Path, row_limit: int) -> list[str]:
+        suffix = file_path.suffix.lower()
+        norm_mode = getattr(self.config, "header_normalize", "none")
+        if suffix in SUPPORTED_TEXT_SUFFIXES:
+            encoding, delimiter, quotechar = self._detect_file_params(file_path)
+            with open(file_path, "r", encoding=encoding, newline="") as handle:
+                headers = next(csv.reader(handle, delimiter=delimiter, quotechar=quotechar), [])
+            return [
+                normalized
+                for header in headers
+                if (normalized := self._normalize_header(header, norm_mode))
+            ]
+        if suffix in SUPPORTED_JSONL_SUFFIXES:
+            columns = []
+            seen = set()
+            for index, row in enumerate(self._iter_jsonl_rows(file_path)):
+                if index >= row_limit:
+                    break
+                for key in row:
+                    normalized = self._normalize_header(str(key), norm_mode)
+                    if normalized and normalized not in seen:
+                        seen.add(normalized)
+                        columns.append(normalized)
+            return columns
+        return self._discover_structured_columns(file_path)
 
-        with tempfile.TemporaryDirectory(prefix="csv-power-preview-") as temp_dir:
-            output_path = Path(temp_dir) / "preview.csv"
-            preview_engine = CSVEngine(preview_config)
-            stats = preview_engine.process(input_files, output_path)
-            if not output_path.exists():
-                return {
-                    "columns": preview_engine.discover_columns(input_files),
-                    "rows": [],
-                    "stats": stats,
-                }
-            with output_path.open("r", encoding="utf-8", newline="") as handle:
-                reader = csv.DictReader(handle)
-                rows = list(reader)
-            return {
-                "columns": list(reader.fieldnames or []),
-                "rows": rows[:limit],
-                "stats": stats,
-            }
+    def discover_columns_bounded(self, files: list[Path], row_limit: int = 256) -> list[str]:
+        """Discover columns without scanning an entire JSONL or table input."""
+        all_columns = []
+        seen = set()
+        per_file_columns = []
+        for raw_path in files:
+            file_path = Path(raw_path)
+            try:
+                if not self._validate_input_file(file_path):
+                    continue
+                file_columns = self._preview_columns_for_file(file_path, max(1, int(row_limit)))
+            except (OSError, RuntimeError, ValueError, UnicodeDecodeError) as exc:
+                self._record_fatal_input(file_path, f"unable to discover bounded columns: {exc}")
+                continue
+            per_file_columns.append(set(file_columns))
+            for column in file_columns:
+                if column not in seen:
+                    seen.add(column)
+                    all_columns.append(column)
+
+        schema_mode = getattr(self.config, "schema_mode", "union")
+        if schema_mode == "intersection" and per_file_columns:
+            common = per_file_columns[0]
+            for columns in per_file_columns[1:]:
+                common &= columns
+            all_columns = [column for column in all_columns if column in common]
+        elif schema_mode == "first_file" and per_file_columns:
+            first = per_file_columns[0]
+            all_columns = [column for column in all_columns if column in first]
+
+        source_column = getattr(self.config, "source_column", "").strip()
+        if source_column and source_column not in all_columns:
+            all_columns.append(source_column)
+        return all_columns
+
+    def _preview_row_iterator(self, file_path: Path, batch_size: int | None = None):
+        suffix = file_path.suffix.lower()
+        if suffix in SUPPORTED_JSONL_SUFFIXES:
+            return self._iter_jsonl_rows(file_path)
+        if suffix == ".parquet":
+            return self._iter_parquet_rows(file_path, batch_size=batch_size)
+        if suffix == ".xlsx":
+            return self._iter_xlsx_rows(file_path)
+        if suffix in SUPPORTED_TEXT_SUFFIXES:
+            return self._iter_text_rows(file_path)
+        raise ValueError(f"Unsupported preview input type: {suffix or '(none)'}")
+
+    def _clip_preview_row(self, row: dict, budget: PreviewBudget) -> tuple[dict, int, bool, bool]:
+        clipped = {}
+        byte_count = 0
+        cell_truncated = False
+        column_truncated = len(row) > budget.column_limit
+        for index, (column, value) in enumerate(row.items()):
+            if index >= budget.column_limit:
+                break
+            text = self._cell_to_text(value)
+            encoded = text.encode("utf-8")
+            if len(encoded) > budget.cell_byte_limit:
+                text = encoded[:budget.cell_byte_limit].decode("utf-8", errors="ignore")
+                text += "…"
+                cell_truncated = True
+            clipped[column] = text
+            byte_count += len(text.encode("utf-8"))
+        return clipped, byte_count, cell_truncated, column_truncated
+
+    def preview(
+        self,
+        input_files: list[Path],
+        limit: int = 100,
+        budget: PreviewBudget | None = None,
+    ) -> dict:
+        """Return a cancellable, read-only projected sample under hard budgets."""
+        requested_limit = max(1, int(limit))
+        base_budget = budget or PreviewBudget(row_limit=requested_limit)
+        preview_budget = PreviewBudget(
+            row_limit=min(requested_limit, max(1, int(base_budget.row_limit))),
+            scan_row_limit=max(1, int(base_budget.scan_row_limit)),
+            scan_byte_limit=max(1, int(base_budget.scan_byte_limit)),
+            column_limit=max(1, int(base_budget.column_limit)),
+            cell_byte_limit=max(1, int(base_budget.cell_byte_limit)),
+        )
+        self.cancelled = False
+        self.stats = ProcessingStats()
+        self._schema_reports = []
+        all_rows = []
+        all_columns = set()
+        column_order = []
+        per_file_columns = []
+        file_reports = []
+        rows_scanned = 0
+        bytes_scanned = 0
+        files_scanned = 0
+        scan_truncated = False
+        cells_truncated = False
+        columns_truncated = False
+        started = time.perf_counter()
+
+        for file_index, raw_path in enumerate(input_files):
+            file_path = Path(raw_path)
+            if self.cancelled:
+                break
+            try:
+                file_columns = self._preview_columns_for_file(
+                    file_path,
+                    min(preview_budget.scan_row_limit, 256),
+                )
+            except (OSError, RuntimeError, ValueError, UnicodeDecodeError) as exc:
+                self._record_fatal_input(file_path, f"unable to preview columns: {exc}")
+                file_columns = []
+            per_file_columns.append(set(file_columns))
+            for column in file_columns:
+                if column not in all_columns:
+                    all_columns.add(column)
+                    column_order.append(column)
+
+            file_rows = 0
+            file_bytes = 0
+            if rows_scanned < preview_budget.scan_row_limit and not self.cancelled:
+                try:
+                    iterator = self._preview_row_iterator(
+                        file_path,
+                        batch_size=min(
+                            preview_budget.scan_row_limit - rows_scanned,
+                            int(getattr(self.config, "stream_batch_rows", 2_048)),
+                        ),
+                    )
+                    for row in iterator:
+                        if self.cancelled:
+                            break
+                        if rows_scanned >= preview_budget.scan_row_limit:
+                            scan_truncated = True
+                            break
+                        clipped, row_bytes, cell_cut, column_cut = self._clip_preview_row(
+                            row, preview_budget
+                        )
+                        if bytes_scanned + row_bytes > preview_budget.scan_byte_limit:
+                            scan_truncated = True
+                            break
+                        all_rows.append(clipped)
+                        rows_scanned += 1
+                        file_rows += 1
+                        bytes_scanned += row_bytes
+                        file_bytes += row_bytes
+                        cells_truncated = cells_truncated or cell_cut
+                        columns_truncated = columns_truncated or column_cut
+                        if rows_scanned % 256 == 0:
+                            self.update_progress(
+                                ((file_index + 0.5) / max(1, len(input_files))) * 100,
+                                f"Preview scanning {file_path.name} ({rows_scanned:,} row(s))",
+                            )
+                    else:
+                        files_scanned += 1
+                except (OSError, RuntimeError, ValueError, UnicodeDecodeError) as exc:
+                    self._record_fatal_input(file_path, f"preview scan failed: {exc}")
+            elif rows_scanned >= preview_budget.scan_row_limit:
+                scan_truncated = True
+            file_reports.append({
+                "file": str(file_path),
+                "rows_scanned": file_rows,
+                "bytes_scanned": file_bytes,
+                "columns": file_columns[:preview_budget.column_limit],
+            })
+            self.update_progress(
+                ((file_index + 1) / max(1, len(input_files))) * 100,
+                f"Preview scanned {file_path.name} ({rows_scanned:,} row(s))",
+            )
+
+        if len(column_order) > preview_budget.column_limit:
+            column_order = column_order[:preview_budget.column_limit]
+            columns_truncated = True
+
+        source_column = getattr(self.config, "source_column", "").strip()
+        if source_column and source_column not in column_order and len(column_order) < preview_budget.column_limit:
+            column_order.append(source_column)
+
+        schema_mode = getattr(self.config, "schema_mode", "union")
+        if schema_mode == "intersection" and per_file_columns:
+            common = per_file_columns[0]
+            for columns in per_file_columns[1:]:
+                common &= columns
+            column_order = [column for column in column_order if column in common]
+        elif schema_mode == "first_file" and per_file_columns:
+            first = per_file_columns[0]
+            column_order = [column for column in column_order if column in first]
+
+        final_columns = self._with_transform_columns(self._get_final_columns(column_order))
+        if self.config.filters and not self.cancelled:
+            all_rows = self._apply_filters(all_rows)
+        if not self.cancelled:
+            all_rows = self._apply_transformations(all_rows, final_columns)
+        if not self.cancelled and (
+            getattr(self.config, "unpivot_columns", None)
+            or getattr(self.config, "pivot_column", "")
+        ):
+            all_rows, final_columns = self._apply_reshape(all_rows, final_columns)
+        if self.config.dedupe_enabled and not self.cancelled:
+            all_rows = self._deduplicate(all_rows, final_columns)
+        if self.config.sort_enabled and self.config.sort_columns and not self.cancelled:
+            all_rows = self._sort_rows(all_rows, final_columns)
+        all_rows = [self._redact_row(row) for row in all_rows]
+        output_columns = [self.config.column_mapping.get(c, c) for c in final_columns]
+        if len(all_rows) > preview_budget.row_limit:
+            scan_truncated = True
+        all_rows = all_rows[:preview_budget.row_limit]
+
+        self.stats.files_processed = files_scanned
+        self.stats.total_rows_read = rows_scanned
+        self.stats.unique_columns = len(output_columns)
+        self.stats.final_row_count = len(all_rows)
+        self._compute_column_summary(all_rows, output_columns)
+        self.update_progress(100, "Preview ready (read-only sample)")
+        return {
+            "columns": output_columns,
+            "rows": all_rows,
+            "stats": self.stats,
+            "mode": "read-only",
+            "bounded": True,
+            "metadata": {
+                "mode": "read-only",
+                "scan_row_limit": preview_budget.scan_row_limit,
+                "row_limit": preview_budget.row_limit,
+                "scan_byte_limit": preview_budget.scan_byte_limit,
+                "column_limit": preview_budget.column_limit,
+                "cell_byte_limit": preview_budget.cell_byte_limit,
+                "rows_scanned": rows_scanned,
+                "bytes_scanned": bytes_scanned,
+                "scan_truncated": scan_truncated,
+                "cells_truncated": cells_truncated,
+                "columns_truncated": columns_truncated,
+                "cancelled": self.cancelled,
+                "remaining_rows": None if scan_truncated else 0,
+                "files_scanned": files_scanned,
+                "files_remaining": max(0, len(input_files) - files_scanned),
+                "files": file_reports,
+                "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+            },
+        }
     
     def _should_use_polars(self, file_path: Path) -> bool:
         backend = getattr(self.config, "engine_backend", "auto")
@@ -4357,7 +4799,7 @@ class LogPanel(ctk.CTkFrame):
 
 
 class PreviewPanel(ctk.CTkFrame):
-    """Projected output preview, capped to the first 100 rows."""
+    """Read-only projected sample with explicit bounded-scan status."""
 
     @staticmethod
     def format_preview(columns: list[str], rows: list[dict], max_width: int = 24) -> str:
@@ -4381,13 +4823,14 @@ class PreviewPanel(ctk.CTkFrame):
             lines.append("(no rows)")
         return "\n".join(lines)
 
-    def __init__(self, master, on_refresh: Callable = None, **kwargs):
+    def __init__(self, master, on_refresh: Callable = None, on_cancel: Callable = None, **kwargs):
         if "fg_color" not in kwargs:
             kwargs["fg_color"] = COLORS["bg_secondary"]
         if "corner_radius" not in kwargs:
             kwargs["corner_radius"] = 8
         super().__init__(master, **kwargs)
         self.on_refresh = on_refresh
+        self.on_cancel = on_cancel
 
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.pack(fill="x", padx=12, pady=(10, 6))
@@ -4396,13 +4839,22 @@ class PreviewPanel(ctk.CTkFrame):
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color=COLORS["text_primary"],
         ).pack(side="left")
+        actions = ctk.CTkFrame(header, fg_color="transparent")
+        actions.pack(side="right")
         ctk.CTkButton(
-            header, text="Refresh", width=64, height=24,
+            actions, text="Cancel", width=58, height=24,
+            font=ctk.CTkFont(size=10),
+            fg_color=COLORS["bg_tertiary"], hover_color=COLORS["accent_red"],
+            text_color=COLORS["text_secondary"], corner_radius=4,
+            command=lambda: self.on_cancel() if self.on_cancel else None,
+        ).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(
+            actions, text="Refresh", width=64, height=24,
             font=ctk.CTkFont(size=10),
             fg_color=COLORS["bg_tertiary"], hover_color=COLORS["accent_blue"],
             text_color=COLORS["text_secondary"], corner_radius=4,
             command=lambda: self.on_refresh() if self.on_refresh else None,
-        ).pack(side="right")
+        ).pack(side="left")
 
         self.status_label = ctk.CTkLabel(
             self, text="Add files to preview projected output",
@@ -4419,14 +4871,22 @@ class PreviewPanel(ctk.CTkFrame):
     def update_preview(self, preview: dict):
         columns = preview.get("columns", [])
         rows = preview.get("rows", [])
-        stats = preview.get("stats")
         text = self.format_preview(columns, rows)
         self.preview_text.configure(state="normal")
         self.preview_text.delete("1.0", END)
         self.preview_text.insert("1.0", text)
         self.preview_text.configure(state="disabled")
-        final_count = getattr(stats, "final_row_count", len(rows)) if stats else len(rows)
-        self.status_label.configure(text=f"Showing {len(rows):,} of {final_count:,} projected row(s)")
+        metadata = preview.get("metadata", {})
+        if metadata.get("cancelled"):
+            status = f"Cancelled after scanning {metadata.get('rows_scanned', 0):,} row(s)"
+        elif metadata.get("scan_truncated"):
+            status = (
+                f"Read-only sample: showing {len(rows):,}; scanned "
+                f"{metadata.get('rows_scanned', 0):,} row(s) within the preview budget"
+            )
+        else:
+            status = f"Read-only sample: {len(rows):,} row(s) scanned within the preview budget"
+        self.status_label.configure(text=status)
 
     def reset(self, message: str = "Add files to preview projected output"):
         self.preview_text.configure(state="normal")
@@ -4535,6 +4995,7 @@ class CSVPowerToolApp:
         self._config_overrides = {}
         self._preview_job = None
         self._preview_generation = 0
+        self._preview_engine = None
         self.history = None
         self.workflow_history_path = Path.home() / ".csv-power-tool" / "workflow-history.json"
         
@@ -4656,7 +5117,12 @@ class CSVPowerToolApp:
         self.stats_panel = StatsPanel(right_col)
         self.stats_panel.pack(fill="x", pady=(0, 8))
 
-        self.preview_panel = PreviewPanel(right_col, on_refresh=self._refresh_preview, height=260)
+        self.preview_panel = PreviewPanel(
+            right_col,
+            on_refresh=self._refresh_preview,
+            on_cancel=self._cancel_preview,
+            height=260,
+        )
         self.preview_panel.pack(fill="x", pady=(0, 8))
         self.preview_panel.pack_propagate(False)
         
@@ -4763,7 +5229,7 @@ class CSVPowerToolApp:
     
     def _on_files_changed(self):
         if self.file_panel.files:
-            columns = CSVEngine(ProcessingConfig()).discover_columns(self.file_panel.files)
+            columns = CSVEngine(ProcessingConfig()).discover_columns_bounded(self.file_panel.files)
             self.column_panel.set_columns(columns)
             self.sort_panel.set_columns(columns)
             self.dedupe_panel.set_columns(columns)
@@ -4801,19 +5267,45 @@ class CSVPowerToolApp:
                 pass
         self._preview_job = self.root.after(250, self._refresh_preview)
 
+    def _cancel_preview(self):
+        self._preview_generation += 1
+        if self._preview_engine is not None:
+            self._preview_engine.cancel()
+        if hasattr(self, "preview_panel"):
+            self.preview_panel.status_label.configure(text="Cancelling read-only preview…")
+
+    def _preview_progress(self, generation: int, value: float, status: str):
+        if generation != self._preview_generation:
+            return
+        self.root.after(
+            0,
+            lambda: self.preview_panel.status_label.configure(
+                text=f"{status} ({value:.0f}%)"
+            ) if generation == self._preview_generation else None,
+        )
+
     def _refresh_preview(self):
         self._preview_job = None
         if self.processing or not self.file_panel.files:
             return
+        if self._preview_engine is not None:
+            self._preview_engine.cancel()
         files = list(self.file_panel.files)
         config = self._build_config()
         self._preview_generation += 1
         generation = self._preview_generation
-        self.preview_panel.status_label.configure(text="Preparing projected output…")
+        self.preview_panel.status_label.configure(text="Preparing bounded read-only preview…")
 
         def run():
+            preview_engine = CSVEngine(
+                config,
+                progress_callback=lambda value, status: self._preview_progress(
+                    generation, value, status
+                ),
+            )
+            self._preview_engine = preview_engine
             try:
-                preview = CSVEngine(config).preview(files, limit=100)
+                preview = preview_engine.preview(files, limit=100)
                 self.root.after(
                     0,
                     lambda: self.preview_panel.update_preview(preview)
@@ -4826,6 +5318,9 @@ class CSVPowerToolApp:
                     lambda message=error_message: self.preview_panel.reset(f"Preview error: {message}")
                     if generation == self._preview_generation else None,
                 )
+            finally:
+                if self._preview_engine is preview_engine:
+                    self._preview_engine = None
 
         threading.Thread(target=run, daemon=True).start()
     
@@ -5209,6 +5704,17 @@ def cli_main(argv=None):
     parser.add_argument("--dedupe-aggregate-separator", default="; ",
                         help="Separator for --dedupe-aggregate concat")
     parser.add_argument("--dedupe-preview", help="Write a JSON duplicate preview without requiring an output file")
+    parser.add_argument("--preview", help="Write a bounded, read-only projected preview JSON artifact")
+    parser.add_argument("--preview-rows", type=int, default=100,
+                        help="Rows to return in a bounded preview")
+    parser.add_argument("--preview-scan-rows", type=int, default=5_000,
+                        help="Maximum rows scanned by a bounded preview")
+    parser.add_argument("--preview-scan-bytes", type=int, default=8 * 1024 * 1024,
+                        help="Maximum sampled cell bytes retained by a bounded preview")
+    parser.add_argument("--preview-columns", type=int, default=256,
+                        help="Maximum columns retained by a bounded preview")
+    parser.add_argument("--preview-cell-bytes", type=int, default=16 * 1024,
+                        help="Maximum UTF-8 bytes retained per preview cell")
     parser.add_argument("--filter", action="append", metavar="COL:OP:VALUE",
                         help="Add a filter rule. Operators include between, fuzzy, regex, contains")
     parser.add_argument("--sort", nargs="+", metavar="COL[:asc|desc]",
@@ -5232,6 +5738,8 @@ def cli_main(argv=None):
                         default=None, help="Schema unification mode")
     parser.add_argument("--backend", choices=["auto", "python", "polars"], default=None,
                         help="Text parsing backend; polars is recommended for large in-memory jobs")
+    parser.add_argument("--stream-batch-rows", type=int, default=None,
+                        help="Rows held per Parquet streaming batch")
     parser.add_argument("--column-template", help="Use this input's column order as the output template")
     parser.add_argument("--source-column", help="Add a provenance column containing each source file")
     parser.add_argument("--source-path", action="store_true", help="Store the full source path instead of the file name")
@@ -5304,7 +5812,7 @@ def cli_main(argv=None):
     if not args.serve and not args.inputs and not args.dry_run and not args.validate_only and not args.export_schema:
         parser.error("--inputs, --config, or --replay is required unless --register-git-driver is used")
     if not args.serve and not args.dry_run and not args.output and not args.dedupe_preview \
-            and not args.validate_only and not args.export_schema:
+            and not args.preview and not args.validate_only and not args.export_schema:
         parser.error("--output is required unless --dry-run or --dedupe-preview is used")
     if (args.join_on or args.three_way_base or args.three_way_ours or args.three_way_theirs) and not args.output:
         parser.error("--output is required for join and three-way merge operations")
@@ -5435,6 +5943,10 @@ def cli_main(argv=None):
         config.schema_mode = args.schema_mode
     if args.backend is not None:
         config.engine_backend = args.backend
+    if args.stream_batch_rows is not None:
+        if args.stream_batch_rows < 1:
+            parser.error("--stream-batch-rows must be at least 1")
+        config.stream_batch_rows = args.stream_batch_rows
     if args.no_stream:
         config.streaming_enabled = False
     if args.column_template:
@@ -5657,6 +6169,40 @@ def cli_main(argv=None):
             engine.write_schema_report(input_files, Path(args.schema_report))
             if not args.quiet:
                 print(f"  Schema report: {args.schema_report}", file=sys.stderr)
+
+        if args.preview:
+            preview = engine.preview(
+                input_files,
+                limit=args.preview_rows,
+                budget=PreviewBudget(
+                    row_limit=args.preview_rows,
+                    scan_row_limit=args.preview_scan_rows,
+                    scan_byte_limit=args.preview_scan_bytes,
+                    column_limit=args.preview_columns,
+                    cell_byte_limit=args.preview_cell_bytes,
+                ),
+            )
+            preview_payload = {
+                "format": "csv-power-tool-preview",
+                "version": 1,
+                "columns": preview["columns"],
+                "rows": preview["rows"],
+                "metadata": preview["metadata"],
+                "stats": asdict(preview["stats"]),
+            }
+            try:
+                _write_json_atomic(args.preview, preview_payload)
+            except (OSError, TypeError, ValueError) as exc:
+                print(f"Error writing bounded preview: {exc}", file=sys.stderr)
+                return 3
+            if not args.quiet:
+                print(
+                    f"  Bounded preview: {args.preview} ({len(preview['rows']):,} row(s), "
+                    f"{preview['metadata']['rows_scanned']:,} scanned)",
+                    file=sys.stderr,
+                )
+            if not args.output:
+                return 3 if engine.stats.errors else 0
 
         if args.dedupe_preview:
             preview_report = build_dedupe_preview(engine, input_files)
