@@ -32,7 +32,8 @@ dev = [
 ]
 
 [project.scripts]
-csv-power-tool = "CSV_Consolidator:cli_main"
+csv-power-tool = "csv_power_tool.cli:main"
 
 [tool.setuptools]
 py-modules = ["CSV_Consolidator"]
+packages = ["csv_power_tool"]

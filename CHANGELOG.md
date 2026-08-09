@@ -8,6 +8,7 @@ All notable changes to CSV_Power_Tool will be documented in this file.
 - Reliability: Added configurable input byte/row/column/cell/container limits, explicit malformed-row fail/warn/quarantine policies, safe rejection of partial inputs, atomic output replacement, collision backups, and hash-based run manifests.
 - Release: Locked runtime and build dependencies, added a clean-build CI lane with dependency auditing, and emitted a dependency/license manifest beside packaged executables.
 - Testing: Added parser property fixtures, format/encoding coverage, cancellation checks, CLI contract tests, bounded performance coverage, and clean-package regression smoke tests.
+- Architecture: Added dependency-injected core, CLI, GUI, and loopback API seams while preserving the single-file launcher and existing command-line flags.
 
 ## [v3.2.0] - 2026-08-03
 

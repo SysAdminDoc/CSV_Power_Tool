@@ -236,6 +236,13 @@ Load a saved configuration:
 The exact runtime set is maintained in [`requirements.lock`](requirements.lock); install it through
 `requirements.txt` so local and release environments resolve the same versions.
 
+### Architecture seams
+
+`CSV_Consolidator.py` remains the compatible launcher, while the `csv_power_tool` package provides
+testable boundaries: `core.EngineService`/`ProcessRequest` for processing, `api` for authenticated
+loopback transport, `cli` for injectable command arguments, and `gui` for injected application startup.
+These adapters do not start a GUI during import and are included by the clean PyInstaller build.
+
 ---
 
 ## 📄 License

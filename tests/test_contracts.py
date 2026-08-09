@@ -10,6 +10,8 @@ import time
 import unittest
 from pathlib import Path
 
+from csv_power_tool.core import EngineService, ProcessRequest
+
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "CSV_Consolidator.py"
 SPEC = importlib.util.spec_from_file_location("csv_consolidator_contracts", MODULE_PATH)
@@ -147,6 +149,29 @@ class ParserContractTests(unittest.TestCase):
             self.assertTrue(stats.cancelled)
             self.assertEqual(output_path.read_text(encoding="utf-8"), "previous\n")
             self.assertEqual(list(root.glob(".*output.csv.*")), [])
+
+    def test_engine_service_boundary_accepts_an_injected_engine(self):
+        calls = {}
+
+        class FakeEngine:
+            def process(self, input_files, output_file):
+                calls["input_files"] = input_files
+                calls["output_file"] = output_file
+                return "fake-stats"
+
+        def factory(config, progress_callback=None, log_callback=None):
+            calls["config"] = config
+            calls["callbacks"] = (progress_callback, log_callback)
+            return FakeEngine()
+
+        config = object()
+        request = ProcessRequest.from_paths(["one.csv", Path("two.csv")], "output.csv", config)
+        result = EngineService(factory).process(request)
+
+        self.assertEqual(result, "fake-stats")
+        self.assertEqual(calls["config"], config)
+        self.assertEqual(calls["input_files"], [Path("one.csv"), Path("two.csv")])
+        self.assertEqual(calls["output_file"], Path("output.csv"))
 
 
 class CLIContractTests(unittest.TestCase):
