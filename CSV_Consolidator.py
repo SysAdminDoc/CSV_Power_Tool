@@ -17,6 +17,7 @@ import os
 import shutil
 import threading
 import time
+import traceback
 import locale
 import tempfile
 import zipfile
@@ -67,6 +68,22 @@ from csv_power_tool.joins import (
     execute_three_way,
 )
 from csv_power_tool.sql import SQLQueryError, execute_sql_query
+from csv_power_tool.gui_accessibility import (
+    accessible_name,
+    collect_focusables,
+    prepare_focus_widget,
+    set_accessible_name,
+    set_focus_ring,
+    validate_theme_contrast,
+    widget_contains,
+)
+from csv_power_tool.i18n import (
+    locale_choices,
+    locale_label,
+    normalize_locale,
+    set_locale,
+    tr,
+)
 
 APP_NAME = "CSV Power Tool"
 APP_VERSION = "3.2.0"
@@ -155,7 +172,7 @@ COLORS = {
     "border_light": "#475569",
     "text_primary": "#f8fafc",
     "text_secondary": "#94a3b8",
-    "text_muted": "#64748b",
+    "text_muted": "#94a3b8",
     "accent_green": "#22c55e",
     "accent_green_hover": "#16a34a",
     "accent_blue": "#60a5fa",
@@ -165,6 +182,7 @@ COLORS = {
     "accent_orange": "#f97316",
     "accent_red": "#ef4444",
     "accent_cyan": "#22d3ee",
+    "text_on_accent": "#052e16",
     "success": "#22c55e",
     "warning": "#f59e0b",
     "error": "#ef4444",
@@ -3552,7 +3570,7 @@ class FileListPanel(ctk.CTkFrame):
         header.pack(fill="x", padx=12, pady=(12, 8))
         
         ctk.CTkLabel(
-            header, text="📁 Input Files",
+            header, text=tr("input_files"),
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color=COLORS["text_primary"]
         ).pack(side="left")
@@ -3577,7 +3595,7 @@ class FileListPanel(ctk.CTkFrame):
         
         self.placeholder = ctk.CTkLabel(
             self.scroll_frame,
-            text="Drag & drop CSV files here\nor use buttons below",
+            text=tr("drag_drop_files"),
             font=ctk.CTkFont(size=12),
             text_color=COLORS["text_muted"]
         )
@@ -3588,14 +3606,14 @@ class FileListPanel(ctk.CTkFrame):
         btn_frame.pack(fill="x", padx=12, pady=(0, 12))
         
         ctk.CTkButton(
-            btn_frame, text="Add Files", font=ctk.CTkFont(size=12),
+            btn_frame, text=tr("add_files"), font=ctk.CTkFont(size=12),
             height=32, fg_color=COLORS["accent_blue"],
             hover_color=COLORS["accent_blue_hover"],
             corner_radius=6, command=self._browse_files
         ).pack(side="left", fill="x", expand=True, padx=(0, 4))
         
         ctk.CTkButton(
-            btn_frame, text="Add Folder", font=ctk.CTkFont(size=12),
+            btn_frame, text=tr("add_folder"), font=ctk.CTkFont(size=12),
             height=32, fg_color=COLORS["bg_tertiary"],
             hover_color=COLORS["bg_hover"],
             text_color=COLORS["text_primary"],
@@ -3603,7 +3621,7 @@ class FileListPanel(ctk.CTkFrame):
         ).pack(side="left", fill="x", expand=True, padx=(4, 4))
         
         ctk.CTkButton(
-            btn_frame, text="Clear", font=ctk.CTkFont(size=12),
+            btn_frame, text=tr("clear"), font=ctk.CTkFont(size=12),
             height=32, width=60, fg_color=COLORS["bg_tertiary"],
             hover_color=COLORS["accent_red"],
             text_color=COLORS["text_secondary"],
@@ -3612,7 +3630,7 @@ class FileListPanel(ctk.CTkFrame):
     
     def _browse_files(self):
         files = filedialog.askopenfilenames(
-            title="Select Input Files",
+            title=tr("select_input_files"),
             filetypes=[
                 ("Supported Files", "*.csv *.tsv *.txt *.xlsx *.parquet *.jsonl *.ndjson"),
                 ("CSV Files", "*.csv"),
@@ -3628,7 +3646,7 @@ class FileListPanel(ctk.CTkFrame):
             self.add_files([Path(f) for f in files])
     
     def _browse_folder(self):
-        folder = filedialog.askdirectory(title="Select Folder")
+        folder = filedialog.askdirectory(title=tr("select_folder"))
         if folder:
             folder_path = Path(folder)
             input_files = [
@@ -3677,7 +3695,7 @@ class FileListPanel(ctk.CTkFrame):
         if not self.files:
             self.placeholder = ctk.CTkLabel(
                 self.scroll_frame,
-                text="Drag & drop CSV files here\nor use buttons below",
+                text=tr("drag_drop_files"),
                 font=ctk.CTkFont(size=12),
                 text_color=COLORS["text_muted"]
             )
@@ -3695,7 +3713,7 @@ class FileListPanel(ctk.CTkFrame):
         frame.pack(fill="x", pady=1)
         frame.pack_propagate(False)
         
-        ctk.CTkLabel(frame, text="📄", font=ctk.CTkFont(size=12), width=24).pack(side="left", padx=(6, 2))
+        ctk.CTkLabel(frame, text="File", font=ctk.CTkFont(size=10), width=28).pack(side="left", padx=(6, 2))
         
         ctk.CTkLabel(
             frame, text=path.name, font=ctk.CTkFont(size=11),
@@ -3714,7 +3732,7 @@ class FileListPanel(ctk.CTkFrame):
         ).pack(side="right", padx=4)
         
         ctk.CTkButton(
-            frame, text="✕", font=ctk.CTkFont(size=10),
+            frame, text=tr("remove"), font=ctk.CTkFont(size=9),
             width=24, height=24, fg_color="transparent",
             hover_color=COLORS["accent_red"],
             text_color=COLORS["text_muted"], corner_radius=4,
@@ -3745,7 +3763,7 @@ class ColumnPanel(ctk.CTkFrame):
         header.pack(fill="x", padx=12, pady=(12, 8))
         
         ctk.CTkLabel(
-            header, text="📊 Column Selection",
+            header, text=tr("column_selection"),
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color=COLORS["text_primary"]
         ).pack(side="left")
@@ -3761,7 +3779,11 @@ class ColumnPanel(ctk.CTkFrame):
         mode_frame = ctk.CTkFrame(self, fg_color="transparent")
         mode_frame.pack(fill="x", padx=12, pady=(0, 8))
         
-        for mode, text in [("all", "All Columns"), ("select", "Include Selected"), ("exclude", "Exclude Selected")]:
+        for mode, text in [
+            ("all", tr("all_columns")),
+            ("select", tr("include_selected")),
+            ("exclude", tr("exclude_selected")),
+        ]:
             ctk.CTkRadioButton(
                 mode_frame, text=text, variable=self.mode, value=mode,
                 font=ctk.CTkFont(size=11),
@@ -3783,7 +3805,7 @@ class ColumnPanel(ctk.CTkFrame):
         
         self.placeholder = ctk.CTkLabel(
             self.scroll_frame,
-            text="Add files to discover columns",
+            text=tr("discover_columns"),
             font=ctk.CTkFont(size=12),
             text_color=COLORS["text_muted"]
         )
@@ -3794,7 +3816,7 @@ class ColumnPanel(ctk.CTkFrame):
         btn_frame.pack(fill="x", padx=12, pady=(0, 12))
         
         ctk.CTkButton(
-            btn_frame, text="Select All", font=ctk.CTkFont(size=11),
+            btn_frame, text=tr("select_all"), font=ctk.CTkFont(size=11),
             height=28, fg_color=COLORS["bg_tertiary"],
             hover_color=COLORS["bg_hover"],
             text_color=COLORS["text_secondary"],
@@ -3802,7 +3824,7 @@ class ColumnPanel(ctk.CTkFrame):
         ).pack(side="left", padx=(0, 4))
         
         ctk.CTkButton(
-            btn_frame, text="Select None", font=ctk.CTkFont(size=11),
+            btn_frame, text=tr("select_none"), font=ctk.CTkFont(size=11),
             height=28, fg_color=COLORS["bg_tertiary"],
             hover_color=COLORS["bg_hover"],
             text_color=COLORS["text_secondary"],
@@ -3863,7 +3885,7 @@ class ColumnPanel(ctk.CTkFrame):
         if not self.columns:
             self.placeholder = ctk.CTkLabel(
                 self.scroll_frame,
-                text="Add files to discover columns",
+                text=tr("discover_columns"),
                 font=ctk.CTkFont(size=12),
                 text_color=COLORS["text_muted"]
             )
@@ -3878,7 +3900,7 @@ class ColumnPanel(ctk.CTkFrame):
                 self._row_frames[col] = frame
 
                 grip = ctk.CTkLabel(
-                    frame, text="⋮⋮", width=24,
+                    frame, text=tr("move"), width=36,
                     font=ctk.CTkFont(size=11),
                     text_color=COLORS["text_muted"],
                     cursor="hand2",
@@ -3925,7 +3947,7 @@ class SortPanel(ctk.CTkFrame):
         header.pack(fill="x", padx=12, pady=(12, 8))
         
         ctk.CTkSwitch(
-            header, text="🔤 Sorting",
+            header, text=tr("sorting"),
             variable=self.enabled,
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color=COLORS["text_primary"],
@@ -3968,14 +3990,14 @@ class SortPanel(ctk.CTkFrame):
         btn_frame.pack(fill="x", padx=12, pady=(0, 12))
         
         ctk.CTkButton(
-            btn_frame, text="+ Add Sort Rule", font=ctk.CTkFont(size=11),
+            btn_frame, text=f"+ {tr('add_sort_rule')}", font=ctk.CTkFont(size=11),
             height=28, fg_color=COLORS["accent_purple"],
             hover_color=COLORS["accent_purple_hover"],
             corner_radius=4, command=self._add_rule
         ).pack(side="left")
         
         ctk.CTkButton(
-            btn_frame, text="Clear All", font=ctk.CTkFont(size=11),
+            btn_frame, text=tr("clear_all"), font=ctk.CTkFont(size=11),
             height=28, fg_color=COLORS["bg_tertiary"],
             hover_color=COLORS["accent_red"],
             text_color=COLORS["text_secondary"],
@@ -4014,7 +4036,7 @@ class SortPanel(ctk.CTkFrame):
         if not self.sort_rules:
             ctk.CTkLabel(
                 self.rules_frame,
-                text="No sort rules defined",
+                text=tr("no_sort_rules"),
                 font=ctk.CTkFont(size=11),
                 text_color=COLORS["text_muted"]
             ).pack(pady=10)
@@ -4058,7 +4080,7 @@ class SortPanel(ctk.CTkFrame):
         dir_menu.pack(side="left", padx=4)
         
         ctk.CTkButton(
-            frame, text="✕", font=ctk.CTkFont(size=10),
+            frame, text=tr("remove"), font=ctk.CTkFont(size=9),
             width=24, height=24, fg_color="transparent",
             hover_color=COLORS["accent_red"],
             text_color=COLORS["text_muted"], corner_radius=4,
@@ -4095,7 +4117,7 @@ class DedupePanel(ctk.CTkFrame):
         header.pack(fill="x", padx=12, pady=(12, 8))
         
         ctk.CTkSwitch(
-            header, text="🔄 Deduplication",
+            header, text=tr("deduplication"),
             variable=self.enabled,
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color=COLORS["text_primary"],
@@ -4280,7 +4302,7 @@ class FilterPanel(ctk.CTkFrame):
         header.pack(fill="x", padx=12, pady=(12, 8))
         
         ctk.CTkLabel(
-            header, text="🔍 Filters",
+            header, text=tr("filters"),
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color=COLORS["text_primary"]
         ).pack(side="left")
@@ -4315,7 +4337,7 @@ class FilterPanel(ctk.CTkFrame):
         
         self.placeholder = ctk.CTkLabel(
             self.filters_frame,
-            text="No filters defined",
+            text=tr("no_filters"),
             font=ctk.CTkFont(size=11),
             text_color=COLORS["text_muted"]
         )
@@ -4326,14 +4348,14 @@ class FilterPanel(ctk.CTkFrame):
         btn_frame.pack(fill="x", padx=12, pady=(0, 12))
         
         ctk.CTkButton(
-            btn_frame, text="+ Add Filter", font=ctk.CTkFont(size=11),
+            btn_frame, text=f"+ {tr('add_filter')}", font=ctk.CTkFont(size=11),
             height=28, fg_color=COLORS["accent_orange"],
             hover_color="#ea580c",
             corner_radius=4, command=self._add_filter
         ).pack(side="left")
         
         ctk.CTkButton(
-            btn_frame, text="Clear All", font=ctk.CTkFont(size=11),
+            btn_frame, text=tr("clear_all"), font=ctk.CTkFont(size=11),
             height=28, fg_color=COLORS["bg_tertiary"],
             hover_color=COLORS["accent_red"],
             text_color=COLORS["text_secondary"],
@@ -4374,7 +4396,7 @@ class FilterPanel(ctk.CTkFrame):
         if not self.filters:
             self.placeholder = ctk.CTkLabel(
                 self.filters_frame,
-                text="No filters defined",
+                text=tr("no_filters"),
                 font=ctk.CTkFont(size=11),
                 text_color=COLORS["text_muted"]
             )
@@ -4412,7 +4434,7 @@ class FilterPanel(ctk.CTkFrame):
         ).pack(side="left", padx=(0, 4))
         
         ctk.CTkButton(
-            row1, text="✕", font=ctk.CTkFont(size=10),
+            row1, text=tr("remove"), font=ctk.CTkFont(size=9),
             width=24, height=24, fg_color="transparent",
             hover_color=COLORS["accent_red"],
             text_color=COLORS["text_muted"], corner_radius=4,
@@ -4471,7 +4493,7 @@ class TransformPanel(ctk.CTkFrame):
         header.pack(fill="x", padx=12, pady=(12, 8))
 
         ctk.CTkLabel(
-            header, text="⚙️ Transformations",
+            header, text=tr("transformations"),
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color=COLORS["text_primary"]
         ).pack(side="left")
@@ -4575,14 +4597,14 @@ class TransformPanel(ctk.CTkFrame):
         btn_frame.pack(fill="x", padx=12, pady=(0, 12))
 
         ctk.CTkButton(
-            btn_frame, text="+ Add Transform", font=ctk.CTkFont(size=11),
+            btn_frame, text=f"+ {tr('add_transform')}", font=ctk.CTkFont(size=11),
             height=28, fg_color=COLORS["accent_purple"],
             hover_color=COLORS["accent_purple_hover"],
             corner_radius=4, command=self._add_transform
         ).pack(side="left")
 
         ctk.CTkButton(
-            btn_frame, text="Clear All", font=ctk.CTkFont(size=11),
+            btn_frame, text=tr("clear_all"), font=ctk.CTkFont(size=11),
             height=28, fg_color=COLORS["bg_tertiary"],
             hover_color=COLORS["accent_red"],
             text_color=COLORS["text_secondary"],
@@ -4633,7 +4655,7 @@ class TransformPanel(ctk.CTkFrame):
         if not self.column_transforms:
             ctk.CTkLabel(
                 self.transforms_frame,
-                text="No per-column transforms defined",
+                text=tr("no_transforms"),
                 font=ctk.CTkFont(size=11),
                 text_color=COLORS["text_muted"]
             ).pack(pady=10)
@@ -4676,7 +4698,7 @@ class TransformPanel(ctk.CTkFrame):
         ).pack(side="left", padx=(0, 4))
 
         ctk.CTkButton(
-            row1, text="✕", font=ctk.CTkFont(size=10),
+            row1, text=tr("remove"), font=ctk.CTkFont(size=9),
             width=24, height=24, fg_color="transparent",
             hover_color=COLORS["accent_red"],
             text_color=COLORS["text_muted"], corner_radius=4,
@@ -4746,7 +4768,7 @@ class OutputPanel(ctk.CTkFrame):
         header.pack(fill="x", padx=12, pady=(12, 8))
         
         ctk.CTkLabel(
-            header, text="💾 Output Settings",
+            header, text=tr("output_settings"),
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color=COLORS["text_primary"]
         ).pack(side="left")
@@ -4902,7 +4924,7 @@ class LogPanel(ctk.CTkFrame):
         header.pack(fill="x", padx=12, pady=(12, 8))
         
         ctk.CTkLabel(
-            header, text="📋 Processing Log",
+            header, text=tr("processing_log"),
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color=COLORS["text_primary"]
         ).pack(side="left")
@@ -4976,7 +4998,7 @@ class PreviewPanel(ctk.CTkFrame):
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.pack(fill="x", padx=12, pady=(10, 6))
         ctk.CTkLabel(
-            header, text="🔎 Preview",
+            header, text=tr("preview"),
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color=COLORS["text_primary"],
         ).pack(side="left")
@@ -4990,7 +5012,7 @@ class PreviewPanel(ctk.CTkFrame):
             command=lambda: self.on_cancel() if self.on_cancel else None,
         ).pack(side="left", padx=(0, 4))
         ctk.CTkButton(
-            actions, text="Refresh", width=64, height=24,
+            actions, text=tr("refresh"), width=64, height=24,
             font=ctk.CTkFont(size=10),
             fg_color=COLORS["bg_tertiary"], hover_color=COLORS["accent_blue"],
             text_color=COLORS["text_secondary"], corner_radius=4,
@@ -4998,7 +5020,7 @@ class PreviewPanel(ctk.CTkFrame):
         ).pack(side="left")
 
         self.status_label = ctk.CTkLabel(
-            self, text="Add files to preview projected output",
+            self, text=tr("preview_empty"),
             font=ctk.CTkFont(size=10), text_color=COLORS["text_muted"], anchor="w",
         )
         self.status_label.pack(fill="x", padx=12, pady=(0, 4))
@@ -5461,19 +5483,35 @@ class CSVPowerToolApp:
             self.root = TkinterDnD.Tk()
         else:
             self.root = ctk.CTk()
-        
+
+        self.locale = set_locale(os.environ.get("CSV_POWER_TOOL_LOCALE", "en"))
+        self.locale_mode = StringVar(value=locale_label(self.locale))
+        self.appearance_mode = StringVar(value="Dark")
+        requested_scale = os.environ.get("CSV_POWER_TOOL_SCALE", "100%").strip()
+        self.scale_mode = StringVar(
+            value=requested_scale if requested_scale in {"100%", "125%", "150%"} else "100%"
+        )
+        if self.scale_mode.get() != "100%":
+            scale = int(self.scale_mode.get()[:-1]) / 100
+            ctk.set_widget_scaling(scale)
+            ctk.set_window_scaling(scale)
+        self._responsive_job = None
+        self._layout_mode = "wide"
+        self._focused_widget = None
+
         self.root.title(APP_NAME)
         self.root.geometry("1200x850")
-        self.root.minsize(1000, 700)
+        self.root.minsize(900, 640)
         
         COLORS.update(DARK_COLORS)
         ctk.set_appearance_mode("dark")
         self.root.configure(bg=COLORS["bg_dark"])
+        validate_theme_contrast(DARK_COLORS)
+        validate_theme_contrast(LIGHT_COLORS)
         
         self.engine: CSVEngine = None
         self.engine_service = EngineService(CSVEngine)
         self.processing = False
-        self.appearance_mode = StringVar(value="Dark")
         self._config_overrides = {}
         self._preview_job = None
         self._preview_generation = 0
@@ -5486,15 +5524,28 @@ class CSVPowerToolApp:
         self._build_ui()
         self.history = ConfigHistory(self._config_to_data())
         self._update_history_buttons()
-        self.root.bind_all("<ButtonRelease-1>", self._on_ui_edit, add="+")
+        self.root.bind_all("<Tab>", self._on_tab_navigation, add="+")
+        self.root.bind_all("<FocusIn>", self._on_focus_in, add="+")
         self.root.bind_all("<KeyRelease>", self._on_ui_edit, add="+")
+        self.root.bind_all("<Alt-p>", self._shortcut_process, add="+")
+        self.root.bind_all("<Escape>", self._shortcut_cancel, add="+")
+        self.root.bind_all("<Control-s>", self._shortcut_save, add="+")
+        self.root.bind_all("<Control-o>", self._shortcut_load, add="+")
+        self.root.bind_all("<Control-z>", self._shortcut_undo, add="+")
+        self.root.bind_all("<Control-y>", self._shortcut_redo, add="+")
+        self.root.bind("<Configure>", self._on_window_configure, add="+")
         
         if DND_AVAILABLE:
             self._setup_dnd()
+
+        if os.environ.get("CSV_POWER_TOOL_GUI_SMOKE"):
+            self.root.after(250, self._run_gui_smoke)
     
     def _build_ui(self):
+        self._layout_mode = ""
         # Main container
         main = ctk.CTkFrame(self.root, fg_color="transparent")
+        self._main = main
         main.pack(fill="both", expand=True, padx=16, pady=16)
         
         # Header
@@ -5515,6 +5566,11 @@ class CSVPowerToolApp:
             font=ctk.CTkFont(size=12),
             text_color=COLORS["text_muted"]
         ).pack(anchor="w")
+
+        ctk.CTkLabel(
+            title_frame, text=tr("keyboard_help"),
+            font=ctk.CTkFont(size=10), text_color=COLORS["text_secondary"],
+        ).pack(anchor="w", pady=(4, 0))
         
         # Version
         ver_badge = ctk.CTkFrame(header, fg_color=COLORS["bg_tertiary"], corner_radius=12)
@@ -5535,22 +5591,56 @@ class CSVPowerToolApp:
             button_color=COLORS["bg_hover"], dropdown_fg_color=COLORS["bg_secondary"],
             command=self._set_appearance_mode,
         ).pack(side="left")
+
+        scale_frame = ctk.CTkFrame(header, fg_color="transparent")
+        scale_frame.pack(side="right", padx=(0, 10))
+        ctk.CTkLabel(
+            scale_frame, text=tr("scale"), font=ctk.CTkFont(size=10),
+            text_color=COLORS["text_muted"],
+        ).pack(side="left", padx=(0, 6))
+        ctk.CTkOptionMenu(
+            scale_frame, variable=self.scale_mode,
+            values=["100%", "125%", "150%"], width=68, height=26,
+            font=ctk.CTkFont(size=10), fg_color=COLORS["bg_tertiary"],
+            button_color=COLORS["bg_hover"], dropdown_fg_color=COLORS["bg_secondary"],
+            command=self._set_scale,
+        ).pack(side="left")
+
+        locale_frame = ctk.CTkFrame(header, fg_color="transparent")
+        locale_frame.pack(side="right", padx=(0, 10))
+        ctk.CTkLabel(
+            locale_frame, text=tr("language"), font=ctk.CTkFont(size=10),
+            text_color=COLORS["text_muted"],
+        ).pack(side="left", padx=(0, 6))
+        ctk.CTkOptionMenu(
+            locale_frame, variable=self.locale_mode,
+            values=locale_choices(), width=88, height=26,
+            font=ctk.CTkFont(size=10), fg_color=COLORS["bg_tertiary"],
+            button_color=COLORS["bg_hover"], dropdown_fg_color=COLORS["bg_secondary"],
+            command=self._set_locale,
+        ).pack(side="left")
         
-        # Content: 3 columns
+        # Content: three columns in wide mode, with the right rail moved below
+        # configuration at compact widths and all columns stacked when narrow.
         content = ctk.CTkFrame(main, fg_color="transparent")
+        self._content = content
         content.pack(fill="both", expand=True)
+        content.grid_columnconfigure(1, weight=1)
+        content.grid_rowconfigure(0, weight=1)
         
         # Left column: Files
         left_col = ctk.CTkFrame(content, fg_color="transparent", width=280)
-        left_col.pack(side="left", fill="both", padx=(0, 8))
-        left_col.pack_propagate(False)
+        self._left_col = left_col
+        left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        left_col.grid_propagate(False)
         
         self.file_panel = FileListPanel(left_col, on_change=self._on_files_changed)
         self.file_panel.pack(fill="both", expand=True)
         
         # Middle column: Configuration tabs
         mid_col = ctk.CTkFrame(content, fg_color="transparent")
-        mid_col.pack(side="left", fill="both", expand=True, padx=8)
+        self._mid_col = mid_col
+        mid_col.grid(row=0, column=1, sticky="nsew", padx=8)
         
         self.tabview = ctk.CTkTabview(
             mid_col, fg_color=COLORS["bg_secondary"],
@@ -5605,8 +5695,11 @@ class CSVPowerToolApp:
         
         # Right column: Log and Stats
         right_col = ctk.CTkFrame(content, fg_color="transparent", width=300)
-        right_col.pack(side="right", fill="both", padx=(8, 0))
-        right_col.pack_propagate(False)
+        self._right_col = right_col
+        right_col.grid(row=0, column=2, sticky="nsew", padx=(8, 0))
+        right_col.grid_propagate(False)
+        content.grid_columnconfigure(0, minsize=280)
+        content.grid_columnconfigure(2, minsize=300)
         
         self.stats_panel = StatsPanel(right_col)
         self.stats_panel.pack(fill="x", pady=(0, 8))
@@ -5632,7 +5725,7 @@ class CSVPowerToolApp:
         progress_frame.pack(fill="x", pady=(0, 8))
         
         self.progress_label = ctk.CTkLabel(
-            progress_frame, text="Ready",
+            progress_frame, text=tr("ready"),
             font=ctk.CTkFont(size=11),
             text_color=COLORS["text_muted"]
         )
@@ -5656,7 +5749,7 @@ class CSVPowerToolApp:
         preset_frame.pack(side="left")
         
         ctk.CTkButton(
-            preset_frame, text="💾 Save Config", font=ctk.CTkFont(size=11),
+            preset_frame, text=tr("save_config"), font=ctk.CTkFont(size=11),
             height=36, fg_color=COLORS["bg_tertiary"],
             hover_color=COLORS["bg_hover"],
             text_color=COLORS["text_secondary"],
@@ -5664,7 +5757,7 @@ class CSVPowerToolApp:
         ).pack(side="left", padx=(0, 4))
         
         ctk.CTkButton(
-            preset_frame, text="📂 Load Config", font=ctk.CTkFont(size=11),
+            preset_frame, text=tr("load_config"), font=ctk.CTkFont(size=11),
             height=36, fg_color=COLORS["bg_tertiary"],
             hover_color=COLORS["bg_hover"],
             text_color=COLORS["text_secondary"],
@@ -5672,16 +5765,16 @@ class CSVPowerToolApp:
         ).pack(side="left")
 
         self.undo_btn = ctk.CTkButton(
-            preset_frame, text="↶ Undo", font=ctk.CTkFont(size=11),
-            height=36, width=64, fg_color=COLORS["bg_tertiary"],
+            preset_frame, text=tr("undo"), font=ctk.CTkFont(size=11),
+            height=36, width=76, fg_color=COLORS["bg_tertiary"],
             hover_color=COLORS["bg_hover"], text_color=COLORS["text_secondary"],
             corner_radius=6, command=self._undo, state="disabled",
         )
         self.undo_btn.pack(side="left", padx=(8, 2))
 
         self.redo_btn = ctk.CTkButton(
-            preset_frame, text="↷ Redo", font=ctk.CTkFont(size=11),
-            height=36, width=64, fg_color=COLORS["bg_tertiary"],
+            preset_frame, text=tr("redo"), font=ctk.CTkFont(size=11),
+            height=36, width=76, fg_color=COLORS["bg_tertiary"],
             hover_color=COLORS["bg_hover"], text_color=COLORS["text_secondary"],
             corner_radius=6, command=self._redo, state="disabled",
         )
@@ -5692,7 +5785,7 @@ class CSVPowerToolApp:
         action_frame.pack(side="right")
         
         self.cancel_btn = ctk.CTkButton(
-            action_frame, text="Cancel", font=ctk.CTkFont(size=13),
+            action_frame, text=tr("cancel"), font=ctk.CTkFont(size=13),
             height=42, width=100, fg_color=COLORS["bg_tertiary"],
             hover_color=COLORS["accent_red"],
             text_color=COLORS["text_primary"],
@@ -5702,14 +5795,261 @@ class CSVPowerToolApp:
         self.cancel_btn.pack(side="left", padx=(0, 8))
         
         self.process_btn = ctk.CTkButton(
-            action_frame, text="▶  Process Files",
+            action_frame, text=tr("process_files"),
             font=ctk.CTkFont(size=14, weight="bold"),
             height=42, width=160,
             fg_color=COLORS["accent_green"],
             hover_color=COLORS["accent_green_hover"],
+            text_color=COLORS["text_on_accent"],
             corner_radius=8, command=self._process
         )
         self.process_btn.pack(side="left")
+
+        self.root.after_idle(lambda: self._apply_responsive_layout(self.root.winfo_width()))
+        self._configure_accessibility()
+
+    def _configure_accessibility(self):
+        """Apply deterministic focus metadata to the current widget tree."""
+
+        focusables = collect_focusables(self.root)
+        for index, widget in enumerate(focusables, start=1):
+            prepare_focus_widget(widget)
+            set_accessible_name(
+                widget,
+                accessible_name(widget),
+                f"Keyboard control {index} of {len(focusables)}",
+            )
+        self._focus_order_snapshot = [accessible_name(widget) for widget in focusables]
+
+    def _on_focus_in(self, event):
+        focused = next(
+            (
+                widget for widget in collect_focusables(self.root)
+                if widget_contains(widget, event.widget)
+            ),
+            None,
+        )
+        self._focused_widget = focused
+        for widget in collect_focusables(self.root):
+            set_focus_ring(widget, widget is focused, COLORS["accent_cyan"])
+
+    def _on_tab_navigation(self, event):
+        """Cycle through enabled controls even when customtkinter hides internals."""
+
+        focusables = collect_focusables(self.root)
+        if not focusables:
+            return "break"
+        current_index = next(
+            (
+                index for index, widget in enumerate(focusables)
+                if widget_contains(widget, event.widget)
+            ),
+            -1,
+        )
+        backwards = bool(event.state & 0x1)
+        step = -1 if backwards else 1
+        target = focusables[(current_index + step) % len(focusables)]
+        try:
+            target.focus_set()
+        except Exception:
+            return None
+        self._focused_widget = target
+        self.progress_label.configure(
+            text=f"{accessible_name(target)} — {tr('keyboard_help').split(';', 1)[0]}"
+        )
+        return "break"
+
+    def _on_window_configure(self, event):
+        if event.widget is not self.root:
+            return
+        if self._responsive_job is not None:
+            try:
+                self.root.after_cancel(self._responsive_job)
+            except Exception:
+                pass
+        self._responsive_job = self.root.after(
+            80, lambda: self._apply_responsive_layout(self.root.winfo_width())
+        )
+
+    def _apply_responsive_layout(self, width: int):
+        if not hasattr(self, "_content") or width <= 1:
+            return
+        requested_mode = (
+            "wide" if width >= 1180 else
+            "compact" if width >= 1000 else
+            "narrow"
+        )
+        if requested_mode == self._layout_mode:
+            self._responsive_job = None
+            return
+        try:
+            if not all(int(column.winfo_exists()) for column in (
+                self._left_col, self._mid_col, self._right_col
+            )):
+                return
+        except Exception:
+            return
+        self._responsive_job = None
+        for column in (self._left_col, self._mid_col, self._right_col):
+            column.grid_forget()
+        for row in range(3):
+            self._content.grid_rowconfigure(row, weight=0, minsize=0)
+
+        if requested_mode == "wide":
+            self._layout_mode = "wide"
+            self._content.grid_columnconfigure(0, minsize=280)
+            self._content.grid_columnconfigure(1, weight=1, minsize=420)
+            self._content.grid_columnconfigure(2, minsize=300)
+            self._left_col.configure(width=280)
+            self._right_col.configure(width=300)
+            self._left_col.grid_propagate(False)
+            self._right_col.grid_propagate(False)
+            self._content.grid_rowconfigure(0, weight=1)
+            self._left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+            self._mid_col.grid(row=0, column=1, sticky="nsew", padx=8)
+            self._right_col.grid(row=0, column=2, sticky="nsew", padx=(8, 0))
+        elif requested_mode == "compact":
+            self._layout_mode = "compact"
+            self._content.grid_columnconfigure(0, minsize=250)
+            self._content.grid_columnconfigure(1, weight=1, minsize=420)
+            self._content.grid_columnconfigure(2, weight=0, minsize=0)
+            self._left_col.grid_propagate(True)
+            self._right_col.grid_propagate(True)
+            self._content.grid_rowconfigure(0, weight=1)
+            self._content.grid_rowconfigure(1, weight=1)
+            self._left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+            self._mid_col.grid(row=0, column=1, sticky="nsew", padx=8)
+            self._right_col.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+        else:
+            self._layout_mode = "narrow"
+            self._content.grid_columnconfigure(0, weight=1, minsize=0)
+            self._content.grid_columnconfigure(1, weight=0, minsize=0)
+            self._content.grid_columnconfigure(2, weight=0, minsize=0)
+            self._left_col.grid_propagate(True)
+            self._right_col.grid_propagate(True)
+            for row, column in enumerate((self._left_col, self._mid_col, self._right_col)):
+                self._content.grid_rowconfigure(row, weight=1 if row != 1 else 2)
+                column.grid(row=row, column=0, columnspan=3, sticky="nsew", pady=(0, 8) if row < 2 else 0)
+
+    def _rebuild_ui(self):
+        config_data = self._config_to_data()
+        files = list(self.file_panel.files)
+        if self._responsive_job is not None:
+            try:
+                self.root.after_cancel(self._responsive_job)
+            except Exception:
+                pass
+            self._responsive_job = None
+        try:
+            self.root.tk.call(self.root._w, "configure", "-background", COLORS["bg_dark"])
+        except Exception:
+            pass
+        for child in self.root.winfo_children():
+            child.destroy()
+        self._build_ui()
+        self._apply_config_data(config_data)
+        self.file_panel.files = files
+        self.file_panel._refresh()
+        if files:
+            self._on_files_changed()
+        self._update_history_buttons()
+
+    def _set_locale(self, value: str):
+        self.locale = set_locale(normalize_locale(value))
+        self.locale_mode.set(locale_label(self.locale))
+        self._rebuild_ui()
+
+    def _set_scale(self, value: str):
+        if value not in {"100%", "125%", "150%"}:
+            return
+        self.scale_mode.set(value)
+        scale = int(value[:-1]) / 100
+        ctk.set_widget_scaling(scale)
+        ctk.set_window_scaling(scale)
+        self._rebuild_ui()
+
+    def _shortcut_process(self, _event=None):
+        self._process()
+        return "break"
+
+    def _shortcut_cancel(self, _event=None):
+        self._cancel()
+        return "break"
+
+    def _shortcut_save(self, _event=None):
+        self._save_config()
+        return "break"
+
+    def _shortcut_load(self, _event=None):
+        self._load_config()
+        return "break"
+
+    def _shortcut_undo(self, _event=None):
+        self._undo()
+        return "break"
+
+    def _shortcut_redo(self, _event=None):
+        self._redo()
+        return "break"
+
+    def _run_gui_smoke(self):
+        """Exercise themes, scale-independent layouts, and focus metadata offscreen."""
+
+        try:
+            output_path = os.environ.get("CSV_POWER_TOOL_GUI_SMOKE_PATH")
+            if output_path:
+                _write_json_atomic(output_path, {"version": APP_VERSION, "status": "started"})
+            self._run_gui_smoke_impl()
+        except Exception as exc:
+            output_path = os.environ.get("CSV_POWER_TOOL_GUI_SMOKE_PATH")
+            if output_path:
+                _write_json_atomic(
+                    output_path,
+                    {
+                        "version": APP_VERSION,
+                        "error": type(exc).__name__,
+                        "message": str(exc),
+                        "traceback": traceback.format_exc(),
+                    },
+                )
+            self.root.after(100, self.root.destroy)
+
+    def _run_gui_smoke_impl(self):
+
+        stages = getattr(self, "_gui_smoke_stages", None)
+        if stages is None:
+            stages = [
+                ("Dark", "1200x850"),
+                ("Light", "1020x700"),
+                ("System", "900x640"),
+            ]
+            self._gui_smoke_stages = stages
+        if stages:
+            theme, geometry = stages.pop(0)
+            self._set_appearance_mode(theme)
+            self.root.geometry(geometry)
+            self.root.update_idletasks()
+            self.root.after(150, self._run_gui_smoke)
+            return
+        output_path = os.environ.get("CSV_POWER_TOOL_GUI_SMOKE_PATH")
+        if output_path:
+            _write_json_atomic(
+                output_path,
+                {
+                    "version": APP_VERSION,
+                    "locale": self.locale,
+                    "scale": self.scale_mode.get(),
+                    "layout_mode": self._layout_mode,
+                    "focusable_count": len(collect_focusables(self.root)),
+                    "focus_order": list(getattr(self, "_focus_order_snapshot", [])),
+                    "themes_checked": ["Dark", "Light", "System"],
+                    "contrast": {
+                        "dark": validate_theme_contrast(DARK_COLORS),
+                        "light": validate_theme_contrast(LIGHT_COLORS),
+                    },
+                },
+            )
+        self.root.after(100, self.root.destroy)
     
     def _setup_dnd(self):
         def drop(event):
@@ -5739,21 +6079,11 @@ class CSVPowerToolApp:
 
     def _set_appearance_mode(self, value: str):
         mode = value.lower()
+        self.appearance_mode.set(value)
         ctk.set_appearance_mode(mode)
         active_mode = ctk.get_appearance_mode().lower() if mode == "system" else mode
         COLORS.update(LIGHT_COLORS if active_mode == "light" else DARK_COLORS)
-        config_data = self._config_to_data()
-        files = list(self.file_panel.files)
-        for child in self.root.winfo_children():
-            child.destroy()
-        self.root.configure(bg=COLORS["bg_dark"])
-        self._build_ui()
-        self._apply_config_data(config_data)
-        self.file_panel.files = files
-        self.file_panel._refresh()
-        if files:
-            self._on_files_changed()
-        self._update_history_buttons()
+        self._rebuild_ui()
 
     def _schedule_preview(self):
         if not hasattr(self, "preview_panel"):
@@ -7422,6 +7752,23 @@ def cli_main(argv=None):
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    gui_smoke_argument = next(
+        (
+            argument for argument in sys.argv[1:]
+            if argument.startswith("--gui-smoke") or argument.startswith("GUI_SMOKE=")
+        ),
+        None,
+    )
+    if gui_smoke_argument is not None:
+        smoke_path = ""
+        if "=" in gui_smoke_argument:
+            smoke_path = gui_smoke_argument.split("=", 1)[1]
+        elif len(sys.argv) > 2:
+            smoke_path = sys.argv[2]
+        os.environ["CSV_POWER_TOOL_GUI_SMOKE"] = "1"
+        if smoke_path:
+            os.environ["CSV_POWER_TOOL_GUI_SMOKE_PATH"] = smoke_path
+        sys.argv = [sys.argv[0]]
     # If CLI arguments are present, run headless; otherwise launch GUI
     if len(sys.argv) > 1:
         from csv_power_tool.cli import main as cli_entry
