@@ -40,3 +40,84 @@ All notable changes to CSV_Power_Tool will be documented in this file.
 - Fixed: Runtime dependency installation was removed.
 - Fixed: Compute/split/merge transform columns now reach output writers.
 - Fixed: README version and setup commands.
+
+## Roadmap archive — 2026-08-10 — ROADMAP.md
+
+<details>
+<summary>Original roadmap snapshot</summary>
+
+```markdown
+# CSV Power Tool — Roadmap
+
+Python/customtkinter CSV combiner and processor. Multi-column sort, 16 filter operators, dedup, per-column transforms, compute columns, flexible output, configuration presets, CLI mode. Drag-drop, dark theme.
+
+## Planned Features
+
+### Engine
+
+### Filter / Sort
+
+### Dedup
+
+### CLI
+
+### UI / UX
+
+### Packaging
+
+## Competitive Research
+- **Power Query (Excel 365)** — gold standard for Excel users, folder combine, refresh. Our edge: cross-platform, open source, no Office licence.
+- **csv-merge ([deviousasti/csv-merge](https://github.com/deviousasti/csv-merge))** — drag-drop GUI, `(Source)` column tracking, key-based combine. Worth emulating the source-column feature.
+- **CSV Combiner (csvcombiner.com)** — browser-based, client-side only. Good reference for "zero install" appeal; we already run local.
+- **Terminal pipelines** (`head/tail/cat`, `miller`, `csvkit`) — power users reach here for scripting. Ship a CLI so CSV Power Tool bridges GUI and scriptable workflows.
+
+## Nice-to-Haves
+
+## Open-Source Research (Round 2)
+
+### Related OSS Projects
+- **deviousasti/csv-merge** — https://github.com/deviousasti/csv-merge — Drag-and-drop GUI, folder recursion, column-order selection, `(Source)` column injection, key-based combining with union/concat/sum.
+- **ParthBapaye1/csv-merge_tool** — https://github.com/ParthBapaye1/csv-merge_tool — Drag-and-drop fork variant.
+- **jlumbroso/csv-merge** — https://github.com/jlumbroso/csv-merge — Continuous/watched-folder merge.
+- **richardARPANET/csv-merge** — https://github.com/richardARPANET/csv-merge — Clean CLI reference.
+- **behroozk/csv-merger** — https://github.com/behroozk/csv-merger — Minimal multi-file combiner.
+- **sctweedie/csvdiff3** — https://github.com/sctweedie/csvdiff3 — 3-way diff/merge for CSV; git-merge driver compatible.
+- **sensorfactdev/csv-joiner** — https://sensorfactdev.github.io/csv-joiner/ — Browser-side joiner with live preview.
+- **GitHub topic: csv-combine** — https://github.com/topics/csv-combine — catalog of alternatives.
+
+### Features to Borrow
+
+### Patterns & Architectures Worth Studying
+
+## Research-Driven Additions
+
+- [ ] P2 — Add an accessible, localized, responsive GUI shell
+  Why: The fixed customtkinter layout, emoji-heavy labels, and absence of a string catalog or accessibility contract make the product harder to use with keyboard navigation, high-DPI settings, assistive technology, or a non-English locale.
+  Evidence: The repository’s 125% DPI environment and customtkinter’s scaling support make geometry a real acceptance concern; active desktop competitors expose keyboard-first and readable data views, while the current GUI has no focused accessibility/i18n test layer.
+  Touches: GUI layout/widgets, string resources, themes, keyboard bindings, tests, README accessibility notes.
+  Acceptance: Provide complete keyboard traversal/focus order, visible focus states, non-emoji accessible labels, scalable/resizable layouts, measured light/dark contrast, tooltip/status alternatives, externalized strings with fallback, and a smoke test at the supported DPI/theme combinations without stealing interactive focus.
+  Complexity: L
+
+- [ ] P2 — Make watch mode debounced and restart-safe
+  Why: Polling file changes can process a file while it is still being written, duplicate work, or mishandle rotation/truncation, undermining automation trust.
+  Evidence: The current watch mode polls mtimes/sizes; `jlumbroso/csv-merge` and CEESVEE follow-mode patterns show the need for settled-file, rotation, pause, and restart semantics.
+  Touches: watch loop, run manifest/state handling, atomic output path, CLI/UI status, tests, README watch documentation.
+  Acceptance: Wait for a configurable stable size/mtime window; detect replacement, rotation, truncation, and deletion; avoid duplicate processing using file identity plus workflow hash; persist/recover last successful run metadata; coordinate with atomic output and cancellation; test rapid writes, partial files, restart, and rotation.
+  Complexity: M
+
+- [ ] P2 — Align README, screenshots, packaging docs, and release surface with v3.2.0
+  Why: The checked-in screenshot shows a v2-era empty interface while the code, CLI, and README describe v3.2.0. Stale visuals and incomplete package instructions weaken trust in the features that already exist.
+  Evidence: Repository inspection found the version mismatch; qsv and OpenRefine release histories show documentation drift and package/runtime issues are recurring maintenance work; marketplace publication remains blocked and must not be implied as shipped.
+  Touches: `README.md`, `screenshot.png`, `packaging/build.py`, WiX/package documentation, release checklist.
+  Acceptance: Regenerate a current screenshot through invisible isolated verification, document the actual GUI/CLI/API/SQL inputs and outputs, document unsigned EXE/MSI and SHA-256 verification, make version strings/checks automated, and clearly label winget/Chocolatey/code-signing work as blocked rather than available.
+  Complexity: M
+
+- [ ] P3 — Define a safe transform plugin extension surface
+  Why: Miller UDFs, RBQL UDFs, and VisiData plugins show demand for extensibility, but loading arbitrary Python from a data workflow creates a new code-execution boundary.
+  Evidence: Competitor extension models are useful; the PyArrow and DuckDB security findings show why capability and trust boundaries must be explicit.
+  Touches: plugin manifest/schema, discovery and policy code, CLI/GUI settings, packaging, tests, README extension documentation.
+  Acceptance: Specify a versioned manifest and capability list before loading code; require explicit per-plugin opt-in and show provenance in the run manifest; default packaged builds to no third-party execution; reject incompatible or unsigned-by-policy plugins with actionable errors; document that this is trusted local code, not a sandbox; add discovery, denial, and compatibility tests.
+  Complexity: L
+```
+
+</details>
