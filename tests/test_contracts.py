@@ -234,6 +234,28 @@ class CLIContractTests(unittest.TestCase):
         self.assertIn("--repair-edits", result.stdout)
         self.assertIn("--join-report", result.stdout)
         self.assertIn("--conflict-resolution", result.stdout)
+        self.assertIn("--watch-settle-seconds", result.stdout)
+        self.assertIn("--watch-state", result.stdout)
+
+    def test_watch_rejects_invalid_settle_and_stdout_contracts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "input.csv"
+            output_path = root / "output.csv"
+            input_path.write_text("id\n1\n", encoding="utf-8")
+
+            invalid_settle = self.run_cli(
+                "--watch", "--inputs", str(input_path), "--output", str(output_path),
+                "--watch-settle-seconds", "-1",
+            )
+            self.assertEqual(invalid_settle.returncode, 2)
+            self.assertIn("--watch-settle-seconds", invalid_settle.stderr)
+
+            stdout_watch = self.run_cli(
+                "--watch", "--inputs", str(input_path), "--output", "-",
+            )
+            self.assertEqual(stdout_watch.returncode, 2)
+            self.assertIn("--watch cannot write", stdout_watch.stderr)
 
     def test_cli_dry_run_and_workflow_replay(self):
         with tempfile.TemporaryDirectory() as temp_dir:

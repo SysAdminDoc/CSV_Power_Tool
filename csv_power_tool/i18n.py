@@ -40,6 +40,11 @@ TRANSLATIONS: Mapping[str, Mapping[str, str]] = {
         "theme": "Theme",
         "language": "Language",
         "scale": "Scale",
+        "dark": "Dark",
+        "light": "Light",
+        "system": "System",
+        "ascending": "A to Z",
+        "descending": "Z to A",
         "ready": "Ready",
         "keyboard_help": "Keyboard: Tab or Shift+Tab to navigate; Alt+P to process; Escape to cancel",
         "save_config": "Save Configuration",
@@ -91,6 +96,9 @@ TRANSLATIONS: Mapping[str, Mapping[str, str]] = {
         "leave_blank": "(leave blank)",
         "per_column_transforms": "Per-Column Transforms",
         "output_name": "Output name",
+        "search": "Search...",
+        "replace_with": "Replace with...",
+        "edit_number": "#",
         "delimiter": "Delimiter:",
         "encoding": "Encoding:",
         "quoting": "Quoting:",
@@ -123,6 +131,18 @@ TRANSLATIONS: Mapping[str, Mapping[str, str]] = {
         "reviewed_edits_status": (
             "Reviewed edits are applied before filters/transforms and written to the manifest."
         ),
+        "no_reviewed_edits": "(no reviewed edits)",
+        "profile_ready": "Profile ready: {matched:,} matching row(s), {source:,} source row(s) scanned",
+        "no_matching_row": "No matching row was found.",
+        "inspection_header": "row {row:,} | source: {source}",
+        "inspection_columns": "column                  raw text                              inferred type",
+        "no_row_selected": "Select a row to inspect source text.",
+        "repair_row_invalid": "Repair row must be a positive integer",
+        "repair_not_added": "Repair not added: {message}",
+        "edits_recorded": "Recorded {count:,} reviewed edit(s)",
+        "remove_index_invalid": "Remove # must be a positive edit number",
+        "remove_index_missing": "That reviewed edit number does not exist",
+        "invalid_saved_repairs": "Invalid saved repairs: {message}",
         "column_summary": "Column Summary",
         "files_processed": "Files Processed",
         "rows_read": "Rows Read",
@@ -156,12 +176,6 @@ TRANSLATIONS: Mapping[str, Mapping[str, str]] = {
         "inspection_error": "Inspection error: {message}",
         "inspected_row": "Inspected raw row {row}",
         "row_not_found": "Row not found",
-        "repair_row_invalid": "Repair row must be a positive integer",
-        "repair_not_added": "Repair not added: {message}",
-        "edits_recorded": "Recorded {count:,} reviewed edit(s)",
-        "remove_index_invalid": "Remove # must be a positive edit number",
-        "remove_index_missing": "That reviewed edit number does not exist",
-        "invalid_saved_repairs": "Invalid saved repairs: {message}",
         "preset_undo": "Preset edit undone",
         "preset_redo": "Preset edit redone",
         "finish_before_profiling": "Finish or cancel processing before profiling",
@@ -170,11 +184,30 @@ TRANSLATIONS: Mapping[str, Mapping[str, str]] = {
         "add_files_before_inspecting": "Add files before inspecting a row",
         "no_files_selected": "No files selected",
         "cancelling": "Cancelling...",
+        "processing_in_progress": "Processing in progress",
+        "profile_error": "Profile error: {message}",
+        "profile_input_error": "Profile completed with an input error: {message}",
+        "inspect_error": "Inspection error: {message}",
+        "inspect_started": "Inspecting raw row {row}…",
+        "inspect_complete": "Inspected raw row {row:,}",
+        "profile_started": "Profiling bounded raw rows…",
+        "cancel_quality": "Cancelling quality operation…",
+        "preview_started": "Preparing bounded read-only preview…",
+        "cancel_preview_status": "Cancelling read-only preview…",
+        "no_quality_profile": "No quality profile yet. Select files and choose Profile.",
+        "no_column_summary": "(no column summary)",
+        "not_available": "—",
+        "files_added_via_drop": "Added {count:,} file(s) via drag and drop",
+        "no_files_selected_error": "No files selected",
+        "processing_started": "Starting processing...",
+        "cancel_started": "Cancelling...",
+        "processing_saved": "Complete! {rows:,} rows saved",
+        "processing_empty": "Processing completed with no output",
         "workflow_save_error": "Workflow save error: {message}",
         "workflow_load_error": "Error loading workflow: {message}",
         "workflow_saved": "Workflow saved: {name} ({operations} operations; {changed})",
         "workflow_loaded": "Workflow loaded: {name} ({operations} operations)",
-        "processing_in_progress": "Processing in progress",
+        "initial_workflow": "initial workflow",
     },
     "es": {
         "input_files": "Archivos de entrada",
@@ -198,6 +231,11 @@ TRANSLATIONS: Mapping[str, Mapping[str, str]] = {
         "theme": "Tema",
         "language": "Idioma",
         "scale": "Escala",
+        "dark": "Oscuro",
+        "light": "Claro",
+        "system": "Sistema",
+        "ascending": "A a Z",
+        "descending": "Z a A",
         "ready": "Listo",
         "keyboard_help": "Teclado: Tab o Mayús+Tab para navegar; Alt+P para procesar; Escape para cancelar",
         "save_config": "Guardar configuración",
@@ -249,6 +287,9 @@ TRANSLATIONS: Mapping[str, Mapping[str, str]] = {
         "leave_blank": "(dejar en blanco)",
         "per_column_transforms": "Transformaciones por columna",
         "output_name": "Nombre de salida",
+        "search": "Buscar...",
+        "replace_with": "Reemplazar por...",
+        "edit_number": "#",
         "delimiter": "Delimitador:",
         "encoding": "Codificación:",
         "quoting": "Comillas:",
@@ -281,6 +322,18 @@ TRANSLATIONS: Mapping[str, Mapping[str, str]] = {
         "reviewed_edits_status": (
             "Las ediciones revisadas se aplican antes de filtros/transformaciones y se escriben en el manifiesto."
         ),
+        "no_reviewed_edits": "(sin ediciones revisadas)",
+        "profile_ready": "Perfil listo: {matched:,} fila(s) coincidente(s), {source:,} fila(s) de origen exploradas",
+        "no_matching_row": "No se encontró ninguna fila coincidente.",
+        "inspection_header": "fila {row:,} | origen: {source}",
+        "inspection_columns": "columna                 texto original                       tipo inferido",
+        "no_row_selected": "Selecciona una fila para inspeccionar el texto de origen.",
+        "repair_row_invalid": "La fila de reparación debe ser un entero positivo",
+        "repair_not_added": "No se añadió la reparación: {message}",
+        "edits_recorded": "Se registraron {count:,} edición(es) revisada(s)",
+        "remove_index_invalid": "Quitar # debe ser un número de edición positivo",
+        "remove_index_missing": "Ese número de edición revisada no existe",
+        "invalid_saved_repairs": "Reparaciones guardadas no válidas: {message}",
         "column_summary": "Resumen de columnas",
         "files_processed": "Archivos procesados",
         "rows_read": "Filas leídas",
@@ -314,12 +367,6 @@ TRANSLATIONS: Mapping[str, Mapping[str, str]] = {
         "inspection_error": "Error de inspección: {message}",
         "inspected_row": "Fila sin procesar inspeccionada: {row}",
         "row_not_found": "Fila no encontrada",
-        "repair_row_invalid": "La fila de reparación debe ser un entero positivo",
-        "repair_not_added": "No se añadió la reparación: {message}",
-        "edits_recorded": "Se registraron {count:,} edición(es) revisada(s)",
-        "remove_index_invalid": "Quitar # debe ser un número de edición positivo",
-        "remove_index_missing": "Ese número de edición revisada no existe",
-        "invalid_saved_repairs": "Reparaciones guardadas no válidas: {message}",
         "preset_undo": "Edición del preset deshecha",
         "preset_redo": "Edición del preset rehecha",
         "finish_before_profiling": "Termina o cancela el procesamiento antes de perfilar",
@@ -328,11 +375,30 @@ TRANSLATIONS: Mapping[str, Mapping[str, str]] = {
         "add_files_before_inspecting": "Añade archivos antes de inspeccionar una fila",
         "no_files_selected": "No hay archivos seleccionados",
         "cancelling": "Cancelando...",
+        "processing_in_progress": "Procesamiento en curso",
+        "profile_error": "Error de perfil: {message}",
+        "profile_input_error": "El perfil terminó con un error de entrada: {message}",
+        "inspect_error": "Error de inspección: {message}",
+        "inspect_started": "Inspeccionando la fila sin procesar {row}…",
+        "inspect_complete": "Fila sin procesar inspeccionada: {row:,}",
+        "profile_started": "Perfilando filas sin procesar con límite…",
+        "cancel_quality": "Cancelando la operación de calidad…",
+        "preview_started": "Preparando vista previa acotada de solo lectura…",
+        "cancel_preview_status": "Cancelando la vista previa de solo lectura…",
+        "no_quality_profile": "Aún no hay perfil de calidad. Selecciona archivos y elige Perfilar.",
+        "no_column_summary": "(sin resumen de columnas)",
+        "not_available": "—",
+        "files_added_via_drop": "Se añadieron {count:,} archivo(s) mediante arrastrar y soltar",
+        "no_files_selected_error": "No hay archivos seleccionados",
+        "processing_started": "Iniciando procesamiento...",
+        "cancel_started": "Cancelando...",
+        "processing_saved": "¡Completado! Se guardaron {rows:,} filas",
+        "processing_empty": "El procesamiento terminó sin salida",
         "workflow_save_error": "Error al guardar el flujo: {message}",
         "workflow_load_error": "Error al cargar el flujo: {message}",
         "workflow_saved": "Flujo guardado: {name} ({operations} operaciones; {changed})",
         "workflow_loaded": "Flujo cargado: {name} ({operations} operaciones)",
-        "processing_in_progress": "Procesamiento en curso",
+        "initial_workflow": "flujo inicial",
     },
 }
 
@@ -358,6 +424,37 @@ def locale_choices() -> list[str]:
     """Return stable display labels for the locale selector."""
 
     return list(LOCALE_LABELS.values())
+
+
+APPEARANCE_MODES = ("dark", "light", "system")
+
+
+def appearance_choices(locale: str | None = None) -> list[str]:
+    """Return localized labels for the appearance selector."""
+
+    return [tr(mode, locale) for mode in APPEARANCE_MODES]
+
+
+def appearance_label(value: str, locale: str | None = None) -> str:
+    """Return the localized label for an appearance mode code."""
+
+    mode = normalize_appearance_mode(value)
+    return tr(mode, locale)
+
+
+def normalize_appearance_mode(value: str | None) -> str:
+    """Normalize a localized or legacy appearance label to its stable code."""
+
+    candidate = (value or "dark").strip().lower()
+    for mode in APPEARANCE_MODES:
+        labels = {
+            mode,
+            TRANSLATIONS[DEFAULT_LOCALE][mode].lower(),
+            *(translations.get(mode, "").lower() for translations in TRANSLATIONS.values()),
+        }
+        if candidate in labels:
+            return mode
+    return "dark"
 
 
 def set_locale(value: str | None) -> str:

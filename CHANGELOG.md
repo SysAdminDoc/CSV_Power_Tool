@@ -21,6 +21,8 @@ All notable changes to CSV_Power_Tool will be documented in this file.
 - API: Published the versioned loopback contract at `/contract`, added health metadata, stable error correlation, run IDs, documented limits, and independent raw/multipart/error/concurrency/cleanup coverage.
 - Workflow: Added atomic version-1-to-current migrations for workflow and history documents, identity-hash recomputation, and actionable rejection of unsupported future versions.
 - Dependencies: Promoted the validated tkinterdnd2, chardet, packaging, PyArrow, DuckDB, setuptools, and PyInstaller pins; added Python 3.14 CI coverage, lock/environment reporting, and a CycloneDX 1.5 SBOM. CustomTkinter remains at the known 5.2.2 pin pending isolated graphical validation.
+- GUI: Extended the accessibility/i18n contract with localized appearance labels, stable accessible descriptions, focus-contract snapshots, focus restoration after shell rebuilds, and a 100/125/150% DPI smoke matrix across dark/light/system themes and responsive layouts.
+- Watch: Added settled-file debouncing, replacement/truncation/deletion detection, workflow/configuration fingerprints, atomic restart-safe state, run IDs, and explicit CLI controls for settle windows and state paths.
 
 ## [v3.2.0] - 2026-08-03
 

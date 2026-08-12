@@ -2,12 +2,18 @@ import unittest
 
 from CSV_Consolidator import DARK_COLORS, LIGHT_COLORS
 from csv_power_tool.gui_accessibility import (
+    accessible_description,
     contrast_ratio,
+    focus_contract_snapshot,
+    set_accessible_name,
     validate_theme_contrast,
 )
 from csv_power_tool.i18n import (
     DEFAULT_LOCALE,
+    appearance_choices,
+    appearance_label,
     locale_choices,
+    normalize_appearance_mode,
     normalize_locale,
     set_locale,
     tr,
@@ -44,6 +50,25 @@ class GuiContractTests(unittest.TestCase):
         self.assertEqual(tr("input_files"), "Archivos de entrada")
         self.assertEqual(set_locale("English"), "en")
         self.assertEqual(tr("input_files"), "Input Files")
+
+    def test_appearance_labels_round_trip_through_localized_catalog(self):
+        self.assertEqual(normalize_appearance_mode("Light"), "light")
+        self.assertEqual(normalize_appearance_mode("Claro"), "light")
+        self.assertEqual(appearance_label("system", "es"), "Sistema")
+        self.assertEqual(appearance_choices("en"), ["Dark", "Light", "System"])
+
+    def test_accessible_description_is_stable_for_focus_contracts(self):
+        class _Widget:
+            def cget(self, key):
+                return {"text": "Run", "state": "normal"}.get(key, "")
+
+            def winfo_children(self):
+                return []
+
+        widget = _Widget()
+        set_accessible_name(widget, "Run", "Keyboard control 1")
+        self.assertEqual(accessible_description(widget), "Keyboard control 1")
+        self.assertEqual(focus_contract_snapshot(widget, "#00ffff"), [])
 
 
 if __name__ == "__main__":

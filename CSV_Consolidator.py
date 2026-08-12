@@ -71,17 +71,23 @@ from csv_power_tool.joins import (
     execute_three_way,
 )
 from csv_power_tool.sql import SQLQueryError, execute_sql_query
+from csv_power_tool.watch import WatchCoordinator, WatchStateError, workflow_fingerprint
 from csv_power_tool.gui_accessibility import (
     accessible_name,
+    accessible_description,
     collect_focusables,
     configure_focus_contract,
+    focus_contract_snapshot,
     set_focus_ring,
     validate_theme_contrast,
     widget_contains,
 )
 from csv_power_tool.i18n import (
+    appearance_choices,
+    appearance_label,
     locale_choices,
     locale_label,
+    normalize_appearance_mode,
     normalize_locale,
     set_locale,
     tr,
@@ -4806,7 +4812,7 @@ class TransformPanel(ctk.CTkFrame):
             row2.pack(fill="x", padx=8, pady=(2, 6))
 
             search_entry = ctk.CTkEntry(
-                row2, placeholder_text="Search...",
+                row2, placeholder_text=tr("search"),
                 font=ctk.CTkFont(size=10), height=26, width=120,
                 fg_color=COLORS["bg_dark"],
                 border_color=COLORS["border"],
@@ -4819,7 +4825,7 @@ class TransformPanel(ctk.CTkFrame):
                               lambda e, i=idx: self._update_transform(i, arg1=e.widget.get()))
 
             replace_entry = ctk.CTkEntry(
-                row2, placeholder_text="Replace with...",
+                row2, placeholder_text=tr("replace_with"),
                 font=ctk.CTkFont(size=10), height=26, width=120,
                 fg_color=COLORS["bg_dark"],
                 border_color=COLORS["border"],
@@ -5160,7 +5166,7 @@ class QualityPanel(ctk.CTkFrame):
     @staticmethod
     def format_profile(report: dict | None, query: str = "") -> str:
         if not report:
-            return "No quality profile yet. Select files and choose Profile."
+            return tr("no_quality_profile")
         query = str(query or "").strip().lower()
         source_rows = report.get("source_rows_scanned", report.get("rows_scanned", 0))
         rows = report.get("rows_scanned", 0)
@@ -5352,7 +5358,7 @@ class QualityPanel(ctk.CTkFrame):
         repair_actions = ctk.CTkFrame(self, fg_color="transparent")
         repair_actions.pack(fill="x", padx=12, pady=(0, 3))
         self.remove_index = ctk.CTkEntry(
-            repair_actions, width=55, height=25, placeholder_text="#",
+            repair_actions, width=55, height=25, placeholder_text=tr("edit_number"),
             font=ctk.CTkFont(size=9), fg_color=COLORS["bg_dark"],
             border_color=COLORS["border"], text_color=COLORS["text_primary"],
         )
@@ -5388,7 +5394,7 @@ class QualityPanel(ctk.CTkFrame):
 
     def _render_repairs(self):
         if not self.repair_edits:
-            text = "(no reviewed edits)"
+            text = tr("no_reviewed_edits")
         else:
             text = "\n".join(
                 f"{index}. row={edit['row']} column={edit['column']!r} "
@@ -5403,7 +5409,7 @@ class QualityPanel(ctk.CTkFrame):
         try:
             row = int(row_entry.get().strip())
         except ValueError:
-            self.status_label.configure(text="Repair row must be a positive integer")
+            self.status_label.configure(text=tr("repair_row_invalid"))
             return
         edit = {
             "row": row,
@@ -5416,30 +5422,30 @@ class QualityPanel(ctk.CTkFrame):
         try:
             self.repair_edits = normalize_repairs(self.repair_edits + [edit])
         except QualityError as exc:
-            self.status_label.configure(text=f"Repair not added: {exc}")
+            self.status_label.configure(text=tr("repair_not_added", message=exc))
             return
         self._render_repairs()
         for entry in self.repair_entries:
             entry.delete(0, END)
         if self.on_edit:
             self.on_edit(self.get_edits())
-        self.status_label.configure(text=f"Recorded {len(self.repair_edits):,} reviewed edit(s)")
+        self.status_label.configure(text=tr("edits_recorded", count=len(self.repair_edits)))
 
     def _remove_repair(self):
         try:
             index = int(self.remove_index.get().strip())
         except ValueError:
-            self.status_label.configure(text="Remove # must be a positive edit number")
+            self.status_label.configure(text=tr("remove_index_invalid"))
             return
         if index < 1 or index > len(self.repair_edits):
-            self.status_label.configure(text="That reviewed edit number does not exist")
+            self.status_label.configure(text=tr("remove_index_missing"))
             return
         del self.repair_edits[index - 1]
         self.remove_index.delete(0, END)
         self._render_repairs()
         if self.on_edit:
             self.on_edit(self.get_edits())
-        self.status_label.configure(text=f"Recorded {len(self.repair_edits):,} reviewed edit(s)")
+        self.status_label.configure(text=tr("edits_recorded", count=len(self.repair_edits)))
 
     def get_edits(self) -> list[dict]:
         return copy.deepcopy(self.repair_edits)
@@ -5449,7 +5455,7 @@ class QualityPanel(ctk.CTkFrame):
             self.repair_edits = normalize_repairs(edits or [])
         except QualityError as exc:
             self.repair_edits = []
-            self.status_label.configure(text=f"Invalid saved repairs: {exc}")
+            self.status_label.configure(text=tr("invalid_saved_repairs", message=exc))
         self._render_repairs()
 
     def get_facet_filter(self) -> tuple[str | None, str | None]:
@@ -5468,17 +5474,24 @@ class QualityPanel(ctk.CTkFrame):
         self._render_profile()
         source_rows = report.get("source_rows_scanned", report.get("rows_scanned", 0))
         self.profile_status.configure(
-            text=f"Profile ready: {report.get('rows_scanned', 0):,} matching row(s), "
-                 f"{source_rows:,} source row(s) scanned"
+            text=tr(
+                "profile_ready",
+                matched=report.get("rows_scanned", 0),
+                source=source_rows,
+            )
         )
 
     def update_inspection(self, inspection: dict | None):
         if not inspection:
-            self._set_text(self.inspection_text, "No matching row was found.")
+            self._set_text(self.inspection_text, tr("no_matching_row"))
             return
         lines = [
-            f"row {inspection['row_number']:,} | source: {inspection['source_file']}",
-            "column                  raw text                              inferred type",
+            tr(
+                "inspection_header",
+                row=inspection["row_number"],
+                source=inspection["source_file"],
+            ),
+            tr("inspection_columns"),
         ]
         for value in inspection.get("values", []):
             raw = str(value.get("raw", "")).replace("\r", "\\r").replace("\n", "\\n")
@@ -5490,8 +5503,8 @@ class QualityPanel(ctk.CTkFrame):
     def reset_profile(self):
         self.profile_report = None
         self._render_profile()
-        self._set_text(self.inspection_text, "Select a row to inspect source text.")
-        self.profile_status.configure(text="No profile loaded")
+        self._set_text(self.inspection_text, tr("no_row_selected"))
+        self.profile_status.configure(text=tr("no_profile_loaded"))
 
 
 class StatsPanel(ctk.CTkFrame):
@@ -5524,7 +5537,7 @@ class StatsPanel(ctk.CTkFrame):
             ).pack(side="left")
             
             val_label = ctk.CTkLabel(
-                frame, text="—", font=ctk.CTkFont(size=12, weight="bold"),
+                frame, text=tr("not_available"), font=ctk.CTkFont(size=12, weight="bold"),
                 text_color=color
             )
             val_label.pack(side="right")
@@ -5555,12 +5568,14 @@ class StatsPanel(ctk.CTkFrame):
             )
         self.summary_text.configure(state="normal")
         self.summary_text.delete("1.0", END)
-        self.summary_text.insert("1.0", "\n".join(lines) if lines else "(no column summary)")
+        self.summary_text.insert(
+            "1.0", "\n".join(lines) if lines else tr("no_column_summary")
+        )
         self.summary_text.configure(state="disabled")
     
     def reset(self):
         for label in self.labels.values():
-            label.configure(text="—")
+            label.configure(text=tr("not_available"))
         self.summary_text.configure(state="normal")
         self.summary_text.delete("1.0", END)
         self.summary_text.configure(state="disabled")
@@ -5581,7 +5596,8 @@ class CSVPowerToolApp:
 
         self.locale = set_locale(os.environ.get("CSV_POWER_TOOL_LOCALE", "en"))
         self.locale_mode = StringVar(value=locale_label(self.locale))
-        self.appearance_mode = StringVar(value="Dark")
+        self.appearance_code = "dark"
+        self.appearance_mode = StringVar(value=appearance_label(self.appearance_code))
         requested_scale = os.environ.get("CSV_POWER_TOOL_SCALE", "100%").strip()
         self.scale_mode = StringVar(
             value=requested_scale if requested_scale in {"100%", "125%", "150%"} else "100%"
@@ -5683,7 +5699,7 @@ class CSVPowerToolApp:
         ).pack(side="left", padx=(0, 6))
         ctk.CTkOptionMenu(
             appearance_frame, variable=self.appearance_mode,
-            values=["Dark", "Light", "System"], width=86, height=26,
+            values=appearance_choices(), width=86, height=26,
             font=ctk.CTkFont(size=10), fg_color=COLORS["bg_tertiary"],
             button_color=COLORS["bg_hover"], dropdown_fg_color=COLORS["bg_secondary"],
             command=self._set_appearance_mode,
@@ -5912,8 +5928,8 @@ class CSVPowerToolApp:
             self.root.update_idletasks()
         except Exception:
             pass
-        focusables = configure_focus_contract(self.root, COLORS["accent_cyan"])
-        self._focus_order_snapshot = [accessible_name(widget) for widget in focusables]
+        self._focus_contract_snapshot = focus_contract_snapshot(self.root, COLORS["accent_cyan"])
+        self._focus_order_snapshot = [entry["name"] for entry in self._focus_contract_snapshot]
 
     def _on_focus_in(self, event):
         focusables = configure_focus_contract(self.root, COLORS["accent_cyan"])
@@ -5949,8 +5965,9 @@ class CSVPowerToolApp:
         except Exception:
             return None
         self._focused_widget = target
+        description = accessible_description(target)
         self.progress_label.configure(
-            text=f"{accessible_name(target)} — {tr('keyboard_help').split(';', 1)[0]}"
+            text=f"{accessible_name(target)} — {description or tr('keyboard_help').split(';', 1)[0]}"
         )
         return "break"
 
@@ -6029,6 +6046,12 @@ class CSVPowerToolApp:
     def _rebuild_ui(self):
         config_data = self._config_to_data()
         files = list(self.file_panel.files)
+        focused_name = ""
+        if self._focused_widget is not None:
+            try:
+                focused_name = accessible_name(self._focused_widget)
+            except Exception:
+                focused_name = ""
         if self._responsive_job is not None:
             try:
                 self.root.after_cancel(self._responsive_job)
@@ -6048,10 +6071,32 @@ class CSVPowerToolApp:
         if files:
             self._on_files_changed()
         self._update_history_buttons()
+        self._restore_focus(focused_name)
+
+    def _restore_focus(self, name: str):
+        """Restore the initiating control after a localized/theme rebuild."""
+
+        if not name:
+            return
+
+        def restore():
+            focusables = configure_focus_contract(self.root, COLORS["accent_cyan"])
+            target = next((widget for widget in focusables if accessible_name(widget) == name), None)
+            if target is None:
+                return
+            try:
+                target.focus_set()
+            except Exception:
+                return
+            self._focused_widget = target
+            self._on_focus_in(type("FocusEvent", (), {"widget": target})())
+
+        self.root.after_idle(restore)
 
     def _set_locale(self, value: str):
         self.locale = set_locale(normalize_locale(value))
         self.locale_mode.set(locale_label(self.locale))
+        self.appearance_mode.set(appearance_label(self.appearance_code))
         self._rebuild_ui()
 
     def _set_scale(self, value: str):
@@ -6114,13 +6159,18 @@ class CSVPowerToolApp:
         stages = getattr(self, "_gui_smoke_stages", None)
         if stages is None:
             stages = [
-                ("Dark", "1200x850"),
-                ("Light", "1020x700"),
-                ("System", "900x640"),
+                (theme, scale, geometry)
+                for theme, geometry in (
+                    ("dark", "1200x850"),
+                    ("light", "1020x700"),
+                    ("system", "900x640"),
+                )
+                for scale in ("100%", "125%", "150%")
             ]
             self._gui_smoke_stages = stages
         if stages:
-            theme, geometry = stages.pop(0)
+            theme, scale, geometry = stages.pop(0)
+            self._set_scale(scale)
             self._set_appearance_mode(theme)
             self.root.geometry(geometry)
             self.root.update_idletasks()
@@ -6137,7 +6187,11 @@ class CSVPowerToolApp:
                     "layout_mode": self._layout_mode,
                     "focusable_count": len(collect_focusables(self.root)),
                     "focus_order": list(getattr(self, "_focus_order_snapshot", [])),
-                    "themes_checked": ["Dark", "Light", "System"],
+                    "focus_contract": list(getattr(self, "_focus_contract_snapshot", [])),
+                    "focus_order_unique": len(self._focus_order_snapshot) == len(set(self._focus_order_snapshot)),
+                    "themes_checked": ["dark", "light", "system"],
+                    "scales_checked": ["100%", "125%", "150%"],
+                    "layout_modes_checked": ["wide", "compact", "narrow"],
                     "contrast": {
                         "dark": validate_theme_contrast(DARK_COLORS),
                         "light": validate_theme_contrast(LIGHT_COLORS),
@@ -6151,7 +6205,7 @@ class CSVPowerToolApp:
             files = self.root.tk.splitlist(event.data)
             added = self.file_panel.add_files([Path(f) for f in files])
             if added:
-                self.log_panel.log(f"Added {added} file(s) via drag & drop", "info")
+                self.log_panel.log(tr("files_added_via_drop", count=added), "info")
         
         self.root.drop_target_register(DND_FILES)
         self.root.dnd_bind('<<Drop>>', drop)
@@ -6173,8 +6227,9 @@ class CSVPowerToolApp:
                 self.quality_panel.reset_profile()
 
     def _set_appearance_mode(self, value: str):
-        mode = value.lower()
-        self.appearance_mode.set(value)
+        mode = normalize_appearance_mode(value)
+        self.appearance_code = mode
+        self.appearance_mode.set(appearance_label(mode))
         ctk.set_appearance_mode(mode)
         active_mode = ctk.get_appearance_mode().lower() if mode == "system" else mode
         COLORS.update(LIGHT_COLORS if active_mode == "light" else DARK_COLORS)
@@ -6195,7 +6250,7 @@ class CSVPowerToolApp:
         if self._preview_engine is not None:
             self._preview_engine.cancel()
         if hasattr(self, "preview_panel"):
-            self.preview_panel.status_label.configure(text="Cancelling read-only preview…")
+            self.preview_panel.status_label.configure(text=tr("cancel_preview_status"))
 
     def _preview_progress(self, generation: int, value: float, status: str):
         if generation != self._preview_generation:
@@ -6217,7 +6272,7 @@ class CSVPowerToolApp:
         config = self._build_config()
         self._preview_generation += 1
         generation = self._preview_generation
-        self.preview_panel.status_label.configure(text="Preparing bounded read-only preview…")
+        self.preview_panel.status_label.configure(text=tr("preview_started"))
 
         def run():
             preview_engine = CSVEngine(
@@ -6238,7 +6293,9 @@ class CSVPowerToolApp:
                 error_message = str(exc)
                 self.root.after(
                     0,
-                    lambda message=error_message: self.preview_panel.reset(f"Preview error: {message}")
+                    lambda message=error_message: self.preview_panel.reset(
+                        tr("preview_error", message=message)
+                    )
                     if generation == self._preview_generation else None,
                 )
             finally:
@@ -6249,10 +6306,10 @@ class CSVPowerToolApp:
 
     def _profile_quality(self):
         if self.processing:
-            self.quality_panel.profile_status.configure(text="Finish or cancel processing before profiling")
+            self.quality_panel.profile_status.configure(text=tr("quality_finish_first"))
             return
         if not self.file_panel.files:
-            self.quality_panel.profile_status.configure(text="Add files before profiling")
+            self.quality_panel.profile_status.configure(text=tr("quality_add_files"))
             return
         try:
             filter_column, filter_value = self.quality_panel.get_facet_filter()
@@ -6265,7 +6322,7 @@ class CSVPowerToolApp:
         generation = self._quality_generation
         files = list(self.file_panel.files)
         config = self._build_config()
-        self.quality_panel.profile_status.configure(text="Profiling bounded raw rows…")
+        self.quality_panel.profile_status.configure(text=tr("profile_started"))
 
         def progress(value, status):
             self.root.after(
@@ -6298,7 +6355,7 @@ class CSVPowerToolApp:
                     self.root.after(
                         0,
                         lambda: self.quality_panel.profile_status.configure(
-                            text=f"Profile completed with an input error: {message}"
+                            text=tr("profile_input_error", message=message)
                         ) if generation == self._quality_generation else None,
                     )
             except Exception as exc:
@@ -6306,7 +6363,7 @@ class CSVPowerToolApp:
                 self.root.after(
                     0,
                     lambda: self.quality_panel.profile_status.configure(
-                        text=f"Profile error: {message}"
+                        text=tr("profile_error", message=message)
                     ) if generation == self._quality_generation else None,
                 )
             finally:
@@ -6317,10 +6374,10 @@ class CSVPowerToolApp:
 
     def _inspect_quality_row(self, row_number):
         if self.processing:
-            self.quality_panel.profile_status.configure(text="Finish or cancel processing before inspecting")
+            self.quality_panel.profile_status.configure(text=tr("quality_finish_inspect"))
             return
         if not self.file_panel.files:
-            self.quality_panel.profile_status.configure(text="Add files before inspecting a row")
+            self.quality_panel.profile_status.configure(text=tr("quality_add_files_inspect"))
             return
         if self._quality_engine is not None:
             self._quality_engine.cancel()
@@ -6328,7 +6385,7 @@ class CSVPowerToolApp:
         generation = self._quality_generation
         files = list(self.file_panel.files)
         config = self._build_config()
-        self.quality_panel.profile_status.configure(text=f"Inspecting raw row {row_number}…")
+        self.quality_panel.profile_status.configure(text=tr("inspect_started", row=row_number))
 
         def run():
             quality_engine = CSVEngine(config)
@@ -6343,8 +6400,8 @@ class CSVPowerToolApp:
                 self.root.after(
                     0,
                     lambda: self.quality_panel.profile_status.configure(
-                        text=(f"Inspected raw row {inspection['row_number']:,}"
-                              if inspection else "Row not found")
+                        text=(tr("inspect_complete", row=inspection["row_number"])
+                              if inspection else tr("row_not_found"))
                     ) if generation == self._quality_generation else None,
                 )
             except Exception as exc:
@@ -6352,7 +6409,7 @@ class CSVPowerToolApp:
                 self.root.after(
                     0,
                     lambda: self.quality_panel.profile_status.configure(
-                        text=f"Inspection error: {message}"
+                        text=tr("inspect_error", message=message)
                     ) if generation == self._quality_generation else None,
                 )
             finally:
@@ -6519,7 +6576,7 @@ class CSVPowerToolApp:
         if state is not None:
             self._apply_config_data(state)
             self._update_history_buttons()
-            self.log_panel.log("Preset edit undone", "info")
+            self.log_panel.log(tr("preset_undo"), "info")
             self._schedule_preview()
 
     def _redo(self):
@@ -6527,12 +6584,12 @@ class CSVPowerToolApp:
         if state is not None:
             self._apply_config_data(state)
             self._update_history_buttons()
-            self.log_panel.log("Preset edit redone", "info")
+            self.log_panel.log(tr("preset_redo"), "info")
             self._schedule_preview()
     
     def _process(self):
         if not self.file_panel.files:
-            self.log_panel.log("No files selected", "error")
+            self.log_panel.log(tr("no_files_selected_error"), "error")
             return
         
         output_config = self.output_panel.get_config()
@@ -6547,7 +6604,7 @@ class CSVPowerToolApp:
         self.stats_panel.reset()
         self.progress_bar.set(0)
         self.log_panel.clear()
-        self.log_panel.log("Starting processing...", "info")
+        self.log_panel.log(tr("processing_started"), "info")
         
         config = self._build_config()
         
@@ -6566,11 +6623,11 @@ class CSVPowerToolApp:
     def _cancel(self):
         if self.engine:
             self.engine.cancel()
-            self.log_panel.log("Cancelling...", "warning")
+            self.log_panel.log(tr("cancel_started"), "warning")
         if self._quality_engine:
             self._quality_generation += 1
             self._quality_engine.cancel()
-            self.quality_panel.profile_status.configure(text="Cancelling quality operation…")
+            self.quality_panel.profile_status.configure(text=tr("cancel_quality"))
     
     def _complete(self, stats: ProcessingStats):
         self.processing = False
@@ -6578,9 +6635,9 @@ class CSVPowerToolApp:
         self.stats_panel.update(stats)
         
         if stats.final_row_count > 0:
-            self.log_panel.log(f"✓ Complete! {stats.final_row_count:,} rows saved", "success")
+            self.log_panel.log(tr("processing_saved", rows=stats.final_row_count), "success")
         else:
-            self.log_panel.log("Processing completed with no output", "warning")
+            self.log_panel.log(tr("processing_empty"), "warning")
     
     def _set_ui_state(self, processing: bool):
         state = "disabled" if processing else "normal"
@@ -6588,12 +6645,13 @@ class CSVPowerToolApp:
         self.cancel_btn.configure(state="normal" if processing else "disabled")
         if hasattr(self, "quality_panel"):
             self.quality_panel.profile_status.configure(
-                text="Processing in progress" if processing else self.quality_panel.profile_status.cget("text")
+                text=tr("processing_in_progress")
+                if processing else self.quality_panel.profile_status.cget("text")
             )
     
     def _save_config(self):
         file = filedialog.asksaveasfilename(
-            title="Save Configuration",
+            title=tr("save_config"),
             defaultextension=".json",
             filetypes=[("JSON Files", "*.json")]
         )
@@ -6610,20 +6668,25 @@ class CSVPowerToolApp:
                 write_workflow(file, workflow)
                 record = append_history(self.workflow_history_path, workflow)
             except WorkflowError as exc:
-                self.log_panel.log(f"Workflow save error: {exc}", "error")
+                self.log_panel.log(tr("workflow_save_error", message=exc), "error")
                 return
             if self.history:
                 self.history.record(data)
                 self._update_history_buttons()
-            changed = ", ".join(record["changed_fields"]) if record["changed_fields"] else "initial workflow"
+            changed = ", ".join(record["changed_fields"]) if record["changed_fields"] else tr("initial_workflow")
             self.log_panel.log(
-                f"Workflow saved: {Path(file).name} ({len(workflow['operations'])} operations; {changed})",
+                tr(
+                    "workflow_saved",
+                    name=Path(file).name,
+                    operations=len(workflow["operations"]),
+                    changed=changed,
+                ),
                 "success",
             )
     
     def _load_config(self):
         file = filedialog.askopenfilename(
-            title="Load Configuration",
+            title=tr("load_config"),
             filetypes=[("JSON Files", "*.json")]
         )
         if file:
@@ -6644,13 +6707,17 @@ class CSVPowerToolApp:
                     self._update_history_buttons()
                 
                 self.log_panel.log(
-                    f"Workflow loaded: {Path(file).name} ({len(operation_types(workflow))} operations)",
+                    tr(
+                        "workflow_loaded",
+                        name=Path(file).name,
+                        operations=len(operation_types(workflow)),
+                    ),
                     "success",
                 )
                 self._schedule_preview()
                 
             except WorkflowError as e:
-                self.log_panel.log(f"Error loading workflow: {e}", "error")
+                self.log_panel.log(tr("workflow_load_error", message=e), "error")
     
     def run(self):
         self.root.mainloop()
@@ -6876,9 +6943,15 @@ def cli_main(argv=None):
     parser.add_argument("--upload-token", help="Use this upload API token; otherwise generate one per server run")
     parser.add_argument("--no-stream", action="store_true", help="Disable bounded-memory streaming path")
     parser.add_argument("--watch", action="store_true",
-                        help="Watch inputs and re-run whenever matching files change")
+                        help="Watch inputs and re-run whenever matching files settle after a change")
     parser.add_argument("--watch-interval", type=float, default=2.0,
                         help="Polling interval for --watch, in seconds")
+    parser.add_argument("--watch-settle-seconds", type=float, default=1.0,
+                        help="Stable size/mtime window required before --watch processes files")
+    parser.add_argument(
+        "--watch-state",
+        help="Persist restart-safe --watch state here (default: <output>.watch.json)",
+    )
     parser.add_argument("--quiet", "-q", action="store_true", help="Suppress log output")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     parser.add_argument("--stats-json", help="Write stable machine-readable run statistics JSON")
@@ -6937,6 +7010,15 @@ def cli_main(argv=None):
                 parser.error("--sql-report must differ from --output")
         except OSError:
             pass
+    if args.watch:
+        if args.watch_interval <= 0:
+            parser.error("--watch-interval must be greater than 0")
+        if args.watch_settle_seconds < 0:
+            parser.error("--watch-settle-seconds must be zero or greater")
+        if args.output == "-":
+            parser.error("--watch cannot write a continuously changing output to stdout")
+        if not args.output:
+            parser.error("--watch requires --output")
 
     stream_temp_paths = []
     stdin_temp_path = None
@@ -7820,30 +7902,46 @@ def cli_main(argv=None):
             lambda _input_files: run_three_way_merge(),
         ))
 
-    def input_signature(input_files):
-        signature = []
-        for path in input_files:
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            signature.append((str(path.resolve()), stat.st_mtime_ns, stat.st_size))
-        return tuple(signature)
-
     if args.watch:
-        last_signature = None
+        state_path = Path(args.watch_state) if args.watch_state else Path(f"{output_path}.watch.json")
+        watch_workflow = workflow_fingerprint(config, args.inputs or [], workflow_output_path)
+        try:
+            coordinator = WatchCoordinator(
+                state_path,
+                watch_workflow,
+                settle_seconds=args.watch_settle_seconds,
+            )
+        except (OSError, WatchStateError, ValueError) as exc:
+            print(f"Error loading watch state: {exc}", file=sys.stderr)
+            sys.exit(3)
         last_exit = 0
         try:
             while True:
                 watched_files = expand_inputs(args.inputs)
-                signature = input_signature(watched_files)
-                if signature != last_signature:
-                    if watched_files:
+                decision = coordinator.observe(watched_files)
+                if decision.deleted_paths and not args.quiet:
+                    print(
+                        f"!! Watch detected deleted input(s): {', '.join(decision.deleted_paths)}",
+                        file=sys.stderr,
+                    )
+                if decision.action == "settling" and not args.quiet:
+                    print("  Watch: inputs are still settling...", file=sys.stderr)
+                elif decision.action == "deleted" and not args.quiet:
+                    print("  Watch: waiting for input files to reappear...", file=sys.stderr)
+                elif decision.should_process:
+                    if not args.quiet:
+                        print(
+                            f"  Watch: processing settled input set (run {decision.run_id})",
+                            file=sys.stderr,
+                        )
+                    try:
                         last_exit = execute_once(watched_files)
-                    elif not args.quiet:
-                        print("CSV Power Tool - waiting for input files...", file=sys.stderr)
-                    last_signature = signature
-                time.sleep(max(args.watch_interval, 0.1))
+                    except KeyboardInterrupt:
+                        coordinator.mark_result(decision.run_id, 130)
+                        raise
+                    else:
+                        coordinator.mark_result(decision.run_id, last_exit)
+                time.sleep(args.watch_interval)
         except KeyboardInterrupt:
             sys.exit(last_exit)
 

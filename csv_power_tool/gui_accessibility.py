@@ -186,8 +186,7 @@ def set_accessible_name(widget: Any, name: str, description: str | None = None) 
     """Attach an inspectable accessible name/description to a Tk widget."""
 
     widget._csv_power_accessible_name = _clean_accessible_text(name)
-    if description:
-        widget._csv_power_accessible_description = _clean_accessible_text(description)
+    widget._csv_power_accessible_description = _clean_accessible_text(description or "")
     return widget
 
 
@@ -214,6 +213,14 @@ def accessible_name(widget: Any) -> str:
     return _clean_accessible_text(widget.__class__.__name__)
 
 
+def accessible_description(widget: Any) -> str:
+    """Read the status/assistive-technology description attached to a control."""
+
+    return _clean_accessible_text(
+        str(getattr(widget, "_csv_power_accessible_description", "") or "")
+    )
+
+
 def configure_focus_contract(root: Any, color: str) -> list[Any]:
     """Prepare visible controls and attach stable names for keyboard/AT users."""
 
@@ -225,9 +232,24 @@ def configure_focus_contract(root: Any, color: str) -> list[Any]:
         counts[name] = counts.get(name, 0) + 1
         if counts[name] > 1:
             name = f"{name} ({counts[name]})"
-        set_accessible_name(widget, name, f"Keyboard control {index} of {len(focusables)}")
+        description = accessible_description(widget)
+        if not description:
+            description = f"Keyboard control {index} of {len(focusables)}"
+        set_accessible_name(widget, name, description)
         set_focus_ring(widget, False, color)
     return focusables
+
+
+def focus_contract_snapshot(root: Any, color: str) -> list[dict[str, str]]:
+    """Return a stable, serializable focus contract for smoke tests and support."""
+
+    return [
+        {
+            "name": accessible_name(widget),
+            "description": accessible_description(widget),
+        }
+        for widget in configure_focus_contract(root, color)
+    ]
 
 
 def widget_contains(parent: Any, child: Any) -> bool:
