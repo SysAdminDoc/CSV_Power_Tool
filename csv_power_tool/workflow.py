@@ -13,9 +13,11 @@ from typing import Iterable
 
 
 WORKFLOW_FORMAT = "csv-power-tool-workflow"
-WORKFLOW_VERSION = 1
+WORKFLOW_VERSION = 2
 HISTORY_FORMAT = "csv-power-tool-workflow-history"
-HISTORY_VERSION = 1
+HISTORY_VERSION = 2
+LEGACY_WORKFLOW_VERSION = 1
+LEGACY_HISTORY_VERSION = 1
 DEFAULT_HISTORY_LIMIT = 50
 
 
@@ -155,8 +157,66 @@ def build_workflow(
     return document
 
 
+def _validate_workflow_payload(data: dict) -> None:
+    if not isinstance(data.get("config"), dict):
+        raise WorkflowError("Workflow config must be an object")
+    if not isinstance(data.get("inputs"), dict) or not isinstance(data["inputs"].get("patterns", []), list):
+        raise WorkflowError("Workflow inputs.patterns must be a list")
+    if not isinstance(data.get("operations"), list) or not data["operations"]:
+        raise WorkflowError("Workflow operations must be a non-empty list")
+
+
+def _normalize_workflow_payload(data: dict) -> dict:
+    _validate_workflow_payload(data)
+    normalized = copy.deepcopy(data)
+    expected_hash = normalized.get("workflow_sha256")
+    normalized["workflow_sha256"] = _workflow_hash(normalized)
+    if expected_hash and expected_hash != normalized["workflow_sha256"]:
+        raise WorkflowError("Workflow identity hash does not match its contents")
+    return normalized
+
+
+def migrate_workflow(data: dict) -> dict:
+    """Upgrade a supported workflow document and recompute its identity hash.
+
+    Version 2 records the schema revision in metadata. The migration is
+    intentionally additive, so the execution configuration and ordered
+    operations retain their version-1 meaning while the new document gets a
+    new, correctly recomputed identity hash.
+    """
+
+    if not isinstance(data, dict):
+        raise WorkflowError("Workflow must be a JSON object")
+    if data.get("format") != WORKFLOW_FORMAT:
+        raise WorkflowError(f"Unsupported workflow format: {data.get('format')!r}")
+    version = data.get("version")
+    if version == WORKFLOW_VERSION:
+        return _normalize_workflow_payload(data)
+    if version == LEGACY_WORKFLOW_VERSION:
+        migrated = _normalize_workflow_payload(data)
+        metadata = migrated.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise WorkflowError("Workflow metadata must be an object")
+        metadata = copy.deepcopy(metadata)
+        metadata.setdefault("migrated_from_version", LEGACY_WORKFLOW_VERSION)
+        metadata["schema_revision"] = WORKFLOW_VERSION
+        migrated["metadata"] = metadata
+        migrated["version"] = WORKFLOW_VERSION
+        migrated.pop("workflow_sha256", None)
+        return _normalize_workflow_payload(migrated)
+    if isinstance(version, int) and version > WORKFLOW_VERSION:
+        raise WorkflowError(
+            f"Workflow version {version} is newer than supported version {WORKFLOW_VERSION}; "
+            "upgrade CSV Power Tool before replaying it"
+        )
+    raise WorkflowError(
+        f"Unsupported workflow version {version!r}; supported versions are "
+        f"{LEGACY_WORKFLOW_VERSION} and {WORKFLOW_VERSION}"
+    )
+
+
 def normalize_workflow(data: dict, tool_version: str = "unknown") -> dict:
-    """Validate a workflow and migrate the historical plain-config format."""
+    """Validate a workflow and migrate plain-config or version-1 documents."""
 
     if not isinstance(data, dict):
         raise WorkflowError("Workflow must be a JSON object")
@@ -166,24 +226,7 @@ def normalize_workflow(data: dict, tool_version: str = "unknown") -> dict:
             tool_version=tool_version,
             metadata={"migrated_from": "legacy-config"},
         )
-    if data.get("format") != WORKFLOW_FORMAT:
-        raise WorkflowError(f"Unsupported workflow format: {data.get('format')!r}")
-    if data.get("version") != WORKFLOW_VERSION:
-        raise WorkflowError(
-            f"Unsupported workflow version {data.get('version')!r}; expected {WORKFLOW_VERSION}"
-        )
-    if not isinstance(data.get("config"), dict):
-        raise WorkflowError("Workflow config must be an object")
-    if not isinstance(data.get("inputs"), dict) or not isinstance(data["inputs"].get("patterns", []), list):
-        raise WorkflowError("Workflow inputs.patterns must be a list")
-    if not isinstance(data.get("operations"), list) or not data["operations"]:
-        raise WorkflowError("Workflow operations must be a non-empty list")
-    normalized = copy.deepcopy(data)
-    expected_hash = normalized.get("workflow_sha256")
-    normalized["workflow_sha256"] = _workflow_hash(normalized)
-    if expected_hash and expected_hash != normalized["workflow_sha256"]:
-        raise WorkflowError("Workflow identity hash does not match its contents")
-    return normalized
+    return migrate_workflow(data)
 
 
 def load_workflow(path: str | Path) -> dict:
@@ -242,15 +285,8 @@ def append_history(
             history = json.loads(history_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise WorkflowError(f"Unable to read workflow history {history_path}: {exc}") from exc
-        if history.get("format") != HISTORY_FORMAT or history.get("version") != HISTORY_VERSION:
-            raise WorkflowError(f"Unsupported workflow history format in {history_path}")
-        records = history.get("records", [])
-        if not isinstance(records, list):
-            raise WorkflowError("Workflow history records must be a list")
-        for record in records:
-            if not isinstance(record, dict) or not isinstance(record.get("workflow"), dict):
-                raise WorkflowError("Workflow history contains an invalid record")
-            normalize_workflow(record["workflow"])
+        history = normalize_history(history)
+        records = history["records"]
 
     previous = records[-1]["workflow"] if records else None
     record = {
@@ -267,6 +303,61 @@ def append_history(
     }
     _atomic_json_write(history_path, payload)
     return record
+
+
+def normalize_history(data: dict) -> dict:
+    """Validate and migrate a workflow history document before it is written."""
+
+    if not isinstance(data, dict):
+        raise WorkflowError("Workflow history must be a JSON object")
+    if data.get("format") != HISTORY_FORMAT:
+        raise WorkflowError(f"Unsupported workflow history format: {data.get('format')!r}")
+    version = data.get("version")
+    if version not in {LEGACY_HISTORY_VERSION, HISTORY_VERSION}:
+        if isinstance(version, int) and version > HISTORY_VERSION:
+            raise WorkflowError(
+                f"Workflow history version {version} is newer than supported version {HISTORY_VERSION}; "
+                "upgrade CSV Power Tool before appending to it"
+            )
+        raise WorkflowError(
+            f"Unsupported workflow history version {version!r}; expected {HISTORY_VERSION}"
+        )
+    records = data.get("records", [])
+    if not isinstance(records, list):
+        raise WorkflowError("Workflow history records must be a list")
+    normalized_records = []
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get("workflow"), dict):
+            raise WorkflowError("Workflow history contains an invalid record")
+        normalized_record = copy.deepcopy(record)
+        normalized_record["workflow"] = normalize_workflow(record["workflow"])
+        normalized_records.append(normalized_record)
+
+    normalized = copy.deepcopy(data)
+    normalized["records"] = normalized_records
+    if version == LEGACY_HISTORY_VERSION:
+        normalized["version"] = HISTORY_VERSION
+        metadata = normalized.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise WorkflowError("Workflow history metadata must be an object")
+        metadata = copy.deepcopy(metadata)
+        metadata.setdefault("migrated_from_version", LEGACY_HISTORY_VERSION)
+        normalized["metadata"] = metadata
+    normalized.setdefault("limit", DEFAULT_HISTORY_LIMIT)
+    try:
+        normalized["limit"] = max(1, int(normalized["limit"]))
+    except (TypeError, ValueError) as exc:
+        raise WorkflowError("Workflow history limit must be a positive integer") from exc
+    return normalized
+
+
+def load_history(path: str | Path) -> dict:
+    history_path = Path(path)
+    try:
+        data = json.loads(history_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WorkflowError(f"Unable to read workflow history {history_path}: {exc}") from exc
+    return normalize_history(data)
 
 
 def _atomic_json_write(path: Path, payload: dict) -> None:
