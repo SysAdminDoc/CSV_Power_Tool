@@ -1,13 +1,16 @@
 # CSV Power Tool runtime lock; refresh intentionally and review security/licensing changes.
+# 2026-08-12 compatibility lane: the upgrades below passed the disposable
+# Python 3.12 test/Ruff run. CustomTkinter 6.0.0 remains unpromoted until the
+# graphical smoke runner has an isolated renderer; 5.2.2 is the known pin.
 customtkinter==5.2.2
-tkinterdnd2==0.4.3
+tkinterdnd2==0.6.2
 darkdetect==0.8.0
-packaging==26.2
-chardet==5.2.0
+packaging==26.3
+chardet==7.5.1
 openpyxl==3.1.5
 et_xmlfile==2.0.0
-pyarrow==25.0.0
+pyarrow==25.0.1
 polars==1.43.2
 polars-runtime-32==1.43.2
 rapidfuzz==3.14.3
-duckdb==1.5.2
+duckdb==1.5.5

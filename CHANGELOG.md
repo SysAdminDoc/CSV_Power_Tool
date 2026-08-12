@@ -20,6 +20,7 @@ All notable changes to CSV_Power_Tool will be documented in this file.
 - Performance: Added an explicit non-streaming Parquet materialization budget with actionable admission failures and execution-mode reporting; Arrow-batched streaming remains available for compatible operations.
 - API: Published the versioned loopback contract at `/contract`, added health metadata, stable error correlation, run IDs, documented limits, and independent raw/multipart/error/concurrency/cleanup coverage.
 - Workflow: Added atomic version-1-to-current migrations for workflow and history documents, identity-hash recomputation, and actionable rejection of unsupported future versions.
+- Dependencies: Promoted the validated tkinterdnd2, chardet, packaging, PyArrow, DuckDB, setuptools, and PyInstaller pins; added Python 3.14 CI coverage, lock/environment reporting, and a CycloneDX 1.5 SBOM. CustomTkinter remains at the known 5.2.2 pin pending isolated graphical validation.
 
 ## [v3.2.0] - 2026-08-03
 

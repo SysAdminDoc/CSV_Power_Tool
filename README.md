@@ -186,8 +186,10 @@ python packaging/build.py --msi
 ```
 
 The build prints SHA-256 hashes for the one-file executable and optional WiX MSI. No code-signing step is used.
-The default build removes stale executable output, performs a clean PyInstaller build, and writes
-`dist/CSV_Power_Tool.dependencies.json` with the locked runtime component versions and detected license metadata.
+The default build removes stale executable output, performs a clean PyInstaller build, checks that the
+launcher, package metadata, README badge, CHANGELOG release, and WiX manifest use one version, and writes
+`dist/CSV_Power_Tool.dependencies.json` plus a CycloneDX 1.5 `dist/CSV_Power_Tool.cdx.json` SBOM with the
+locked runtime component versions and detected license metadata.
 Use `python packaging/build.py --reuse` only when intentionally reusing an already verified executable.
 
 ---

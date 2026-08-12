@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.10', '3.12', '3.13']
+        python-version: ['3.10', '3.12', '3.13', '3.14']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -44,7 +44,7 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.lock
       - name: Install locked dependencies
-        run: python -m pip install --disable-pip-version-check -r requirements.lock pyinstaller==6.20.0
+        run: python -m pip install --disable-pip-version-check -r requirements.lock pyinstaller==6.22.0
       - name: Build clean unsigned executable
         run: python packaging/build.py
       - name: Verify artifact and manifest
@@ -52,6 +52,7 @@ jobs:
         run: |
           if (-not (Test-Path dist/CSV_Power_Tool.exe)) { throw 'Executable missing' }
           if (-not (Test-Path dist/CSV_Power_Tool.dependencies.json)) { throw 'Dependency manifest missing' }
+          if (-not (Test-Path dist/CSV_Power_Tool.cdx.json)) { throw 'CycloneDX SBOM missing' }
           if ((Get-AuthenticodeSignature dist/CSV_Power_Tool.exe).Status -ne 'NotSigned') { throw 'Artifact must remain unsigned' }
           python -c "import hashlib; from pathlib import Path; p=Path('dist/CSV_Power_Tool.exe'); print(hashlib.sha256(p.read_bytes()).hexdigest())"
           dist/CSV_Power_Tool.exe --version
