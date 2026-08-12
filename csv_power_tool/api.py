@@ -25,6 +25,8 @@ from urllib.parse import parse_qs, urlparse
 DEFAULT_APP_NAME = "CSV Power Tool"
 DEFAULT_APP_VERSION = "unknown"
 DEFAULT_INPUT_SUFFIXES = {".csv", ".tsv", ".txt", ".xlsx", ".parquet", ".jsonl", ".ndjson"}
+API_FORMAT = "csv-power-tool-loopback-api"
+API_VERSION = 1
 
 
 def _default_engine_factory(config):
@@ -45,6 +47,8 @@ class UploadRequestHandler(BaseHTTPRequestHandler):
     def setup(self):
         super().setup()
         self.connection.settimeout(self.server.request_timeout)
+        self.request_id = secrets.token_hex(16)
+        self.run_id = None
 
     @staticmethod
     def _loopback_host(host: str | None) -> bool:
@@ -79,13 +83,26 @@ class UploadRequestHandler(BaseHTTPRequestHandler):
             raise UploadRequestError(401, "unauthorized", "A valid CSV Power Tool upload token is required")
 
     def _request_error(self, error: "UploadRequestError"):
-        self._send_json(error.status, {"error": {"code": error.code, "message": str(error)}})
+        payload = {
+            "error": {"code": error.code, "message": str(error)},
+            "request_id": self.request_id,
+        }
+        if self.run_id:
+            payload["run_id"] = self.run_id
+        self._send_json(error.status, payload)
+
+    def _send_contract_headers(self):
+        self.send_header("X-CSV-Power-API-Version", str(API_VERSION))
+        self.send_header("X-CSV-Power-Request-Id", self.request_id)
+        if self.run_id:
+            self.send_header("X-CSV-Power-Run-Id", self.run_id)
 
     def _send_json(self, status: int, payload: dict):
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
+        self._send_contract_headers()
         self.end_headers()
         self.wfile.write(encoded)
 
@@ -145,24 +162,31 @@ class UploadRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler API
         try:
             self._authorize()
-            if urlparse(self.path).path == "/health":
+            path = urlparse(self.path).path
+            if path == "/health":
                 self._send_json(
                     200,
                     {
+                        "format": API_FORMAT,
+                        "api_version": API_VERSION,
                         "status": "ok",
                         "service": self.server.app_name,
                         "version": self.server.app_version,
                     },
                 )
                 return
-            self._send_json(404, {"error": {"code": "not_found", "message": "Use GET /health or POST /process"}})
+            if path == "/contract":
+                self._send_json(200, build_api_contract(self.server))
+                return
+            raise UploadRequestError(404, "not_found", "Use GET /health or POST /process")
         except UploadRequestError as exc:
             self._request_error(exc)
 
     def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
         if urlparse(self.path).path != "/process":
-            self._send_json(404, {"error": {"code": "not_found", "message": "Use POST /process"}})
+            self._request_error(UploadRequestError(404, "not_found", "Use POST /process"))
             return
+        self.run_id = secrets.token_hex(16)
         if not self.server.request_slots.acquire(blocking=False):
             self._request_error(UploadRequestError(429, "busy", "The upload server is at its concurrency limit"))
             return
@@ -194,6 +218,7 @@ class UploadRequestHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/csv; charset=utf-8")
             self.send_header("Content-Length", str(len(output)))
+            self._send_contract_headers()
             self.send_header("X-CSV-Power-Rows", str(stats.final_row_count))
             self.send_header("X-CSV-Power-Files", str(stats.files_processed))
             self.end_headers()
@@ -223,6 +248,71 @@ class UploadRequestError(ValueError):
         self.code = code
 
 
+def build_api_contract(server=None) -> dict:
+    """Return the machine-readable contract shared by health and process clients."""
+
+    app_name = getattr(server, "app_name", DEFAULT_APP_NAME)
+    app_version = getattr(server, "app_version", DEFAULT_APP_VERSION)
+    suffixes = getattr(server, "supported_input_suffixes", DEFAULT_INPUT_SUFFIXES)
+    handler = UploadRequestHandler
+    return {
+        "format": API_FORMAT,
+        "version": API_VERSION,
+        "service": app_name,
+        "tool_version": app_version,
+        "authentication": {
+            "required": True,
+            "headers": ["X-CSV-Power-Token", "Authorization: Bearer <token>"],
+            "host": "loopback only",
+            "origin": "optional loopback origin only",
+        },
+        "endpoints": {
+            "health": {
+                "method": "GET",
+                "path": "/health",
+                "response": "application/json",
+            },
+            "contract": {
+                "method": "GET",
+                "path": "/contract",
+                "response": "application/json",
+            },
+            "process": {
+                "method": "POST",
+                "path": "/process",
+                "request": ["raw file body", "multipart/form-data"],
+                "response": "text/csv",
+                "sql": False,
+            },
+        },
+        "limits": {
+            "request_bytes": handler.MAX_UPLOAD_BYTES,
+            "file_bytes": handler.MAX_FILE_BYTES,
+            "file_count": handler.MAX_FILE_COUNT,
+            "form_field_bytes": handler.MAX_FORM_FIELD_BYTES,
+            "filename_bytes": handler.MAX_FILENAME_BYTES,
+            "concurrent_requests": getattr(server, "max_concurrent_requests", 4),
+            "request_timeout_seconds": getattr(server, "request_timeout", 30.0),
+        },
+        "input_suffixes": sorted(str(suffix) for suffix in suffixes),
+        "response_headers": {
+            "X-CSV-Power-API-Version": "contract version",
+            "X-CSV-Power-Request-Id": "request correlation identifier",
+            "X-CSV-Power-Run-Id": "processing run identifier for POST /process",
+            "X-CSV-Power-Rows": "successful process row count",
+            "X-CSV-Power-Files": "successful process file count",
+        },
+        "errors": {
+            "content_type": "application/json; charset=utf-8",
+            "shape": {
+                "error": {"code": "stable machine-readable code", "message": "human-readable detail"},
+                "request_id": "request correlation identifier",
+                "run_id": "processing run identifier when allocated",
+            },
+        },
+    }
+
+
 def create_upload_server(
     config,
     host: str = "127.0.0.1",
@@ -245,7 +335,8 @@ def create_upload_server(
     server.app_version = app_version
     server.auth_token = auth_token or secrets.token_urlsafe(32)
     server.request_timeout = 30.0
-    server.request_slots = threading.BoundedSemaphore(4)
+    server.max_concurrent_requests = 4
+    server.request_slots = threading.BoundedSemaphore(server.max_concurrent_requests)
     return server
 
 

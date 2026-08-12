@@ -18,6 +18,7 @@ All notable changes to CSV_Power_Tool will be documented in this file.
 - SQL: Added format-aware CSV/TSV/TXT, XLSX, Parquet, and JSONL/NDJSON adapters with named-view schema/limitation reports, read-only local execution, bounded source/result rows and cells, memory/time budgets, interruptible failures, and manifest/CLI report integration.
 - Contracts: Exposed validated source-to-output column mappings through GUI configuration, workflows, schema reports, manifests, and repeated `--rename SOURCE=TARGET` CLI options; ambiguous or stale mappings now fail before output replacement.
 - Performance: Added an explicit non-streaming Parquet materialization budget with actionable admission failures and execution-mode reporting; Arrow-batched streaming remains available for compatible operations.
+- API: Published the versioned loopback contract at `/contract`, added health metadata, stable error correlation, run IDs, documented limits, and independent raw/multipart/error/concurrency/cleanup coverage.
 
 ## [v3.2.0] - 2026-08-03
 
