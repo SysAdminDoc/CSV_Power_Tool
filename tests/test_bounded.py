@@ -183,6 +183,26 @@ class BoundedProcessingTests(unittest.TestCase):
                 streamed_output.read_text(encoding="utf-8"),
                 materialized_output.read_text(encoding="utf-8"),
             )
+            self.assertEqual(streamed_stats.execution_mode, "streaming")
+            self.assertEqual(materialized_stats.execution_mode, "materialized")
+
+    def test_materialized_parquet_path_rejects_rows_above_explicit_budget(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "input.parquet"
+            output_path = root / "output.csv"
+            pq.write_table(pa.table({"id": list(range(3))}), input_path)
+
+            stats = CSVEngine(
+                ProcessingConfig(
+                    dedupe_enabled=False,
+                    streaming_enabled=False,
+                    max_materialized_rows=2,
+                )
+            ).process([input_path], output_path)
+
+            self.assertTrue(any("materialization limit" in error for error in stats.errors))
+            self.assertFalse(output_path.exists())
 
     def test_streaming_writer_supports_batched_parquet_output(self):
         with tempfile.TemporaryDirectory() as temp_dir:

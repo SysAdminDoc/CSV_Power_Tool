@@ -45,7 +45,10 @@ from csv_power_tool.schema import (
     SchemaError,
     infer_schema,
     load_schema,
+    normalize_column_mapping,
     normalize_schema,
+    parse_column_mapping_assignments,
+    validate_column_mapping,
     validate_rows,
     validation_report,
     write_schema,
@@ -71,8 +74,7 @@ from csv_power_tool.sql import SQLQueryError, execute_sql_query
 from csv_power_tool.gui_accessibility import (
     accessible_name,
     collect_focusables,
-    prepare_focus_widget,
-    set_accessible_name,
+    configure_focus_contract,
     set_focus_ring,
     validate_theme_contrast,
     widget_contains,
@@ -338,6 +340,7 @@ class ProcessingConfig:
     engine_backend: str = "auto"  # "auto", "python", or "polars"
     polars_threshold_bytes: int = 5_000_000
     stream_batch_rows: int = 2_048
+    max_materialized_rows: int = 250_000
 
     # Output
     output_delimiter: str = ","
@@ -374,6 +377,7 @@ class ProcessingStats:
     join_report: dict = field(default_factory=dict)
     merge_report: dict = field(default_factory=dict)
     sql_report: dict = field(default_factory=dict)
+    execution_mode: str = "materialized"
 
 
 class ConfigHistory:
@@ -947,11 +951,39 @@ class CSVEngine:
                         return []
                     if not self._check_row_limit(file_path, metadata.num_rows):
                         return []
+                    materialized_limit = self._input_limit(
+                        "max_materialized_rows", 250_000
+                    )
+                    if metadata.num_rows > materialized_limit:
+                        self._record_fatal_input(
+                            file_path,
+                            "Parquet processing requires materializing "
+                            f"{metadata.num_rows:,} rows, exceeding the "
+                            f"materialization limit of {materialized_limit:,}; "
+                            "use a bounded streaming-compatible operation or raise "
+                            "--max-materialized-rows explicitly",
+                        )
+                        return []
                     table = pq.read_table(file_path)
                     records = table.to_pylist()
                 except ImportError:
                     pl = _optional_module("polars")
-                    frame = pl.read_parquet(file_path)
+                    lazy_frame = pl.scan_parquet(file_path)
+                    row_count = int(lazy_frame.select(pl.len()).collect().item())
+                    materialized_limit = self._input_limit(
+                        "max_materialized_rows", 250_000
+                    )
+                    if row_count > materialized_limit:
+                        self._record_fatal_input(
+                            file_path,
+                            "Parquet processing requires materializing "
+                            f"{row_count:,} rows, exceeding the "
+                            f"materialization limit of {materialized_limit:,}; "
+                            "use a bounded streaming-compatible operation or raise "
+                            "--max-materialized-rows explicitly",
+                        )
+                        return []
+                    frame = lazy_frame.collect()
                     if not self._check_column_limit(file_path, len(frame.columns)):
                         return []
                     if not self._check_row_limit(file_path, frame.height):
@@ -1529,7 +1561,11 @@ class CSVEngine:
                 "sha256": self._sha256_file(output_file),
                 "backup": str(backup_path) if backup_path else None,
             },
-            "schema": {"columns": output_columns, "column_count": len(output_columns)},
+            "schema": {
+                "columns": output_columns,
+                "column_count": len(output_columns),
+                "column_mapping": dict(getattr(self.config, "column_mapping", {}) or {}),
+            },
             "stats": {
                 "files_processed": self.stats.files_processed,
                 "files_skipped": self.stats.files_skipped,
@@ -1537,6 +1573,7 @@ class CSVEngine:
                 "rows_filtered": self.stats.rows_filtered,
                 "duplicates_removed": self.stats.duplicates_removed,
                 "rows_written": self.stats.final_row_count,
+                "execution_mode": self.stats.execution_mode,
                 "warnings": self.stats.warnings,
                 "errors": self.stats.errors,
                 "quarantined_rows": self.stats.quarantined_rows,
@@ -1793,6 +1830,8 @@ class CSVEngine:
                 column for column in union
                 if all(column in set(report["columns"]) for report in file_reports)
             ] if file_reports else [],
+            "column_mapping": validate_column_mapping(self.config.column_mapping, union),
+            "output_columns": [self.config.column_mapping.get(column, column) for column in union],
         }
 
     def write_schema_report(self, files: list[Path], report_path: Path) -> dict:
@@ -1975,6 +2014,8 @@ class CSVEngine:
 
         # Determine final columns
         final_columns = self._get_final_columns(column_order)
+        if not self._validate_column_mapping(column_order):
+            return self.stats
         final_columns = self._with_transform_columns(final_columns)
         
         # Phase 2: Apply filters
@@ -2285,11 +2326,14 @@ class CSVEngine:
         self._record_fatal_input(file_path, "unable to decode input with supported encodings")
 
     def _process_streaming(self, input_files: list[Path], output_file: Path) -> ProcessingStats:
+        self.stats.execution_mode = "streaming"
         self.log("Phase 1: Streaming rows...", "info")
         discovered_order = self.discover_columns(input_files)
         if self.stats.fatal_input_errors:
             self._write_quarantine()
             self.log("Input validation failed; no output was written", "error")
+            return self.stats
+        if not self._validate_column_mapping(discovered_order):
             return self.stats
         final_columns = self._with_transform_columns(self._get_final_columns(discovered_order))
         output_columns = [self.config.column_mapping.get(c, c) for c in final_columns]
@@ -2886,6 +2930,21 @@ class CSVEngine:
         
         # Apply column mapping for display names
         return columns
+
+    def _validate_column_mapping(self, columns: list[str]) -> bool:
+        """Reject ambiguous or stale renames before any output is created."""
+
+        try:
+            self.config.column_mapping = validate_column_mapping(
+                self.config.column_mapping,
+                list(columns),
+            )
+        except SchemaError as exc:
+            message = f"Column mapping validation failed: {exc}"
+            self.stats.errors.append(message)
+            self.log(f"XX {message}", "error")
+            return False
+        return True
 
     def _with_transform_columns(self, columns: list[str]) -> list[str]:
         """Add output columns created by split, merge, and compute transforms."""
@@ -3576,7 +3635,7 @@ class FileListPanel(ctk.CTkFrame):
         ).pack(side="left")
         
         self.count_label = ctk.CTkLabel(
-            header, text="0 files",
+            header, text=tr("file_count_many", count=0),
             font=ctk.CTkFont(size=11),
             text_color=COLORS["text_muted"]
         )
@@ -3700,11 +3759,12 @@ class FileListPanel(ctk.CTkFrame):
                 text_color=COLORS["text_muted"]
             )
             self.placeholder.pack(expand=True, pady=30)
-            self.count_label.configure(text="0 files")
+            self.count_label.configure(text=tr("file_count_many", count=0))
         else:
             for idx, fp in enumerate(self.files):
                 self._create_item(fp, idx)
-            self.count_label.configure(text=f"{len(self.files)} file{'s' if len(self.files) != 1 else ''}")
+            count_key = "file_count_one" if len(self.files) == 1 else "file_count_many"
+            self.count_label.configure(text=tr(count_key, count=len(self.files)))
     
     def _create_item(self, path: Path, idx: int):
         bg = COLORS["bg_secondary"] if idx % 2 == 0 else COLORS["bg_tertiary"]
@@ -3713,7 +3773,7 @@ class FileListPanel(ctk.CTkFrame):
         frame.pack(fill="x", pady=1)
         frame.pack_propagate(False)
         
-        ctk.CTkLabel(frame, text="File", font=ctk.CTkFont(size=10), width=28).pack(side="left", padx=(6, 2))
+        ctk.CTkLabel(frame, text=tr("file"), font=ctk.CTkFont(size=10), width=28).pack(side="left", padx=(6, 2))
         
         ctk.CTkLabel(
             frame, text=path.name, font=ctk.CTkFont(size=11),
@@ -3754,6 +3814,7 @@ class ColumnPanel(ctk.CTkFrame):
         self.columns: list[str] = []
         self.selected: set[str] = set()
         self.column_mapping: dict[str, str] = {}
+        self.mapping_vars: dict[str, StringVar] = {}
         self._drag_column = None
         self._row_frames = {}
         self.mode = StringVar(value="all")
@@ -3769,7 +3830,7 @@ class ColumnPanel(ctk.CTkFrame):
         ).pack(side="left")
         
         self.count_label = ctk.CTkLabel(
-            header, text="No columns",
+            header, text=tr("column_count_none"),
             font=ctk.CTkFont(size=11),
             text_color=COLORS["text_muted"]
         )
@@ -3837,6 +3898,20 @@ class ColumnPanel(ctk.CTkFrame):
         self.selected = {column for column in self.selected if column in self.columns} or set(self.columns)
         self._refresh()
 
+    def set_mapping(self, mapping: dict | None):
+        self.column_mapping = normalize_column_mapping(mapping)
+        self._refresh()
+
+    def get_mapping(self) -> dict[str, str]:
+        mapping = dict(self.column_mapping)
+        for column, variable in self.mapping_vars.items():
+            target = str(variable.get() or "").strip()
+            if target and target != column:
+                mapping[column] = target
+            else:
+                mapping.pop(column, None)
+        return normalize_column_mapping(mapping)
+
     def get_column_order(self) -> list[str]:
         return list(self.columns)
 
@@ -3878,9 +3953,12 @@ class ColumnPanel(ctk.CTkFrame):
             self.selected.discard(col)
     
     def _refresh(self):
+        if self.mapping_vars:
+            self.column_mapping = self.get_mapping()
         for w in self.scroll_frame.winfo_children():
             w.destroy()
         self._row_frames = {}
+        self.mapping_vars = {}
         
         if not self.columns:
             self.placeholder = ctk.CTkLabel(
@@ -3890,7 +3968,7 @@ class ColumnPanel(ctk.CTkFrame):
                 text_color=COLORS["text_muted"]
             )
             self.placeholder.pack(expand=True, pady=20)
-            self.count_label.configure(text="No columns")
+            self.count_label.configure(text=tr("column_count_none"))
         else:
             for col in self.columns:
                 var = BooleanVar(value=col in self.selected)
@@ -3918,11 +3996,25 @@ class ColumnPanel(ctk.CTkFrame):
                     text_color=COLORS["text_primary"],
                     command=lambda c=col, v=var: self._toggle_column(c, v)
                 ).pack(side="left")
+
+                mapping_var = StringVar(value=self.column_mapping.get(col, ""))
+                self.mapping_vars[col] = mapping_var
+                ctk.CTkEntry(
+                    frame,
+                    textvariable=mapping_var,
+                    placeholder_text=tr("output_name"),
+                    width=150,
+                    height=25,
+                    font=ctk.CTkFont(size=10),
+                    fg_color=COLORS["bg_dark"],
+                    border_color=COLORS["border"],
+                    text_color=COLORS["text_primary"],
+                ).pack(side="right", padx=(6, 2), fill="x", expand=True)
             
-            self.count_label.configure(text=f"{len(self.columns)} columns")
+            self.count_label.configure(text=tr("column_count_many", count=len(self.columns)))
     
-    def get_config(self) -> tuple[str, list[str]]:
-        return self.mode.get(), list(self.selected)
+    def get_config(self) -> tuple[str, list[str], dict[str, str]]:
+        return self.mode.get(), list(self.selected), self.get_mapping()
 
 
 class SortPanel(ctk.CTkFrame):
@@ -3962,14 +4054,14 @@ class SortPanel(ctk.CTkFrame):
         opts_frame.pack(fill="x", padx=12, pady=(0, 8))
         
         ctk.CTkCheckBox(
-            opts_frame, text="Case sensitive", variable=self.case_sensitive,
+            opts_frame, text=tr("case_sensitive"), variable=self.case_sensitive,
             font=ctk.CTkFont(size=11),
             fg_color=COLORS["accent_blue"],
             text_color=COLORS["text_secondary"]
         ).pack(side="left", padx=(0, 12))
         
         ctk.CTkCheckBox(
-            opts_frame, text="Numeric-aware", variable=self.numeric_aware,
+            opts_frame, text=tr("numeric_aware"), variable=self.numeric_aware,
             font=ctk.CTkFont(size=11),
             fg_color=COLORS["accent_blue"],
             text_color=COLORS["text_secondary"]
@@ -4130,12 +4222,12 @@ class DedupePanel(ctk.CTkFrame):
         keep_frame.pack(fill="x", padx=12, pady=(0, 8))
         
         ctk.CTkLabel(
-            keep_frame, text="Keep:",
+            keep_frame, text=tr("keep"),
             font=ctk.CTkFont(size=11),
             text_color=COLORS["text_secondary"]
         ).pack(side="left", padx=(0, 8))
         
-        for val, text in [("first", "First"), ("last", "Last")]:
+        for val, text in [("first", tr("first")), ("last", tr("last"))]:
             ctk.CTkRadioButton(
                 keep_frame, text=text, variable=self.keep_mode, value=val,
                 font=ctk.CTkFont(size=11),
@@ -4148,7 +4240,7 @@ class DedupePanel(ctk.CTkFrame):
         col_mode_frame.pack(fill="x", padx=12, pady=(0, 8))
         
         ctk.CTkCheckBox(
-            col_mode_frame, text="Use all columns for comparison",
+            col_mode_frame, text=tr("use_all_columns"),
             variable=self.use_all_columns,
             font=ctk.CTkFont(size=11),
             fg_color=COLORS["accent_blue"],
@@ -4160,7 +4252,7 @@ class DedupePanel(ctk.CTkFrame):
         fuzzy_frame.pack(fill="x", padx=12, pady=(0, 8))
 
         ctk.CTkCheckBox(
-            fuzzy_frame, text="Fuzzy duplicate matching",
+            fuzzy_frame, text=tr("fuzzy_duplicate_matching"),
             variable=self.fuzzy_enabled,
             font=ctk.CTkFont(size=11),
             fg_color=COLORS["accent_blue"],
@@ -4168,7 +4260,7 @@ class DedupePanel(ctk.CTkFrame):
         ).pack(side="left", padx=(0, 12))
 
         ctk.CTkLabel(
-            fuzzy_frame, text="Threshold",
+            fuzzy_frame, text=tr("threshold"),
             font=ctk.CTkFont(size=11),
             text_color=COLORS["text_muted"],
         ).pack(side="left", padx=(0, 6))
@@ -4186,7 +4278,7 @@ class DedupePanel(ctk.CTkFrame):
         aggregate_frame.pack(fill="x", padx=12, pady=(0, 8))
 
         ctk.CTkLabel(
-            aggregate_frame, text="Aggregate:",
+            aggregate_frame, text=tr("aggregate"),
             font=ctk.CTkFont(size=11),
             text_color=COLORS["text_secondary"],
         ).pack(side="left", padx=(0, 8))
@@ -4202,7 +4294,7 @@ class DedupePanel(ctk.CTkFrame):
 
         ctk.CTkEntry(
             aggregate_frame, textvariable=self.aggregate_separator,
-            placeholder_text="separator",
+            placeholder_text=tr("separator"),
             font=ctk.CTkFont(size=11), height=28, width=80,
             fg_color=COLORS["bg_dark"],
             border_color=COLORS["border"],
@@ -4312,14 +4404,14 @@ class FilterPanel(ctk.CTkFrame):
         logic_frame.pack(side="right")
         
         ctk.CTkRadioButton(
-            logic_frame, text="AND", variable=self.logic, value="and",
+            logic_frame, text=tr("and"), variable=self.logic, value="and",
             font=ctk.CTkFont(size=10),
             fg_color=COLORS["accent_blue"],
             text_color=COLORS["text_secondary"]
         ).pack(side="left", padx=4)
         
         ctk.CTkRadioButton(
-            logic_frame, text="OR", variable=self.logic, value="or",
+            logic_frame, text=tr("or"), variable=self.logic, value="or",
             font=ctk.CTkFont(size=10),
             fg_color=COLORS["accent_blue"],
             text_color=COLORS["text_secondary"]
@@ -4447,7 +4539,7 @@ class FilterPanel(ctk.CTkFrame):
             row2.pack(fill="x", padx=8, pady=(2, 6))
             
             val_entry = ctk.CTkEntry(
-                row2, placeholder_text="Value...",
+                row2, placeholder_text=tr("value"),
                 font=ctk.CTkFont(size=10), height=26,
                 fg_color=COLORS["bg_dark"],
                 border_color=COLORS["border"],
@@ -4504,7 +4596,7 @@ class TransformPanel(ctk.CTkFrame):
 
         # Trim whitespace
         ctk.CTkCheckBox(
-            opts_frame, text="Trim whitespace",
+            opts_frame, text=tr("trim_whitespace"),
             variable=self.trim_whitespace,
             font=ctk.CTkFont(size=11),
             fg_color=COLORS["accent_blue"],
@@ -4516,12 +4608,15 @@ class TransformPanel(ctk.CTkFrame):
         case_frame.pack(fill="x", pady=4)
 
         ctk.CTkLabel(
-            case_frame, text="Case:",
+            case_frame, text=tr("case"),
             font=ctk.CTkFont(size=11),
             text_color=COLORS["text_secondary"]
         ).pack(side="left", padx=(0, 8))
 
-        for val, text in [("none", "None"), ("upper", "UPPER"), ("lower", "lower"), ("title", "Title")]:
+        for val, text in [
+            ("none", tr("none")), ("upper", "UPPER"),
+            ("lower", "lower"), ("title", "Title"),
+        ]:
             ctk.CTkRadioButton(
                 case_frame, text=text, variable=self.case_transform, value=val,
                 font=ctk.CTkFont(size=11),
@@ -4534,7 +4629,7 @@ class TransformPanel(ctk.CTkFrame):
         header_frame.pack(fill="x", pady=4)
 
         ctk.CTkLabel(
-            header_frame, text="Headers:",
+            header_frame, text=tr("headers"),
             font=ctk.CTkFont(size=11),
             text_color=COLORS["text_secondary"]
         ).pack(side="left", padx=(0, 8))
@@ -4553,14 +4648,14 @@ class TransformPanel(ctk.CTkFrame):
         empty_frame.pack(fill="x", pady=4)
 
         ctk.CTkLabel(
-            empty_frame, text="Replace empty cells with:",
+            empty_frame, text=tr("replace_empty_cells"),
             font=ctk.CTkFont(size=11),
             text_color=COLORS["text_secondary"]
         ).pack(side="left", padx=(0, 8))
 
         ctk.CTkEntry(
             empty_frame, textvariable=self.empty_value,
-            placeholder_text="(leave blank)",
+            placeholder_text=tr("leave_blank"),
             font=ctk.CTkFont(size=11), height=28, width=120,
             fg_color=COLORS["bg_dark"],
             border_color=COLORS["border"],
@@ -4575,7 +4670,7 @@ class TransformPanel(ctk.CTkFrame):
         col_header.pack(fill="x", padx=12, pady=(4, 4))
 
         ctk.CTkLabel(
-            col_header, text="Per-Column Transforms",
+            col_header, text=tr("per_column_transforms"),
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color=COLORS["text_primary"]
         ).pack(side="left")
@@ -4781,7 +4876,7 @@ class OutputPanel(ctk.CTkFrame):
         row1 = ctk.CTkFrame(opts_frame, fg_color="transparent")
         row1.pack(fill="x", pady=4)
         
-        ctk.CTkLabel(row1, text="Delimiter:", font=ctk.CTkFont(size=11),
+        ctk.CTkLabel(row1, text=tr("delimiter"), font=ctk.CTkFont(size=11),
                      text_color=COLORS["text_secondary"], width=70, anchor="w").pack(side="left")
         ctk.CTkOptionMenu(
             row1, variable=self.delimiter,
@@ -4792,7 +4887,7 @@ class OutputPanel(ctk.CTkFrame):
             dropdown_fg_color=COLORS["bg_secondary"]
         ).pack(side="left", padx=(0, 20))
         
-        ctk.CTkLabel(row1, text="Encoding:", font=ctk.CTkFont(size=11),
+        ctk.CTkLabel(row1, text=tr("encoding"), font=ctk.CTkFont(size=11),
                      text_color=COLORS["text_secondary"], width=70, anchor="w").pack(side="left")
         ctk.CTkOptionMenu(
             row1, variable=self.encoding,
@@ -4807,7 +4902,7 @@ class OutputPanel(ctk.CTkFrame):
         row2 = ctk.CTkFrame(opts_frame, fg_color="transparent")
         row2.pack(fill="x", pady=4)
         
-        ctk.CTkLabel(row2, text="Quoting:", font=ctk.CTkFont(size=11),
+        ctk.CTkLabel(row2, text=tr("quoting"), font=ctk.CTkFont(size=11),
                      text_color=COLORS["text_secondary"], width=70, anchor="w").pack(side="left")
         ctk.CTkOptionMenu(
             row2, variable=self.quoting,
@@ -4818,7 +4913,7 @@ class OutputPanel(ctk.CTkFrame):
             dropdown_fg_color=COLORS["bg_secondary"]
         ).pack(side="left", padx=(0, 20))
         
-        ctk.CTkLabel(row2, text="Line End:", font=ctk.CTkFont(size=11),
+        ctk.CTkLabel(row2, text=tr("line_end"), font=ctk.CTkFont(size=11),
                      text_color=COLORS["text_secondary"], width=70, anchor="w").pack(side="left")
         ctk.CTkOptionMenu(
             row2, variable=self.line_ending,
@@ -4831,7 +4926,7 @@ class OutputPanel(ctk.CTkFrame):
         
         # Include header checkbox
         ctk.CTkCheckBox(
-            opts_frame, text="Include header row",
+            opts_frame, text=tr("include_header_row"),
             variable=self.include_header,
             font=ctk.CTkFont(size=11),
             fg_color=COLORS["accent_blue"],
@@ -4843,7 +4938,7 @@ class OutputPanel(ctk.CTkFrame):
         path_frame.pack(fill="x", padx=12, pady=(0, 12))
         
         ctk.CTkLabel(
-            path_frame, text="Output File:",
+            path_frame, text=tr("output_file"),
             font=ctk.CTkFont(size=11),
             text_color=COLORS["text_secondary"]
         ).pack(anchor="w", pady=(0, 4))
@@ -4853,7 +4948,7 @@ class OutputPanel(ctk.CTkFrame):
         
         self.path_entry = ctk.CTkEntry(
             path_row, textvariable=self.output_path,
-            placeholder_text="Select output file...",
+            placeholder_text=tr("select_output_file"),
             font=ctk.CTkFont(size=11), height=32,
             fg_color=COLORS["bg_dark"],
             border_color=COLORS["border"],
@@ -4862,7 +4957,7 @@ class OutputPanel(ctk.CTkFrame):
         self.path_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
         
         ctk.CTkButton(
-            path_row, text="Browse", font=ctk.CTkFont(size=11),
+            path_row, text=tr("browse"), font=ctk.CTkFont(size=11),
             height=32, width=70, fg_color=COLORS["bg_tertiary"],
             hover_color=COLORS["bg_hover"],
             text_color=COLORS["text_primary"],
@@ -4871,7 +4966,7 @@ class OutputPanel(ctk.CTkFrame):
     
     def _browse(self):
         file = filedialog.asksaveasfilename(
-            title="Save As",
+            title=tr("save_as"),
             defaultextension=".csv",
             filetypes=[
                 ("CSV Files", "*.csv"),
@@ -4930,7 +5025,7 @@ class LogPanel(ctk.CTkFrame):
         ).pack(side="left")
         
         ctk.CTkButton(
-            header, text="Clear", font=ctk.CTkFont(size=10),
+            header, text=tr("clear_log"), font=ctk.CTkFont(size=10),
             height=24, width=50, fg_color=COLORS["bg_tertiary"],
             hover_color=COLORS["bg_hover"],
             text_color=COLORS["text_secondary"],
@@ -5005,7 +5100,7 @@ class PreviewPanel(ctk.CTkFrame):
         actions = ctk.CTkFrame(header, fg_color="transparent")
         actions.pack(side="right")
         ctk.CTkButton(
-            actions, text="Cancel", width=58, height=24,
+            actions, text=tr("cancel_preview"), width=58, height=24,
             font=ctk.CTkFont(size=10),
             fg_color=COLORS["bg_tertiary"], hover_color=COLORS["accent_red"],
             text_color=COLORS["text_secondary"], corner_radius=4,
@@ -5041,21 +5136,22 @@ class PreviewPanel(ctk.CTkFrame):
         self.preview_text.configure(state="disabled")
         metadata = preview.get("metadata", {})
         if metadata.get("cancelled"):
-            status = f"Cancelled after scanning {metadata.get('rows_scanned', 0):,} row(s)"
+            status = tr("preview_cancelled", rows=f"{metadata.get('rows_scanned', 0):,}")
         elif metadata.get("scan_truncated"):
-            status = (
-                f"Read-only sample: showing {len(rows):,}; scanned "
-                f"{metadata.get('rows_scanned', 0):,} row(s) within the preview budget"
+            status = tr(
+                "preview_limited",
+                shown=f"{len(rows):,}",
+                scanned=f"{metadata.get('rows_scanned', 0):,}",
             )
         else:
-            status = f"Read-only sample: {len(rows):,} row(s) scanned within the preview budget"
+            status = tr("preview_complete", rows=f"{len(rows):,}")
         self.status_label.configure(text=status)
 
-    def reset(self, message: str = "Add files to preview projected output"):
+    def reset(self, message: str | None = None):
         self.preview_text.configure(state="normal")
         self.preview_text.delete("1.0", END)
         self.preview_text.configure(state="disabled")
-        self.status_label.configure(text=message)
+        self.status_label.configure(text=message or tr("preview_empty"))
 
 
 class QualityPanel(ctk.CTkFrame):
@@ -5141,12 +5237,12 @@ class QualityPanel(ctk.CTkFrame):
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.pack(fill="x", padx=12, pady=(10, 4))
         ctk.CTkLabel(
-            header, text="Data Quality",
+            header, text=tr("data_quality"),
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color=COLORS["text_primary"],
         ).pack(side="left")
         ctk.CTkButton(
-            header, text="Profile", width=72, height=25,
+            header, text=tr("profile"), width=72, height=25,
             font=ctk.CTkFont(size=10), fg_color=COLORS["accent_blue"],
             hover_color=COLORS["accent_blue_hover"], corner_radius=5,
             command=lambda: self.on_profile() if self.on_profile else None,
@@ -5154,8 +5250,7 @@ class QualityPanel(ctk.CTkFrame):
 
         ctk.CTkLabel(
             self,
-            text="Inspect distributions, drill into a facet, and record exact reviewed text edits."
-                 " The global Undo/Redo controls include these edits.",
+            text=tr("quality_description"),
             font=ctk.CTkFont(size=10), text_color=COLORS["text_muted"],
             anchor="w", justify="left", wraplength=500,
         ).pack(fill="x", padx=12, pady=(0, 6))
@@ -5164,14 +5259,14 @@ class QualityPanel(ctk.CTkFrame):
         filter_row.pack(fill="x", padx=12, pady=(0, 5))
         self.profile_filter = ctk.CTkEntry(
             filter_row, width=170, height=28,
-            placeholder_text="Find column or facet",
+            placeholder_text=tr("find_column_or_facet"),
             font=ctk.CTkFont(size=10), fg_color=COLORS["bg_dark"],
             border_color=COLORS["border"], text_color=COLORS["text_primary"],
         )
         self.profile_filter.pack(side="left", padx=(0, 5))
         self.facet_filter = ctk.CTkEntry(
             filter_row, width=190, height=28,
-            placeholder_text="Facet filter: column=value",
+            placeholder_text=tr("facet_filter"),
             font=ctk.CTkFont(size=10), fg_color=COLORS["bg_dark"],
             border_color=COLORS["border"], text_color=COLORS["text_primary"],
         )
@@ -5179,7 +5274,7 @@ class QualityPanel(ctk.CTkFrame):
         self.profile_filter.bind("<KeyRelease>", lambda _event: self._render_profile())
 
         self.profile_status = ctk.CTkLabel(
-            self, text="No profile loaded", font=ctk.CTkFont(size=10),
+            self, text=tr("no_profile_loaded"), font=ctk.CTkFont(size=10),
             text_color=COLORS["text_muted"], anchor="w",
         )
         self.profile_status.pack(fill="x", padx=12, pady=(0, 3))
@@ -5194,19 +5289,19 @@ class QualityPanel(ctk.CTkFrame):
         inspect_header = ctk.CTkFrame(self, fg_color="transparent")
         inspect_header.pack(fill="x", padx=12, pady=(0, 3))
         ctk.CTkLabel(
-            inspect_header, text="Row inspection (global 1-based row)",
+            inspect_header, text=tr("row_inspection"),
             font=ctk.CTkFont(size=10, weight="bold"),
             text_color=COLORS["text_secondary"], anchor="w",
         ).pack(side="left")
         self.inspect_row_entry = ctk.CTkEntry(
-            inspect_header, width=70, height=25, placeholder_text="Row",
+            inspect_header, width=70, height=25, placeholder_text=tr("row"),
             font=ctk.CTkFont(size=10), fg_color=COLORS["bg_dark"],
             border_color=COLORS["border"], text_color=COLORS["text_primary"],
         )
         self.inspect_row_entry.insert(0, "1")
         self.inspect_row_entry.pack(side="right", padx=(5, 0))
         ctk.CTkButton(
-            inspect_header, text="Inspect", width=65, height=25,
+            inspect_header, text=tr("inspect"), width=65, height=25,
             font=ctk.CTkFont(size=10), fg_color=COLORS["bg_tertiary"],
             hover_color=COLORS["bg_hover"], text_color=COLORS["text_secondary"],
             corner_radius=5,
@@ -5223,20 +5318,20 @@ class QualityPanel(ctk.CTkFrame):
         repair_header = ctk.CTkFrame(self, fg_color="transparent")
         repair_header.pack(fill="x", padx=12, pady=(0, 3))
         ctk.CTkLabel(
-            repair_header, text="Reviewed repairs (text replacements)",
+            repair_header, text=tr("reviewed_repairs"),
             font=ctk.CTkFont(size=10, weight="bold"),
             text_color=COLORS["text_secondary"], anchor="w",
         ).pack(side="left")
         ctk.CTkLabel(
-            repair_header, text="Raw text is compared when Expected is set",
+            repair_header, text=tr("raw_text_expected"),
             font=ctk.CTkFont(size=9), text_color=COLORS["text_muted"], anchor="e",
         ).pack(side="right")
 
         repair_form = ctk.CTkFrame(self, fg_color="transparent")
         repair_form.pack(fill="x", padx=12, pady=(0, 4))
         fields = (
-            ("Row", 48), ("Column", 100), ("Expected old", 120),
-            ("Replacement", 120), ("Reason", 120),
+            (tr("row"), 48), (tr("column"), 100), (tr("expected_old"), 120),
+            (tr("replacement"), 120), (tr("reason"), 120),
         )
         self.repair_entries = []
         for placeholder, width in fields:
@@ -5248,7 +5343,7 @@ class QualityPanel(ctk.CTkFrame):
             entry.pack(side="left", padx=(0, 3))
             self.repair_entries.append(entry)
         ctk.CTkButton(
-            repair_form, text="Add", width=50, height=27,
+            repair_form, text=tr("add"), width=50, height=27,
             font=ctk.CTkFont(size=9), fg_color=COLORS["accent_green"],
             hover_color=COLORS["accent_green_hover"], corner_radius=5,
             command=self._add_repair,
@@ -5263,7 +5358,7 @@ class QualityPanel(ctk.CTkFrame):
         )
         self.remove_index.pack(side="right", padx=(4, 0))
         ctk.CTkButton(
-            repair_actions, text="Remove #", width=72, height=25,
+            repair_actions, text=tr("remove_number"), width=72, height=25,
             font=ctk.CTkFont(size=9), fg_color=COLORS["bg_tertiary"],
             hover_color=COLORS["accent_red"], text_color=COLORS["text_secondary"],
             corner_radius=5, command=self._remove_repair,
@@ -5276,7 +5371,7 @@ class QualityPanel(ctk.CTkFrame):
         self.repair_text.pack(fill="x", padx=12, pady=(0, 4))
         self.repair_text.configure(state="disabled")
         self.status_label = ctk.CTkLabel(
-            self, text="Reviewed edits are applied before filters/transforms and written to the manifest.",
+            self, text=tr("reviewed_edits_status"),
             font=ctk.CTkFont(size=9), text_color=COLORS["text_muted"], anchor="w",
         )
         self.status_label.pack(fill="x", padx=12, pady=(0, 8))
@@ -5412,11 +5507,11 @@ class StatsPanel(ctk.CTkFrame):
         self.labels = {}
         
         stats_config = [
-            ("files_processed", "Files Processed", COLORS["accent_blue"]),
-            ("total_rows_read", "Rows Read", COLORS["text_primary"]),
-            ("rows_filtered", "Rows Filtered", COLORS["accent_orange"]),
-            ("duplicates_removed", "Duplicates Removed", COLORS["accent_purple"]),
-            ("final_row_count", "Final Rows", COLORS["accent_green"]),
+            ("files_processed", tr("files_processed"), COLORS["accent_blue"]),
+            ("total_rows_read", tr("rows_read"), COLORS["text_primary"]),
+            ("rows_filtered", tr("rows_filtered"), COLORS["accent_orange"]),
+            ("duplicates_removed", tr("duplicates_removed"), COLORS["accent_purple"]),
+            ("final_row_count", tr("final_rows"), COLORS["accent_green"]),
         ]
         
         for i, (key, label, color) in enumerate(stats_config):
@@ -5436,7 +5531,7 @@ class StatsPanel(ctk.CTkFrame):
             self.labels[key] = val_label
 
         ctk.CTkLabel(
-            self, text="Column Summary", font=ctk.CTkFont(size=11, weight="bold"),
+            self, text=tr("column_summary"), font=ctk.CTkFont(size=11, weight="bold"),
             text_color=COLORS["text_secondary"], anchor="w",
         ).pack(fill="x", padx=12, pady=(2, 4))
         self.summary_text = ctk.CTkTextbox(
@@ -5525,6 +5620,8 @@ class CSVPowerToolApp:
         self.history = ConfigHistory(self._config_to_data())
         self._update_history_buttons()
         self.root.bind_all("<Tab>", self._on_tab_navigation, add="+")
+        self.root.bind_all("<ISO_Left_Tab>", self._on_tab_navigation, add="+")
+        self.root.bind_all("<Shift-Tab>", self._on_tab_navigation, add="+")
         self.root.bind_all("<FocusIn>", self._on_focus_in, add="+")
         self.root.bind_all("<KeyRelease>", self._on_ui_edit, add="+")
         self.root.bind_all("<Alt-p>", self._shortcut_process, add="+")
@@ -5562,7 +5659,7 @@ class CSVPowerToolApp:
         ).pack(anchor="w")
         
         ctk.CTkLabel(
-            title_frame, text="Combine • Filter • Transform • Deduplicate • Export",
+            title_frame, text=tr("combine_description"),
             font=ctk.CTkFont(size=12),
             text_color=COLORS["text_muted"]
         ).pack(anchor="w")
@@ -5581,7 +5678,7 @@ class CSVPowerToolApp:
         appearance_frame = ctk.CTkFrame(header, fg_color="transparent")
         appearance_frame.pack(side="right", padx=(0, 10))
         ctk.CTkLabel(
-            appearance_frame, text="Theme", font=ctk.CTkFont(size=10),
+            appearance_frame, text=tr("theme"), font=ctk.CTkFont(size=10),
             text_color=COLORS["text_muted"],
         ).pack(side="left", padx=(0, 6))
         ctk.CTkOptionMenu(
@@ -5811,32 +5908,30 @@ class CSVPowerToolApp:
     def _configure_accessibility(self):
         """Apply deterministic focus metadata to the current widget tree."""
 
-        focusables = collect_focusables(self.root)
-        for index, widget in enumerate(focusables, start=1):
-            prepare_focus_widget(widget)
-            set_accessible_name(
-                widget,
-                accessible_name(widget),
-                f"Keyboard control {index} of {len(focusables)}",
-            )
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
+        focusables = configure_focus_contract(self.root, COLORS["accent_cyan"])
         self._focus_order_snapshot = [accessible_name(widget) for widget in focusables]
 
     def _on_focus_in(self, event):
+        focusables = configure_focus_contract(self.root, COLORS["accent_cyan"])
         focused = next(
             (
-                widget for widget in collect_focusables(self.root)
+                widget for widget in focusables
                 if widget_contains(widget, event.widget)
             ),
             None,
         )
         self._focused_widget = focused
-        for widget in collect_focusables(self.root):
+        for widget in focusables:
             set_focus_ring(widget, widget is focused, COLORS["accent_cyan"])
 
     def _on_tab_navigation(self, event):
         """Cycle through enabled controls even when customtkinter hides internals."""
 
-        focusables = collect_focusables(self.root)
+        focusables = configure_focus_contract(self.root, COLORS["accent_cyan"])
         if not focusables:
             return "break"
         current_index = next(
@@ -6278,9 +6373,10 @@ class CSVPowerToolApp:
         config = ProcessingConfig()
         
         # Columns
-        mode, selected = self.column_panel.get_config()
+        mode, selected, mapping = self.column_panel.get_config()
         config.columns_mode = mode
         config.selected_columns = selected
+        config.column_mapping = mapping
         config.column_order = self.column_panel.get_column_order()
         
         # Sort
@@ -6345,7 +6441,7 @@ class CSVPowerToolApp:
             key: copy.deepcopy(value)
             for key, value in data.items()
             if key not in {
-                "columns_mode", "selected_columns", "column_order",
+                "columns_mode", "selected_columns", "column_mapping", "column_order",
                 "sort_enabled", "sort_columns", "sort_case_sensitive", "sort_numeric_aware",
                 "dedupe_enabled", "dedupe_columns", "dedupe_keep", "dedupe_fuzzy_enabled",
                 "dedupe_fuzzy_threshold", "dedupe_aggregate_mode", "dedupe_aggregate_separator",
@@ -6357,6 +6453,7 @@ class CSVPowerToolApp:
 
         self.column_panel.mode.set(data.get("columns_mode", "all"))
         self.column_panel.selected = set(data.get("selected_columns", []))
+        self.column_panel.set_mapping(data.get("column_mapping", {}))
         requested_order = data.get("column_order", [])
         if requested_order:
             known = [column for column in requested_order if column in self.column_panel.columns]
@@ -6681,6 +6778,10 @@ def cli_main(argv=None):
                         help="Sort by columns, e.g. name:asc age:desc")
     parser.add_argument("--columns", nargs="+", help="Include only these columns")
     parser.add_argument("--exclude-columns", nargs="+", help="Exclude these columns")
+    parser.add_argument(
+        "--rename", action="append", metavar="SOURCE=TARGET",
+        help="Rename an input column; repeat for multiple mappings",
+    )
     parser.add_argument("--header-normalize", choices=["none", "trim", "lowercase", "snake_case"],
                         default=None, help="Header normalization mode")
     parser.add_argument("--invalid-row-policy", choices=["fail", "warn", "quarantine"],
@@ -6700,6 +6801,10 @@ def cli_main(argv=None):
                         help="Text parsing backend; polars is recommended for large in-memory jobs")
     parser.add_argument("--stream-batch-rows", type=int, default=None,
                         help="Rows held per Parquet streaming batch")
+    parser.add_argument(
+        "--max-materialized-rows", type=int, default=None,
+        help="Maximum Parquet rows allowed in a non-streaming materialized operation",
+    )
     parser.add_argument("--column-template", help="Use this input's column order as the output template")
     parser.add_argument("--source-column", help="Add a provenance column containing each source file")
     parser.add_argument("--source-path", action="store_true", help="Store the full source path instead of the file name")
@@ -6940,6 +7045,14 @@ def cli_main(argv=None):
             config.schema_contract = load_schema(args.schema_contract)
         except SchemaError as exc:
             parser.error(str(exc))
+    if args.rename:
+        try:
+            cli_mapping = parse_column_mapping_assignments(args.rename)
+            merged_mapping = dict(getattr(config, "column_mapping", {}) or {})
+            merged_mapping.update(cli_mapping)
+            config.column_mapping = normalize_column_mapping(merged_mapping)
+        except SchemaError as exc:
+            parser.error(str(exc))
     elif config.schema_contract:
         try:
             config.schema_contract = normalize_schema(config.schema_contract)
@@ -7070,6 +7183,10 @@ def cli_main(argv=None):
         if args.stream_batch_rows < 1:
             parser.error("--stream-batch-rows must be at least 1")
         config.stream_batch_rows = args.stream_batch_rows
+    if args.max_materialized_rows is not None:
+        if args.max_materialized_rows < 1:
+            parser.error("--max-materialized-rows must be at least 1")
+        config.max_materialized_rows = args.max_materialized_rows
     for name, argument in (
         ("quality_scan_rows", args.quality_scan_rows),
         ("quality_facet_limit", args.quality_facet_limit),

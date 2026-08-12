@@ -8,6 +8,7 @@ launcher applies the optional focus behavior only when a GUI is requested.
 from __future__ import annotations
 
 from collections.abc import Iterator
+import unicodedata
 from typing import Any
 
 
@@ -33,6 +34,50 @@ FOCUSABLE_CLASS_NAMES = frozenset(
         "Text",
     }
 )
+
+GENERIC_CONTROL_TEXT = frozenset({"add", "clear", "remove", "browse", "inspect", "profile"})
+
+
+def _widget_text(widget: Any) -> str:
+    """Read a Tk text option without requiring a concrete Tk widget in tests."""
+
+    try:
+        value = widget.cget("text")
+    except Exception:
+        value = ""
+    return str(value or "").strip()
+
+
+def _clean_accessible_text(value: str) -> str:
+    """Remove decorative symbol glyphs that do not convey a control name."""
+
+    cleaned = "".join(
+        character
+        for character in str(value)
+        if unicodedata.category(character) not in {"So", "Sk"}
+    )
+    return " ".join(cleaned.split())
+
+
+def _context_text(widget: Any) -> str:
+    """Find nearby visible text for generic actions such as Remove or Clear."""
+
+    current = widget
+    for _ in range(3):
+        try:
+            siblings = current.winfo_children()
+        except Exception:
+            siblings = []
+        for sibling in siblings:
+            if sibling is widget:
+                continue
+            text = _clean_accessible_text(_widget_text(sibling))
+            if text and text.lower() not in GENERIC_CONTROL_TEXT:
+                return text
+        current = getattr(current, "master", None)
+        if current is None:
+            break
+    return ""
 
 
 def _hex_rgb(value: str) -> tuple[int, int, int]:
@@ -102,7 +147,7 @@ def iter_widgets(root: Any) -> Iterator[Any]:
         yield from iter_widgets(child)
 
 
-def is_focusable(widget: Any) -> bool:
+def is_focusable(widget: Any, visible_only: bool = True) -> bool:
     """Identify controls that should participate in the shell's Tab order."""
 
     if getattr(widget, "_csv_power_skip_focus", False):
@@ -113,37 +158,76 @@ def is_focusable(widget: Any) -> bool:
         state = str(widget.cget("state"))
     except Exception:
         state = "normal"
-    return state != "disabled"
+    if state == "disabled":
+        return False
+    if visible_only:
+        for method_name in ("winfo_viewable", "winfo_ismapped"):
+            method = getattr(widget, method_name, None)
+            if method is None:
+                continue
+            try:
+                if not bool(method()):
+                    return False
+            except Exception:
+                continue
+    return True
 
 
-def collect_focusables(root: Any) -> list[Any]:
-    """Return enabled controls in deterministic visual/creation order."""
+def collect_focusables(root: Any, visible_only: bool = True) -> list[Any]:
+    """Return enabled, visible controls in deterministic visual/creation order."""
 
-    return [widget for widget in iter_widgets(root) if is_focusable(widget)]
+    return [
+        widget for widget in iter_widgets(root)
+        if is_focusable(widget, visible_only=visible_only)
+    ]
 
 
 def set_accessible_name(widget: Any, name: str, description: str | None = None) -> Any:
     """Attach an inspectable accessible name/description to a Tk widget."""
 
-    widget._csv_power_accessible_name = name
+    widget._csv_power_accessible_name = _clean_accessible_text(name)
     if description:
-        widget._csv_power_accessible_description = description
+        widget._csv_power_accessible_description = _clean_accessible_text(description)
     return widget
 
 
 def accessible_name(widget: Any) -> str:
-    """Read the explicit name or derive a useful text fallback for testing."""
+    """Read the explicit name or derive a useful, contextual fallback."""
 
     explicit = getattr(widget, "_csv_power_accessible_name", "")
     if explicit:
-        return str(explicit)
-    try:
-        text = widget.cget("text")
-    except Exception:
-        text = ""
+        return _clean_accessible_text(str(explicit))
+    text = _clean_accessible_text(_widget_text(widget))
     if text:
-        return str(text)
-    return widget.__class__.__name__
+        if text.lower() in GENERIC_CONTROL_TEXT:
+            context = _context_text(widget)
+            if context:
+                return f"{text}: {context}"
+        return text
+    placeholder = ""
+    try:
+        placeholder = str(widget.cget("placeholder_text") or "").strip()
+    except Exception:
+        pass
+    if placeholder:
+        return _clean_accessible_text(placeholder)
+    return _clean_accessible_text(widget.__class__.__name__)
+
+
+def configure_focus_contract(root: Any, color: str) -> list[Any]:
+    """Prepare visible controls and attach stable names for keyboard/AT users."""
+
+    focusables = collect_focusables(root)
+    counts: dict[str, int] = {}
+    for index, widget in enumerate(focusables, start=1):
+        prepare_focus_widget(widget)
+        name = accessible_name(widget) or widget.__class__.__name__
+        counts[name] = counts.get(name, 0) + 1
+        if counts[name] > 1:
+            name = f"{name} ({counts[name]})"
+        set_accessible_name(widget, name, f"Keyboard control {index} of {len(focusables)}")
+        set_focus_ring(widget, False, color)
+    return focusables
 
 
 def widget_contains(parent: Any, child: Any) -> bool:

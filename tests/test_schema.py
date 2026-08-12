@@ -12,7 +12,10 @@ from csv_power_tool.schema import (
     SchemaError,
     infer_schema,
     load_schema,
+    normalize_column_mapping,
     normalize_schema,
+    parse_column_mapping_assignments,
+    validate_column_mapping,
     validate_rows,
     validation_report,
     write_schema,
@@ -43,6 +46,85 @@ CONTRACT = {
 
 
 class SchemaContractTests(unittest.TestCase):
+    def test_column_mapping_is_normalized_and_rejects_collisions(self):
+        self.assertEqual(
+            normalize_column_mapping({" id ": " record_id "}),
+            {"id": "record_id"},
+        )
+        self.assertEqual(
+            parse_column_mapping_assignments(["id=record_id", "name=display_name"]),
+            {"id": "record_id", "name": "display_name"},
+        )
+        with self.assertRaisesRegex(SchemaError, "target"):
+            normalize_column_mapping({"id": "value", "name": "value"})
+        with self.assertRaisesRegex(SchemaError, "unknown"):
+            validate_column_mapping({"missing": "value"}, ["id"])
+
+    def test_engine_mapping_is_user_visible_and_collision_safe(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "input.csv"
+            output_path = root / "output.csv"
+            manifest_path = root / "manifest.json"
+            schema_path = root / "schema.json"
+            input_path.write_text("id,name\n001,A\n", encoding="utf-8")
+
+            config = ProcessingConfig(
+                dedupe_enabled=False,
+                column_mapping={"id": "record_id"},
+                run_manifest_path=str(manifest_path),
+            )
+            stats = CSVEngine(config).process([input_path], output_path)
+
+            self.assertFalse(stats.errors)
+            self.assertEqual(output_path.read_text(encoding="utf-8").splitlines(), [
+                "record_id,name",
+                "001,A",
+            ])
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["schema"]["column_mapping"], {"id": "record_id"})
+
+            report = CSVEngine(
+                ProcessingConfig(dedupe_enabled=False, column_mapping={"id": "record_id"})
+            ).write_schema_report([input_path], schema_path)
+            self.assertEqual(report["column_mapping"], {"id": "record_id"})
+            self.assertEqual(report["output_columns"], ["record_id", "name"])
+
+            collision_stats = CSVEngine(
+                ProcessingConfig(
+                    dedupe_enabled=False,
+                    column_mapping={"id": "name"},
+                )
+            ).process([input_path], root / "collision.csv")
+            self.assertTrue(any("collide" in error for error in collision_stats.errors))
+            self.assertFalse((root / "collision.csv").exists())
+
+    def test_cli_rename_option_writes_mapped_header(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "input.csv"
+            output_path = root / "output.csv"
+            input_path.write_text("id,name\n001,A\n", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(MODULE_PATH),
+                    "--inputs", str(input_path),
+                    "--rename", "id=record_id",
+                    "--no-dedupe",
+                    "--no-manifest",
+                    "--output", str(output_path),
+                ],
+                cwd=MODULE_PATH.parent,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(output_path.read_text(encoding="utf-8").splitlines()[0], "record_id,name")
+
     def test_schema_round_trip_and_unsupported_features(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "contract.json"

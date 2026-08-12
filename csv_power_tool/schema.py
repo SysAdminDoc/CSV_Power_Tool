@@ -24,6 +24,76 @@ class SchemaError(ValueError):
     """Actionable schema contract error."""
 
 
+def normalize_column_mapping(mapping: dict | None) -> dict[str, str]:
+    """Normalize and validate source-to-output column rename declarations."""
+
+    if mapping is None:
+        return {}
+    if not isinstance(mapping, dict):
+        raise SchemaError("Column mapping must be an object of source-to-output names")
+
+    normalized: dict[str, str] = {}
+    targets: dict[str, str] = {}
+    for raw_source, raw_target in mapping.items():
+        if not isinstance(raw_source, str) or not isinstance(raw_target, str):
+            raise SchemaError("Column mapping names must be strings")
+        source = raw_source.strip()
+        target = raw_target.strip()
+        if not source or not target:
+            raise SchemaError("Column mapping source and target names cannot be blank")
+        if source in normalized:
+            raise SchemaError(f"Duplicate column mapping source: {source}")
+        previous_source = targets.get(target)
+        if previous_source is not None and previous_source != source:
+            raise SchemaError(
+                f"Column mapping target {target!r} is used by both {previous_source!r} and {source!r}"
+            )
+        normalized[source] = target
+        targets[target] = source
+    return normalized
+
+
+def validate_column_mapping(mapping: dict | None, columns: list[str]) -> dict[str, str]:
+    """Validate a mapping against discovered columns and effective output names."""
+
+    normalized = normalize_column_mapping(mapping)
+    known_columns = list(columns)
+    unknown = sorted(set(normalized) - set(known_columns))
+    if unknown:
+        raise SchemaError(
+            "Column mapping references unknown source column(s): " + ", ".join(unknown)
+        )
+
+    output_names: dict[str, str] = {}
+    for column in known_columns:
+        target = normalized.get(column, column)
+        previous = output_names.get(target)
+        if previous is not None and previous != column:
+            raise SchemaError(
+                f"Column mapping would collide: {previous!r} and {column!r} both output as {target!r}"
+            )
+        output_names[target] = column
+    return normalized
+
+
+def parse_column_mapping_assignments(assignments: list[str] | None) -> dict[str, str]:
+    """Parse repeated ``SOURCE=TARGET`` CLI declarations."""
+
+    mapping: dict[str, str] = {}
+    for assignment in assignments or []:
+        if not isinstance(assignment, str) or "=" not in assignment:
+            raise SchemaError(
+                f"Invalid column mapping {assignment!r}; expected SOURCE=TARGET"
+            )
+        source, target = assignment.split("=", 1)
+        source = source.strip()
+        target = target.strip()
+        if source in mapping:
+            raise SchemaError(f"Duplicate column mapping source: {source}")
+        mapping[source] = target
+    return normalize_column_mapping(mapping)
+
+
 def normalize_schema(data: dict) -> dict:
     if not isinstance(data, dict):
         raise SchemaError("Table Schema must be a JSON object")
